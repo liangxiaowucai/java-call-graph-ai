@@ -1,0 +1,396 @@
+/* ─── Global Reset ─────────────────────────────────────────────────────────── */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, 'Noto Sans', sans-serif;
+}
+
+/* ─── Layout ──────────────────────────────────────────────────────────────── */
+.app-layout {
+  min-height: 100vh;
+}
+
+.app-layout .logo {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.app-layout .logo .logo-full {
+  display: inline;
+}
+
+.app-layout .logo .logo-short {
+  display: none;
+}
+
+.site-layout-content {
+  padding: 16px;
+  height: calc(100vh - 0px);
+  background: #f5f5f5;
+  overflow: auto;
+}
+
+/* ─── Repo Manager ────────────────────────────────────────────────────────── */
+.repo-manager {
+  max-width: 100%;
+  margin: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.repo-manager .ant-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.repo-manager .ant-card-body {
+  flex: 1;
+  overflow: auto;
+}
+
+.repo-manager .add-repo-card {
+  margin-bottom: 24px;
+}
+
+/* ─── Call Graph Page ─────────────────────────────────────────────────────── */
+.callgraph-page {
+  display: flex;
+  height: calc(100vh - 112px);
+  gap: 0;
+}
+
+.callgraph-left {
+  width: 360px;
+  min-width: 360px;
+  background: #fff;
+  border-right: 1px solid #f0f0f0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.callgraph-left .left-header {
+  padding: 16px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.callgraph-left .entry-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+
+.callgraph-left .entry-group-title {
+  padding: 8px 16px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #8c8c8c;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.callgraph-left .entry-item {
+  padding: 8px 16px;
+  cursor: pointer;
+  border-bottom: 1px solid #fafafa;
+  transition: background 0.2s;
+}
+
+.callgraph-left .entry-item:hover {
+  background: #e6f7ff;
+}
+
+.callgraph-left .entry-item.active {
+  background: #e6f7ff;
+  border-left: 3px solid #1890ff;
+}
+
+.callgraph-left .entry-item .entry-method {
+  font-size: 13px;
+  font-weight: 500;
+  color: #262626;
+  word-break: break-all;
+}
+
+.callgraph-left .entry-item .entry-class {
+  font-size: 11px;
+  color: #8c8c8c;
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+.callgraph-left .entry-class-group {
+  margin-bottom: 2px;
+}
+
+.callgraph-left .entry-module-group {
+  margin-bottom: 2px;
+}
+
+.callgraph-left .entry-module-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 16px;
+  cursor: pointer;
+  background: #f0f5ff;
+  border-bottom: 1px solid #d6e4ff;
+  font-size: 12px;
+  font-weight: 700;
+  color: #1d39c4;
+  user-select: none;
+}
+
+.callgraph-left .entry-module-header:hover {
+  background: #d6e4ff;
+}
+
+.callgraph-left .entry-module-header .anticon {
+  font-size: 10px;
+  color: #597ef7;
+}
+
+.callgraph-left .entry-module-header .entry-module-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callgraph-left .entry-module-header .entry-module-count {
+  font-size: 11px;
+  font-weight: 400;
+  color: #597ef7;
+}
+
+.callgraph-left .entry-class-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px 6px 28px;
+  cursor: pointer;
+  background: #fafafa;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 12px;
+  font-weight: 600;
+  color: #595959;
+  user-select: none;
+}
+
+.callgraph-left .entry-class-header:hover {
+  background: #f0f5ff;
+  color: #1890ff;
+}
+
+.callgraph-left .entry-class-header .anticon {
+  font-size: 10px;
+  color: #bfbfbf;
+}
+
+.callgraph-left .entry-class-header .entry-class-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.callgraph-left .entry-class-header .entry-class-count {
+  font-size: 11px;
+  font-weight: 400;
+  color: #bfbfbf;
+  background: #f0f0f0;
+  border-radius: 8px;
+  padding: 0 7px;
+  line-height: 16px;
+}
+
+.callgraph-left .entry-class-group .entry-item {
+  padding-left: 44px;
+}
+
+.callgraph-right {
+  flex: 1;
+  position: relative;
+  background: #fafafa;
+  overflow: hidden;
+}
+
+.callgraph-right .graph-container {
+  width: 100%;
+  height: 100%;
+}
+
+.callgraph-right .graph-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #bfbfbf;
+  font-size: 16px;
+}
+
+.callgraph-right .graph-stats {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: #595959;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  z-index: 10;
+}
+
+.callgraph-right .graph-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  gap: 6px;
+  z-index: 10;
+}
+
+/* ─── Source Code Drawer ──────────────────────────────────────────────────── */
+.source-code-block {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 16px;
+  border-radius: 6px;
+  font-family: 'Fira Code', 'Cascadia Code', 'JetBrains Mono', Consolas, 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+  tab-size: 4;
+}
+
+/* ─── QA Chat ─────────────────────────────────────────────────────────────── */
+.qa-chat-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - 112px);
+}
+
+.qa-chat-placeholder {
+  text-align: center;
+  color: #8c8c8c;
+}
+
+.qa-chat-placeholder .anticon {
+  font-size: 64px;
+  color: #d9d9d9;
+  margin-bottom: 24px;
+}
+
+/* ─── Boundary Dots ───────────────────────────────────────────────────────── */
+.boundary-dots {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: 4px;
+}
+
+.boundary-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.boundary-dot.DB { background: #1890ff; }
+.boundary-dot.HTTP { background: #52c41a; }
+.boundary-dot.EXCEPTION { background: #ff4d4f; }
+.boundary-dot.TRANSACTION { background: #722ed1; }
+.boundary-dot.SERIALIZATION { background: #fa8c16; }
+.boundary-dot.MQ { background: #13c2c2; }
+.boundary-dot.CACHE { background: #eb2f96; }
+
+/* ─── G6 Tooltip ──────────────────────────────────────────────────────────── */
+.g6-tooltip {
+  background: rgba(255, 255, 255, 0.96) !important;
+  border: 1px solid #e8e8e8 !important;
+  border-radius: 6px !important;
+  padding: 10px 14px !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12) !important;
+  max-width: 420px !important;
+  word-break: break-all;
+}
+
+/* ─── Markdown in Chat ────────────────────────────────────────────────────── */
+.markdown-body {
+  font-size: 13px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.markdown-body h1 { font-size: 18px; font-weight: 700; margin: 12px 0 6px; }
+.markdown-body h2 { font-size: 16px; font-weight: 600; margin: 10px 0 4px; }
+.markdown-body h3 { font-size: 14px; font-weight: 600; margin: 8px 0 4px; }
+.markdown-body p { margin: 4px 0; }
+.markdown-body ul, .markdown-body ol { padding-left: 20px; margin: 4px 0; }
+.markdown-body li { margin: 2px 0; }
+.markdown-body code {
+  background: #f5f5f5;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 12px;
+  color: #c7254e;
+}
+.markdown-body pre {
+  background: #2b2b2b;
+  color: #a9b7c6;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.markdown-body pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.markdown-body blockquote {
+  border-left: 3px solid #d9d9d9;
+  padding-left: 12px;
+  color: #666;
+  margin: 8px 0;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.markdown-body th, .markdown-body td {
+  border: 1px solid #e8e8e8;
+  padding: 4px 8px;
+}
+.markdown-body th { background: #fafafa; font-weight: 600; }
+.markdown-body strong { color: #1a1a2e; }
+
+/* 打字机光标 */
+.typing-cursor {
+  animation: blink 0.8s infinite;
+  color: #1890ff;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

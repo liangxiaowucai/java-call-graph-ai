@@ -1,0 +1,30 @@
+build/
+bin/
+out/
+.project
+.settings/
+.idea/
+.gradle/
+*.iml
+.classpath
+jar_output_dir/
+log_javacg2/
+runlocal/
+config_local/
+prompt/
+
+# 运行时数据
+platform/data/
+data/
+
+# AI 工具内部配置
+.harness/
+.claude/
+.kiro/
+
+# 前端依赖
+node_modules/
+
+# IDE
+.vscode/
+*.iml

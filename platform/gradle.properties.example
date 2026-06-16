@@ -1,0 +1,16 @@
+# 复制此文件为 gradle.properties 并填写你本地的 JDK 17 路径
+# Copy this file to gradle.properties and set your local JDK 17 path
+
+# macOS (Temurin/Adoptium):
+# org.gradle.java.home=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
+
+# macOS (Homebrew):
+# org.gradle.java.home=/opt/homebrew/opt/openjdk@17
+
+# Linux (Ubuntu/Debian):
+# org.gradle.java.home=/usr/lib/jvm/java-17-openjdk-amd64
+
+# Windows:
+# org.gradle.java.home=C:/Program Files/Eclipse Adoptium/jdk-17.0.x-hotspot
+
+# 留空则使用系统 JAVA_HOME 环境变量（确保已指向 JDK 17）

@@ -1,0 +1,58 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: javacg2-platform
+  datasource:
+    url: jdbc:h2:file:./data/javacg2-platform;AUTO_SERVER=TRUE;CACHE_SIZE=65536
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: false
+      path: /h2-console
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.H2Dialect
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+  servlet:
+    multipart:
+      max-file-size: 500MB
+      max-request-size: 1GB
+  # Spring AI MCP Server（暴露 Java 调用链图谱工具给 AI 编程助手）
+  # AI 编程助手配置：{"mcpServers":{"java-callgraph":{"url":"http://localhost:8080/mcp/sse","transport":"sse"}}}
+  ai:
+    mcp:
+      server:
+        name: java-callgraph-mcp
+        version: 1.0.0
+        enabled: true
+        type: SYNC
+
+# 平台配置
+platform:
+  repo-base-dir: ./data/repos
+  analysis-output-dir: ./data/analysis
+  sync:
+    enabled: false
+    cron: "0 0 * * * *"  # 每小时同步
+  embedding:
+    api-url: ${EMBEDDING_URL:}
+    api-key: ${EMBEDDING_API_KEY:}
+    model: text-embedding-3-large
+    batch-size: ${EMBEDDING_BATCH_SIZE:100}
+    dimensions: 3072
+  qdrant:
+    url: ${QDRANT_URL:http://localhost:6333}
+    collection: ${QDRANT_COLLECTION:javacg2_chunks}

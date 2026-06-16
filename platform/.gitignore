@@ -1,0 +1,22 @@
+# 运行时数据（含私有仓库代码、H2数据库、日志、Qdrant向量数据）
+# 绝对不能提交到 GitHub
+data/
+
+# Gradle 构建产物
+build/
+.gradle/
+
+# 前端依赖和构建产物
+frontend/node_modules/
+frontend/dist/
+
+# 进程 PID 文件
+.pids
+
+# 本地环境覆盖（如 application-local.yml）
+src/main/resources/application-local.yml
+src/main/resources/application-local.properties
+
+# 本地 JDK 路径配置（每人路径不同，不提交）
+# 参考 gradle.properties.example 创建自己的 gradle.properties
+gradle.properties

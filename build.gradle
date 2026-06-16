@@ -1,0 +1,185 @@
+apply plugin: 'eclipse'
+apply plugin: 'java'
+apply plugin: 'java-library'
+apply plugin: 'idea'
+
+apply from: 'unittest.gradle'
+
+group 'com.github.adrninistrator'
+version = "4.0.5"
+def projectName = "java-callgraph2"
+description = "${projectName}"
+sourceCompatibility = 1.8
+targetCompatibility = 1.8
+def jar_output_dir = "jar_output_dir"
+
+def defaultEncoding = 'UTF-8'
+
+[compileJava, compileTestJava]*.options*.encoding = defaultEncoding
+
+project.buildDir = 'build'
+
+repositories {
+    // 国内镜像，解决 Maven Central 下载失败问题
+    maven { url 'https://maven.aliyun.com/repository/public' }
+    maven { url 'https://maven.aliyun.com/repository/spring' }
+    mavenCentral()
+}
+
+clean {
+    delete 'build'
+    delete "${jar_output_dir}"
+}
+
+sourceSets {
+    main {
+        java {
+            srcDir 'src/main/java'
+        }
+
+        resources {
+            srcDir 'src/main/resources'
+        }
+    }
+
+    test {
+        java {
+            srcDir 'src/test/java'
+        }
+
+        resources {
+            srcDir 'src/test/resources'
+        }
+    }
+}
+
+List apache_ant = ["org.apache.ant:ant:1.10.15"]
+
+List apache_common = [
+        'commons-codec:commons-codec:1.15',
+        'org.apache.commons:commons-compress:1.27.1',
+        'org.apache.commons:commons-lang3:3.17.0',
+        'commons-io:commons-io:2.15.1'
+]
+
+List aviator = ['com.googlecode.aviator:aviator:5.4.3']
+
+// 6.7.0版本LDC.getValue()会报错，不使用
+List bcel = ['org.apache.bcel:bcel:6.10.0']
+
+List zip4j = ['net.lingala.zip4j:zip4j:2.11.5']
+
+List slf4j = ['org.slf4j:slf4j-api:1.7.36']
+
+List junit = ['junit:junit:4.13.2']
+
+List log4j = [
+        'org.apache.logging.log4j:log4j-api:2.20.0',
+        'org.apache.logging.log4j:log4j-core:2.20.0',
+        'org.apache.logging.log4j:log4j-slf4j-impl:2.20.0'
+]
+
+List disruptor = ['com.lmax:disruptor:3.3.7']
+
+List bcprov_jdk18on = ['org.bouncycastle:bcprov-jdk18on:1.76']
+
+dependencies {
+    api apache_ant, apache_common, aviator, bcel, zip4j, slf4j
+    testImplementation junit, log4j, disruptor, bcprov_jdk18on
+}
+
+compileJava.options.compilerArgs << "-Xlint:unchecked" << "-Xlint:deprecation"
+
+processResources {
+    setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
+}
+
+processTestResources {
+    setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
+}
+
+tasks.register('createProject') {
+    doFirst {
+        sourceSets*.java.srcDirs*.each { it.mkdirs() }
+        sourceSets*.resources.srcDirs*.each { it.mkdirs() }
+    }
+}
+
+// 生成可以直接执行的jar包，并拷贝相关文件
+tasks.register('gen_run_jar', Jar) {
+    archiveFileName.set('run_javacg2.jar')
+    from(sourceSets.main.output) {
+        into '/'
+    }
+
+    doFirst {
+        delete "${jar_output_dir}"
+    }
+
+    doLast {
+        copy {
+            from "${buildDir}/libs/run_javacg2.jar"
+            into "${jar_output_dir}/jar/"
+        }
+        def javaCG2ConfigDirs = new File('src/main/resources').listFiles().findAll
+                { File f -> (f.isDirectory() && (f.name.startsWith('_javacg2_') || f.name.startsWith('_el_'))) }
+        // 拷贝配置文件目录
+        javaCG2ConfigDirs.each { jacgConfigDir ->
+            def dirName = jacgConfigDir.getName()
+
+            copy {
+                from 'src/main/resources/' + dirName
+                into "${jar_output_dir}/" + dirName
+            }
+        }
+        copy {
+            from 'src/test/resources/log4j2.xml'
+            into new File("${jar_output_dir}/config/")
+            rename { "log4j2_console.xml" }
+        }
+        copy {
+            from 'src/test/resources/log4j2_file.xml'
+            into new File("${jar_output_dir}/config/")
+            rename { "log4j2.xml" }
+        }
+        copy {
+            from new File('bat').listFiles().findAll { File f -> (f.name.endsWith('.bat')) }
+            into "${jar_output_dir}/"
+        }
+        copy {
+            from new File('shell').listFiles().findAll { File f -> (f.name.endsWith('.sh')) }
+            into "${jar_output_dir}/"
+        }
+        copy {
+            from configurations.runtimeClasspath.getFiles()
+            into "${jar_output_dir}/lib"
+        }
+        copy {
+            from configurations.testRuntimeClasspath.getFiles().findAll {
+                    /*
+                    需要使用以下日志相关的组件：
+                    log4j
+                    disruptor
+                 */
+                File f ->
+                    (f.name.startsWith('log4j-')
+                            || f.name.startsWith("disruptor-"))
+            }
+            into "${jar_output_dir}/lib"
+        }
+    }
+}
+
+idea {
+    module {
+        // and some extra dirs that should be excluded by IDEA
+        excludeDirs += file('.idea')
+        excludeDirs += file('gradle')
+        excludeDirs += file("${jar_output_dir}")
+        excludeDirs += file('bat')
+        excludeDirs += file('shell')
+        excludeDirs += file('prompt')
+        excludeDirs += file('log_javacg2')
+        excludeDirs += file('docs')
+    }
+}

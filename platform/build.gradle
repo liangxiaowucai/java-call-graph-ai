@@ -1,0 +1,97 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.3.5'
+    id 'io.spring.dependency-management' version '1.1.5'
+}
+
+group = 'com.adrninistrator.javacg2.platform'
+version = '0.1.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+def defaultEncoding = 'UTF-8'
+[compileJava, compileTestJava]*.options*.encoding = defaultEncoding
+
+repositories {
+    // 国内镜像，解决 Maven Central 下载失败问题
+    maven { url 'https://maven.aliyun.com/repository/public' }
+    maven { url 'https://maven.aliyun.com/repository/spring' }
+    maven { url 'https://maven.aliyun.com/repository/google' }
+    mavenCentral()
+}
+
+dependencies {
+    // javacg2 核心库（通过本地 jar 引用）
+    implementation fileTree(dir: '../build/libs', include: ['*.jar'])
+    // javacg2 的运行时依赖
+    implementation 'org.apache.bcel:bcel:6.10.0'
+    implementation 'org.apache.ant:ant:1.10.15'
+    implementation 'commons-codec:commons-codec:1.15'
+    implementation 'org.apache.commons:commons-compress:1.27.1'
+    implementation 'org.apache.commons:commons-lang3:3.17.0'
+    implementation 'commons-io:commons-io:2.15.1'
+    implementation 'com.googlecode.aviator:aviator:5.4.3'
+    implementation 'net.lingala.zip4j:zip4j:2.11.5'
+
+    // Spring Boot
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // H2 嵌入式数据库
+    runtimeOnly 'com.h2database:h2'
+
+    // SQLite JDBC（用于 sqlite-vss 向量存储）
+    implementation 'org.xerial:sqlite-jdbc:3.45.3.0'
+
+    // JGit（Git 操作）
+    implementation 'org.eclipse.jgit:org.eclipse.jgit:6.9.0.202403050737-r'
+
+    // LangChain4j — RAG Pipeline 核心
+    implementation 'dev.langchain4j:langchain4j:0.32.0'
+    implementation 'dev.langchain4j:langchain4j-open-ai:0.32.0'
+
+    // Qdrant Java client（向量存储）
+    implementation 'io.qdrant:client:1.9.1'
+    // Qdrant client 传递依赖（显式声明避免版本冲突）
+    implementation 'com.google.guava:guava:33.1.0-jre'
+    implementation 'com.google.protobuf:protobuf-java:3.25.3'
+
+    // JSON 处理
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'
+
+    // Spring AI MCP Server（WebMVC 变体，暴露调用链工具给 AI 编程助手）
+    implementation 'org.springframework.ai:spring-ai-starter-mcp-server-webmvc:1.0.0'
+
+    // 日志
+    implementation 'org.apache.logging.log4j:log4j-api:2.20.0'
+    implementation 'org.apache.logging.log4j:log4j-core:2.20.0'
+    implementation 'org.apache.logging.log4j:log4j-slf4j2-impl:2.20.0'
+
+    // 测试
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'net.jqwik:jqwik:1.8.4'
+}
+
+// 排除 Spring Boot 默认的 logback，使用 log4j2
+configurations.all {
+    exclude group: 'org.springframework.boot', module: 'spring-boot-starter-logging'
+}
+
+test {
+    useJUnitPlatform()
+    minHeapSize = '256m'
+    maxHeapSize = '1g'
+    jvmArgs '-XX:MetaspaceSize=64m', '-XX:MaxMetaspaceSize=256m'
+    testLogging {
+        events 'PASSED', 'STARTED', 'FAILED', 'SKIPPED'
+    }
+}
+
+bootJar {
+    archiveFileName.set('javacg2-platform.jar')
+}
