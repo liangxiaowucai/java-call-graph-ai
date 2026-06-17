@@ -4,6 +4,7 @@ import com.adrninistrator.javacg2.platform.entity.*;
 import com.adrninistrator.javacg2.platform.repository.*;
 import com.adrninistrator.javacg2.platform.service.BuildLogService;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
+import com.adrninistrator.javacg2.platform.service.AnalysisDataExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -26,12 +27,14 @@ public class DocGenerator {
     private final ProjectInfoExtractor projectInfoExtractor;
     private final RepoConfigRepo repoConfigRepo;
     private final BuildLogService buildLogService;
+    private final AnalysisDataExtractor analysisDataExtractor;
 
     public DocGenerator(CallGraphEngine callGraphEngine, BoundaryRepo boundaryRepo,
                          CallChainCodeGenerator codeGenerator, ClaudeApiClient claudeClient,
                          ApiEndpointRepo apiEndpointRepo, ChunkRepo chunkRepo,
                          RepositoryRepo repositoryRepo, ProjectInfoExtractor projectInfoExtractor,
-                         RepoConfigRepo repoConfigRepo, BuildLogService buildLogService) {
+                         RepoConfigRepo repoConfigRepo, BuildLogService buildLogService,
+                         AnalysisDataExtractor analysisDataExtractor) {
         this.callGraphEngine = callGraphEngine;
         this.boundaryRepo = boundaryRepo;
         this.codeGenerator = codeGenerator;
@@ -42,6 +45,7 @@ public class DocGenerator {
         this.projectInfoExtractor = projectInfoExtractor;
         this.repoConfigRepo = repoConfigRepo;
         this.buildLogService = buildLogService;
+        this.analysisDataExtractor = analysisDataExtractor;
     }
 
     // AI 文档生成的 system prompt
@@ -60,6 +64,9 @@ public class DocGenerator {
 
     /**
      * AI 生成完整项目概览文档（异步调用）
+     * 包含两个层次：
+     * 1. 项目级业务概览（面向产品经理）
+     * 2. 接口级技术详情（面向开发人员，含方法调用链和 Mermaid 图）
      */
     public String generateAIOverview(Long repoId) {
         RepositoryEntity repo = repositoryRepo.findById(repoId).orElse(null);
@@ -70,31 +77,67 @@ public class DocGenerator {
 
         StringBuilder fullDoc = new StringBuilder();
 
-        // ========== 第 1 轮：AI 项目简介 + 技术栈 + 架构图 + 外部依赖 + 功能模块 ==========
-        buildLogService.append(repoId, "📖 [1/4] 生成项目简介和架构信息...");
+        // ========== 第 1 轮：AI 项目简介 + 核心能力 ==========
+        buildLogService.append(repoId, "📖 [1/6] 生成项目简介和核心能力...");
         try {
-            String round1 = generateRound1(repo, endpoints, allBoundaries);
+            String round1 = generateProjectIntroduction(repo, endpoints, allBoundaries);
             fullDoc.append(round1).append("\n\n");
-            buildLogService.append(repoId, "✅ [1/4] 项目简介和架构信息完成");
+            buildLogService.append(repoId, "✅ [1/6] 项目简介完成");
         } catch (Exception e) {
             logger.error("[文档生成] 第1轮失败", e);
-            buildLogService.append(repoId, "【异常点】 [1/4] 失败: " + e.getMessage());
+            buildLogService.append(repoId, "【异常点】 [1/6] 失败: " + e.getMessage());
             fullDoc.append("## 项目简介\n\n> 生成失败，请重试\n\n");
         }
 
-        // ========== 项目结构（代码直出，不过 AI）==========
-        buildLogService.append(repoId, "📖 [2/4] 生成项目结构...");
+        // ========== 第 2 轮：技术栈 + 架构图 + 外部依赖（代码直出）==========
+        buildLogService.append(repoId, "📖 [2/6] 生成技术栈和架构信息...");
         try {
-            fullDoc.append(generateProjectStructure(repoId, endpoints)).append("\n\n");
-            buildLogService.append(repoId, "✅ [2/4] 项目结构完成");
+            String techStack = generateTechnicalOverview(repo, endpoints, allBoundaries);
+            fullDoc.append(techStack).append("\n\n");
+            buildLogService.append(repoId, "✅ [2/6] 技术栈完成");
         } catch (Exception e) {
-            logger.warn("[文档生成] 项目结构生成失败", e);
-            buildLogService.append(repoId, "⚠️ [2/4] 项目结构生成跳过: " + e.getMessage());
+            logger.warn("[文档生成] 技术栈生成失败", e);
+            buildLogService.append(repoId, "⚠️ [2/6] 技术栈生成跳过: " + e.getMessage());
         }
 
-        // ========== 第 3 轮：每个接口的完整档案 ==========
-        buildLogService.append(repoId, "📖 [3/4] 生成接口档案（共 " + endpoints.size() + " 个）...");
-        fullDoc.append("## 接口详情\n\n");
+        // ========== 第 3 轮：功能模块和主要功能（业务视角）==========
+        buildLogService.append(repoId, "📖 [3/6] 生成功能模块清单...");
+        try {
+            String modules = generateBusinessModules(repo, endpoints);
+            fullDoc.append(modules).append("\n\n");
+            buildLogService.append(repoId, "✅ [3/6] 功能模块完成");
+        } catch (Exception e) {
+            logger.error("[文档生成] 第3轮失败", e);
+            buildLogService.append(repoId, "【异常点】 [3/6] 失败: " + e.getMessage());
+        }
+
+        // ========== 第 4 轮：业务数据字典（枚举/状态码/错误码）==========
+        buildLogService.append(repoId, "📖 [4/6] 生成数据字典...");
+        try {
+            String dataDict = generateBusinessDataDictionary(repoId);
+            fullDoc.append(dataDict).append("\n\n");
+            buildLogService.append(repoId, "✅ [4/6] 数据字典完成");
+        } catch (Exception e) {
+            logger.error("[文档生成] 第4轮失败", e);
+            buildLogService.append(repoId, "【异常点】 [4/6] 失败: " + e.getMessage());
+        }
+
+        // ========== 第 5 轮：项目级业务流程（主要用户场景）==========
+        buildLogService.append(repoId, "📖 [5/6] 生成主要业务流程...");
+        try {
+            String flows = generateBusinessFlows(repo, endpoints, allBoundaries);
+            fullDoc.append(flows).append("\n\n");
+            buildLogService.append(repoId, "✅ [5/6] 业务流程完成");
+        } catch (Exception e) {
+            logger.error("[文档生成] 第5轮失败", e);
+            buildLogService.append(repoId, "【异常点】 [5/6] 失败: " + e.getMessage());
+        }
+
+        // ========== 第 6 轮：接口技术详情（方法级调用链 + Mermaid 图）==========
+        buildLogService.append(repoId, "📖 [6/6] 生成接口技术详情（共 " + endpoints.size() + " 个）...");
+        fullDoc.append("## 接口技术详情\n\n");
+        fullDoc.append("> 以下是每个接口的详细技术实现，包含方法调用链和流程图。\n\n");
+        
         int done = 0;
         for (ApiEndpointEntity ep : endpoints) {
             try {
@@ -102,31 +145,392 @@ public class DocGenerator {
                 fullDoc.append(epDoc).append("\n\n");
                 done++;
                 if (done % 5 == 0) {
-                    buildLogService.append(repoId, "📖 [3/4] 已完成 " + done + "/" + endpoints.size() + " 个接口");
+                    buildLogService.append(repoId, "📖 [6/6] 已完成 " + done + "/" + endpoints.size() + " 个接口");
                 }
             } catch (Exception e) {
-                logger.warn("[文档生成] 接口档案失败: {}", ep.getFullMethod(), e);
+                logger.warn("[文档生成] 接口详情失败: {}", ep.getFullMethod(), e);
                 String shortName = shortClass(ep.getClassName()) + "." + shortMethodName(ep.getFullMethod());
                 fullDoc.append("### ").append(shortName).append("\n\n> 生成失败\n\n");
             }
         }
-        buildLogService.append(repoId, "✅ [3/4] 接口档案完成（" + done + "/" + endpoints.size() + "）");
+        buildLogService.append(repoId, "✅ [6/6] 接口详情完成（" + done + "/" + endpoints.size() + "）");
 
-        // ========== 第 4 轮：状态机 + 错误码 + 风险点 ==========
-        buildLogService.append(repoId, "📖 [4/4] 生成状态流转和风险分析...");
-        try {
-            String round3 = generateRound3(repoId, repo, allBoundaries);
-            fullDoc.append(round3).append("\n\n");
-            buildLogService.append(repoId, "✅ [4/4] 状态流转和风险分析完成");
-        } catch (Exception e) {
-            logger.error("[文档生成] 第4轮失败", e);
-            buildLogService.append(repoId, "【异常点】 [4/4] 失败: " + e.getMessage());
-        }
-
-        // 追加静态统计
+        // 追加统计信息
         fullDoc.append(generateStaticSections(repoId, repo));
 
         return fullDoc.toString();
+    }
+
+    /**
+     * 第 1 轮：项目简介 + 核心能力（AI 生成，面向产品经理）
+     * 重点：这个项目是什么、服务于谁、解决什么问题、核心能力有哪些
+     */
+    private String generateProjectIntroduction(RepositoryEntity repo, List<ApiEndpointEntity> endpoints,
+                                                List<BoundaryEntity> allBoundaries) {
+        var projectInfo = projectInfoExtractor.extract(repo.getLocalPath());
+
+        // ===== 提取枚举和业务数据（用于让 AI 了解业务域）=====
+        Map<String, List<AnalysisDataExtractor.EnumConstant>> allEnums = analysisDataExtractor.extractAllEnums(repo.getId());
+        StringBuilder businessContext = new StringBuilder();
+        
+        // 枚举常量（状态、类型等业务概念）
+        if (!allEnums.isEmpty()) {
+            businessContext.append("### 业务数据\n\n");
+            int count = 0;
+            for (var entry : allEnums.entrySet()) {
+                if (count++ >= 5) break; // 只取前5个，避免上下文过长
+                String shortClassName = entry.getKey().contains(".") 
+                    ? entry.getKey().substring(entry.getKey().lastIndexOf('.') + 1) 
+                    : entry.getKey();
+                businessContext.append("**").append(shortClassName).append("**：");
+                businessContext.append(entry.getValue().stream()
+                    .limit(10)
+                    .map(c -> c.constName() + (c.description() != null && !c.description().isBlank() ? "(" + c.description() + ")" : ""))
+                    .collect(Collectors.joining("、")));
+                businessContext.append("\n\n");
+            }
+        }
+
+        // ===== 接口清单：按业务特征分组 =====
+        StringBuilder endpointList = new StringBuilder();
+        Map<String, List<String>> groupedEndpoints = groupEndpointsByBusinessFeature(endpoints, repo.getId());
+        
+        for (Map.Entry<String, List<String>> group : groupedEndpoints.entrySet()) {
+            endpointList.append("**").append(group.getKey()).append("**\n");
+            for (String ep : group.getValue()) {
+                endpointList.append("- ").append(ep).append("\n");
+            }
+            endpointList.append("\n");
+        }
+
+        // ===== AI 生成：项目简介 + 核心能力 =====
+        String prompt = "你是一个产品经理，正在阅读一个新项目的代码分析报告。请用业务语言（非技术术语）描述这个项目。\n\n"
+                + "## 项目名称\n" + repo.getName() + "\n\n"
+                + "## 接口列表（共 " + endpoints.size() + " 个）\n"
+                + endpointList + "\n"
+                + businessContext
+                + "\n## 请生成以下内容\n\n"
+                + "### 项目简介\n"
+                + "用 2-3 句话说明：\n"
+                + "1. 这个项目是什么（业务领域）\n"
+                + "2. 服务于谁（用户/客户）\n"
+                + "3. 解决什么问题（核心价值）\n\n"
+                + "### 核心能力\n"
+                + "列出 3-5 个核心功能模块，每个模块用一句话说明它做什么、为什么重要。\n"
+                + "用业务语言，不要提及技术实现（如类名、方法名、数据库等）。\n\n"
+                + "**要求：**\n"
+                + "- 只基于提供的接口和数据生成内容，不要臆测\n"
+                + "- 使用 Markdown 格式输出\n"
+                + "- 不要添加接口列表中不存在的功能";
+
+        return claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+    }
+
+    /**
+     * 按业务特征对接口进行分组（基于 URL 路径和功能描述）
+     */
+    private Map<String, List<String>> groupEndpointsByBusinessFeature(List<ApiEndpointEntity> endpoints, Long repoId) {
+        Map<String, List<String>> grouped = new LinkedHashMap<>();
+        
+        for (ApiEndpointEntity ep : endpoints) {
+            String method = ep.getHttpMethod() != null ? ep.getHttpMethod() : ep.getEndpointType();
+            String url = ep.getUrlPath() != null ? ep.getUrlPath() : "";
+            String desc = "";
+            
+            // 获取功能描述
+            var chunk = chunkRepo.findByRepoIdAndFullMethod(repoId, ep.getFullMethod());
+            if (chunk.isPresent() && chunk.get().getCallSummary() != null) {
+                for (String part : chunk.get().getCallSummary().split("\\|")) {
+                    String trimmed = part.trim();
+                    if (trimmed.length() >= 2 && trimmed.length() <= 30) {
+                        desc = trimmed;
+                        break;
+                    }
+                }
+            }
+            
+            // 根据 URL 路径判断业务模块
+            String group = inferBusinessModule(url, desc);
+            String epLine = method + " " + url + (!desc.isEmpty() ? " — " + desc : "");
+            grouped.computeIfAbsent(group, k -> new ArrayList<>()).add(epLine);
+        }
+        
+        return grouped;
+    }
+
+    /**
+     * 根据 URL 路径推断业务模块
+     */
+    private String inferBusinessModule(String url, String desc) {
+        if (url == null || url.isEmpty()) return "其他";
+        
+        String path = url.toLowerCase();
+        
+        // 常见业务模块关键词
+        if (path.contains("/user") || path.contains("/account") || path.contains("/profile")) return "用户管理";
+        if (path.contains("/order") || path.contains("/purchase")) return "订单管理";
+        if (path.contains("/product") || path.contains("/goods") || path.contains("/item")) return "商品管理";
+        if (path.contains("/payment") || path.contains("/pay")) return "支付";
+        if (path.contains("/auth") || path.contains("/login") || path.contains("/register")) return "认证授权";
+        if (path.contains("/admin") || path.contains("/system") || path.contains("/config")) return "系统管理";
+        if (path.contains("/report") || path.contains("/statistic") || path.contains("/analytics")) return "报表分析";
+        if (path.contains("/message") || path.contains("/notification") || path.contains("/notice")) return "消息通知";
+        if (path.contains("/file") || path.contains("/upload") || path.contains("/download")) return "文件管理";
+        if (path.contains("/log") || path.contains("/audit")) return "日志审计";
+        
+        // 根据描述推断
+        if (desc != null && !desc.isEmpty()) {
+            if (desc.contains("用户") || desc.contains("账户")) return "用户管理";
+            if (desc.contains("订单")) return "订单管理";
+            if (desc.contains("商品") || desc.contains("产品")) return "商品管理";
+            if (desc.contains("支付")) return "支付";
+            if (desc.contains("登录") || desc.contains("认证")) return "认证授权";
+        }
+        
+        // 从 URL 第一段提取
+        String[] segments = path.split("/");
+        if (segments.length >= 2 && !segments[1].isEmpty()) {
+            return segments[1].substring(0, 1).toUpperCase() + segments[1].substring(1) + " 模块";
+        }
+        
+        return "其他";
+    }
+
+    /**
+     * 第 2 轮：技术栈 + 架构图 + 外部依赖（代码直出）
+     */
+    private String generateTechnicalOverview(RepositoryEntity repo, List<ApiEndpointEntity> endpoints,
+                                              List<BoundaryEntity> allBoundaries) {
+        var projectInfo = projectInfoExtractor.extract(repo.getLocalPath());
+
+        // ===== 外部依赖列表 =====
+        List<String[]> deps = new ArrayList<>();
+        Set<String> seenDeps = new HashSet<>();
+        for (BoundaryEntity b : allBoundaries) {
+            if ("HTTP".equals(b.getBoundaryType()) || "GRPC".equals(b.getBoundaryType()) || "MQ".equals(b.getBoundaryType())) {
+                String firstLine = b.getContext() != null ? b.getContext().split("\n")[0] : "";
+                String key = b.getBoundaryType() + "|" + firstLine;
+                if (seenDeps.add(key)) {
+                    deps.add(new String[]{b.getBoundaryType(), firstLine});
+                }
+            }
+        }
+
+        String techStackMd = buildTechStackMd(repo.getName(), projectInfo);
+        String archMd = buildArchMd(repo.getId(), repo.getName(), deps);
+        String externalDepsMd = buildExternalDepsMd(repo.getId(), deps);
+
+        return techStackMd + "\n\n" + archMd + "\n\n" + externalDepsMd;
+    }
+
+    /**
+     * 第 3 轮：功能模块清单（AI 生成，面向业务，带接口链接）
+     */
+    private String generateBusinessModules(RepositoryEntity repo, List<ApiEndpointEntity> endpoints) {
+        // 按业务模块分组
+        Map<String, List<ApiEndpointEntity>> groupedEndpoints = new LinkedHashMap<>();
+        
+        for (ApiEndpointEntity ep : endpoints) {
+            String method = ep.getHttpMethod() != null ? ep.getHttpMethod() : ep.getEndpointType();
+            String url = ep.getUrlPath() != null ? ep.getUrlPath() : "";
+            String desc = "";
+            
+            // 获取功能描述
+            var chunk = chunkRepo.findByRepoIdAndFullMethod(repo.getId(), ep.getFullMethod());
+            if (chunk.isPresent() && chunk.get().getCallSummary() != null) {
+                for (String part : chunk.get().getCallSummary().split("\\|")) {
+                    String trimmed = part.trim();
+                    if (trimmed.length() >= 2 && trimmed.length() <= 30) {
+                        desc = trimmed;
+                        break;
+                    }
+                }
+            }
+            
+            // 根据 URL 路径判断业务模块
+            String group = inferBusinessModule(url, desc);
+            groupedEndpoints.computeIfAbsent(group, k -> new ArrayList<>()).add(ep);
+        }
+        
+        StringBuilder moduleList = new StringBuilder();
+        for (Map.Entry<String, List<ApiEndpointEntity>> group : groupedEndpoints.entrySet()) {
+            moduleList.append("### ").append(group.getKey()).append("\n");
+            moduleList.append("接口数量：").append(group.getValue().size()).append(" 个\n\n");
+            moduleList.append("**主要功能：**\n");
+            
+            for (ApiEndpointEntity ep : group.getValue().stream().limit(10).collect(Collectors.toList())) {
+                String method = ep.getHttpMethod() != null ? ep.getHttpMethod() : ep.getEndpointType();
+                String url = ep.getUrlPath() != null ? ep.getUrlPath() : "";
+                String desc = "";
+                var chunk = chunkRepo.findByRepoIdAndFullMethod(repo.getId(), ep.getFullMethod());
+                if (chunk.isPresent() && chunk.get().getCallSummary() != null) {
+                    for (String part : chunk.get().getCallSummary().split("\\|")) {
+                        String trimmed = part.trim();
+                        if (trimmed.length() >= 2 && trimmed.length() <= 30) {
+                            desc = trimmed;
+                            break;
+                        }
+                    }
+                }
+                
+                // 生成锚点链接到详情章节
+                String anchor = generateAnchor(ep);
+                String epLine = method + " " + url + (!desc.isEmpty() ? " — " + desc : "");
+                moduleList.append("- [").append(epLine).append("](#").append(anchor).append(")\n");
+            }
+            
+            if (group.getValue().size() > 10) {
+                moduleList.append("- _...还有 ").append(group.getValue().size() - 10).append(" 个接口_\n");
+            }
+            moduleList.append("\n");
+        }
+
+        String prompt = "以下是项目的功能模块清单，每个模块都列出了相关的接口。\n\n"
+                + "## 功能模块\n\n" + moduleList
+                + "\n请为每个模块生成一段业务描述（2-3句话），说明：\n"
+                + "1. 这个模块的主要职责\n"
+                + "2. 典型的使用场景\n"
+                + "3. 与其他模块的关系（如果有）\n\n"
+                + "**要求：**\n"
+                + "- 用业务语言，不要提及技术实现\n"
+                + "- 保持原有的 Markdown 结构和模块名称\n"
+                + "- 在每个模块标题下添加业务描述，然后保留接口列表（包括链接）\n"
+                + "- 只输出完整的 Markdown，不要有解释性文字";
+
+        return "## 功能模块\n\n" + claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+    }
+
+    /**
+     * 为接口生成 Markdown 锚点 ID
+     */
+    private String generateAnchor(ApiEndpointEntity ep) {
+        String shortClass = shortClass(ep.getClassName());
+        String methodName = shortMethodName(ep.getFullMethod());
+        String anchor = (shortClass + "-" + methodName)
+            .toLowerCase()
+            .replaceAll("[^a-z0-9-]", "-")
+            .replaceAll("-+", "-")
+            .replaceAll("^-|-$", "");
+        return anchor;
+    }
+
+    /**
+     * 第 4 轮：业务数据字典（枚举/状态码/错误码）
+     */
+    private String generateBusinessDataDictionary(Long repoId) {
+        Map<String, List<AnalysisDataExtractor.EnumConstant>> allEnums = analysisDataExtractor.extractAllEnums(repoId);
+        List<AnalysisDataExtractor.FieldConstant> fieldConstants = analysisDataExtractor.extractAllFieldConstants(repoId);
+        
+        StringBuilder dict = new StringBuilder();
+        dict.append("## 业务数据字典\n\n");
+        dict.append("> 这些常量和枚举定义了系统中的业务规则和状态流转。\n\n");
+        
+        // 枚举常量
+        if (!allEnums.isEmpty()) {
+            dict.append("### 枚举/状态码\n\n");
+            for (Map.Entry<String, List<AnalysisDataExtractor.EnumConstant>> entry : allEnums.entrySet()) {
+                String shortClassName = entry.getKey().contains(".") 
+                    ? entry.getKey().substring(entry.getKey().lastIndexOf('.') + 1) 
+                    : entry.getKey();
+                dict.append("#### ").append(shortClassName).append("\n\n");
+                dict.append("| 常量名 | 代码值 | 说明 |\n|--------|--------|------|\n");
+                for (AnalysisDataExtractor.EnumConstant c : entry.getValue()) {
+                    String code = c.code() != null && !c.code().isBlank() ? c.code() : "-";
+                    String desc = c.description() != null && !c.description().isBlank() ? c.description() : "-";
+                    dict.append("| `").append(c.constName()).append("` | ").append(code).append(" | ").append(desc).append(" |\n");
+                }
+                dict.append("\n");
+            }
+        }
+        
+        // 静态常量字段（业务常量）
+        if (!fieldConstants.isEmpty()) {
+            dict.append("### 常量定义\n\n");
+            dict.append("| 类名 | 字段名 | 值 |\n|------|--------|----|\n");
+            int count = 0;
+            for (AnalysisDataExtractor.FieldConstant fc : fieldConstants) {
+                if (count++ >= 30) break; // 限制数量
+                String shortClassName = fc.className().contains(".") 
+                    ? fc.className().substring(fc.className().lastIndexOf('.') + 1) 
+                    : fc.className();
+                String value = fc.value() != null ? fc.value() : "-";
+                dict.append("| ").append(shortClassName).append(" | `").append(fc.fieldName()).append("` | ").append(value).append(" |\n");
+            }
+            dict.append("\n");
+        }
+        
+        if (allEnums.isEmpty() && fieldConstants.isEmpty()) {
+            return "";
+        }
+        
+        return dict.toString();
+    }
+
+    /**
+     * 第 5 轮：项目级业务流程（基于调用链生成 Mermaid 图）
+     * 重点：为每个主要模块的代表性接口生成调用链时序图
+     */
+    private String generateBusinessFlows(RepositoryEntity repo, List<ApiEndpointEntity> endpoints,
+                                          List<BoundaryEntity> allBoundaries) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("## 主要业务流程\n\n");
+        sb.append("> 以下是基于接口分析生成的主要业务场景流程图。\n\n");
+        
+        // 按业务模块分组
+        Map<String, List<ApiEndpointEntity>> groupedEndpoints = new LinkedHashMap<>();
+        for (ApiEndpointEntity ep : endpoints) {
+            String method = ep.getHttpMethod() != null ? ep.getHttpMethod() : ep.getEndpointType();
+            String url = ep.getUrlPath() != null ? ep.getUrlPath() : "";
+            String desc = "";
+            
+            var chunk = chunkRepo.findByRepoIdAndFullMethod(repo.getId(), ep.getFullMethod());
+            if (chunk.isPresent() && chunk.get().getCallSummary() != null) {
+                for (String part : chunk.get().getCallSummary().split("\\|")) {
+                    String trimmed = part.trim();
+                    if (trimmed.length() >= 2 && trimmed.length() <= 30) {
+                        desc = trimmed;
+                        break;
+                    }
+                }
+            }
+            
+            String group = inferBusinessModule(url, desc);
+            groupedEndpoints.computeIfAbsent(group, k -> new ArrayList<>()).add(ep);
+        }
+        
+        // 为每个主要模块生成一个时序图（最多3个）
+        int count = 0;
+        for (Map.Entry<String, List<ApiEndpointEntity>> group : groupedEndpoints.entrySet()) {
+            if (count++ >= 3) break;
+            if (group.getValue().isEmpty()) continue;
+            
+            // 选择该模块最具代表性的接口（第一个）
+            ApiEndpointEntity representativeEp = group.getValue().get(0);
+            
+            sb.append("### ").append(group.getKey()).append("\n\n");
+            
+            String method = representativeEp.getHttpMethod() != null ? representativeEp.getHttpMethod() : "";
+            String url = representativeEp.getUrlPath() != null ? representativeEp.getUrlPath() : "";
+            sb.append("**示例接口：** ").append(method).append(" ").append(url).append("\n\n");
+            
+            // 使用统一的调用链图生成方法
+            try {
+                var tree = callGraphEngine.expandCallTree(repo.getId(), representativeEp.getFullMethod(), 10);
+                if (tree.root() != null) {
+                    String diagram = generateTechnicalSequenceDiagram(tree.root(), repo.getId());
+                    sb.append(diagram);
+                } else {
+                    sb.append("> 调用链数据不可用\n");
+                }
+            } catch (Exception e) {
+                logger.warn("[项目概览] 生成业务流程图失败: {}", representativeEp.getFullMethod(), e);
+                sb.append("> 流程图生成失败\n");
+            }
+            
+            sb.append("\n\n");
+        }
+        
+        return sb.toString();
     }
 
     /**
@@ -761,7 +1165,10 @@ public class DocGenerator {
     private String generateEndpointDoc(Long repoId, RepositoryEntity repo, ApiEndpointEntity ep) {
         String httpInfo = ep.getHttpMethod() != null ? ep.getHttpMethod() + " " : "";
         String urlInfo = ep.getUrlPath() != null ? ep.getUrlPath() : "";
-        String header = "### " + shortClass(ep.getClassName()) + " · " + httpInfo + urlInfo + "\n\n";
+        
+        // 生成锚点 ID
+        String anchor = generateAnchor(ep);
+        String header = "<a name=\"" + anchor + "\"></a>\n\n### " + shortClass(ep.getClassName()) + " · " + httpInfo + urlInfo + "\n\n";
 
         // ===== 加载调用链源码 =====
         StringBuilder sourceContext = new StringBuilder();
@@ -838,6 +1245,18 @@ public class DocGenerator {
                 : "源码中未检测到该接口的外部依赖（HTTP/gRPC/MQ/DB 边界点）。";
 
         // ===== 构建 prompt，严格基于已加载的源码内容 =====
+        
+        // 先生成 Mermaid 时序图（代码生成）
+        String mermaidDiagram = "";
+        try {
+            var tree = callGraphEngine.expandCallTree(repoId, ep.getFullMethod(), 10);
+            if (tree.root() != null) {
+                mermaidDiagram = generateTechnicalSequenceDiagram(tree.root(), repoId);
+            }
+        } catch (Exception e) {
+            logger.warn("[文档生成] Mermaid 图生成失败: {}", ep.getFullMethod(), e);
+        }
+        
         String prompt = "## 接口信息\n"
                 + "- 类型：" + ep.getEndpointType() + "\n"
                 + "- 方法：" + httpInfo + urlInfo + "\n"
@@ -852,13 +1271,11 @@ public class DocGenerator {
                 + "- 所有内容只能来自上方提供的源码，不得推断、补全或引入任何源码中不存在的内容\n"
                 + "- 如果某项内容在源码中找不到依据，该项输出：`【异常点】 异常点：源码中未找到[具体内容]，需补充后重新生成`\n"
                 + "- 禁止使用\"可能\"、\"通常\"、\"建议\"、\"一般来说\"等推断性措辞\n"
-                + "- 用 ### 作为标题级别\n\n"
+                + "- 用 ### 作为标题级别\n"
+                + "- 不要生成 Mermaid 图，图表已单独生成\n\n"
                 + "## 请生成以下内容\n\n"
                 + "### 功能描述\n"
                 + "用 1-2 句话描述这个接口的业务功能。只能根据源码中的方法名、注释、日志文字描述，不得推断。\n\n"
-                + "### 业务流程\n"
-                + "根据调用链源码的实际执行顺序，用 Mermaid sequenceDiagram 画出流程。"
-                + "参与者只能使用源码中出现的类名（可缩短为简单类名），不得替换为推断的业务系统名称。\n\n"
                 + "### 入参说明\n"
                 + (paramLoaded
                     ? "表格：字段名 | 类型 | 必填 | 限制 | 说明\n只列出入参实体类中明确存在的字段，限制只填写源码中有注解或 if 判断明确约束的内容，没有就填 - 。\n"
@@ -876,7 +1293,295 @@ public class DocGenerator {
                 + "\n### 数据变更\n"
                 + "只列出源码中明确出现的数据库写操作（INSERT/UPDATE/DELETE），标注来源。找不到时输出：`源码中未发现数据库写操作`。\n";
 
-        return header + claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        // 组合：先输出 AI 生成的文字描述，再插入代码生成的 Mermaid 图
+        String aiContent = claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        
+        // 在功能描述之后插入业务流程图
+        if (!mermaidDiagram.isEmpty()) {
+            aiContent = aiContent.replaceFirst(
+                "(### 功能描述.*?)(\n### |$)",
+                "$1\n\n### 业务流程\n\n" + mermaidDiagram + "\n\n$2"
+            );
+        }
+        
+        return header + aiContent;
+    }
+
+    /**
+     * 生成技术级时序图（基于调用链树，代码生成）
+     */
+    private String generateTechnicalSequenceDiagram(CallGraphEngine.CallTreeNodeDTO root, Long repoId) {
+        logger.info("[技术时序图] 开始生成，root: {}", root != null ? root.fullMethod() : "null");
+        
+        StringBuilder sb = new StringBuilder();
+        
+        sb.append("```mermaid\n");
+        sb.append("%%{init: {'theme':'base', 'themeVariables': {");
+        sb.append("'primaryColor':'#e3f2fd',");
+        sb.append("'actorBorder':'#1976d2',");
+        sb.append("'actorBkg':'#e3f2fd',");
+        sb.append("'signalColor':'#1976d2'");
+        sb.append("}}}%%\n");
+        
+        sb.append("sequenceDiagram\n");
+        
+        // 收集所有参与者（按类名分组）
+        Map<String, String> participants = new LinkedHashMap<>();
+        Set<String> visited = new HashSet<>();
+        collectParticipants(root, participants, visited);
+        
+        logger.info("[技术时序图] 收集到参与者数量: {}", participants.size());
+        
+        // 输出参与者定义（emoji 放在名称中）
+        int participantId = 0;
+        Map<String, String> participantIds = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : participants.entrySet()) {
+            String shortName = entry.getKey();
+            String emoji = selectClassIcon(shortName);
+            String pid = "P" + participantId++;
+            participantIds.put(shortName, pid);
+            // emoji 放在显示名称里
+            sb.append("    participant ").append(pid).append(" as ").append(emoji).append(" ").append(shortName).append("\n");
+            logger.debug("[技术时序图] 参与者: {} {}", emoji, shortName);
+        }
+        
+        sb.append("\n");
+        
+        // 生成调用序列（使用 participantIds）
+        visited.clear();
+        generateCallSequenceWithIds(root, sb, participants, participantIds, visited, repoId, 0);
+        
+        sb.append("```");
+        
+        String result = sb.toString();
+        logger.info("[技术时序图] 生成完成，长度: {}", result.length());
+        
+        return result;
+    }
+
+    /**
+     * 收集参与者（去重的类名）
+     */
+    private void collectParticipants(CallGraphEngine.CallTreeNodeDTO node, 
+                                      Map<String, String> participants, Set<String> visited) {
+        if (node == null) return;
+        
+        // 使用 fullMethod 来避免重复访问
+        String fullMethod = node.fullMethod();
+        if (!visited.add(fullMethod)) return;
+        
+        // 收集当前节点的类名
+        String className = extractClassName(fullMethod);
+        String shortName = shortClass(className);
+        
+        if (!participants.containsKey(shortName)) {
+            participants.put(shortName, className);
+            logger.debug("[技术时序图] 收集参与者: {} -> {}", shortName, className);
+        }
+        
+        // 递归收集子节点
+        if (node.children() != null) {
+            for (var child : node.children()) {
+                collectParticipants(child, participants, visited);
+            }
+        }
+    }
+
+    /**
+     * 生成调用序列（使用参与者ID，emoji在participant声明中）
+     */
+    private void generateCallSequenceWithIds(CallGraphEngine.CallTreeNodeDTO node, StringBuilder sb,
+                                       Map<String, String> participants, Map<String, String> participantIds,
+                                       Set<String> visited, Long repoId, int depth) {
+        if (node == null || depth > 8) return; // 限制深度避免过于复杂
+        
+        String callerClass = shortClass(extractClassName(node.fullMethod()));
+        
+        if (node.children() != null && !node.children().isEmpty()) {
+            for (var child : node.children()) {
+                String calleeClass = shortClass(extractClassName(child.fullMethod()));
+                String calleeMethod = extractMethodName(child.fullMethod());
+                
+                // 获取参与者 ID，如果不存在则跳过（理论上不应该发生）
+                String callerPid = participantIds.get(callerClass);
+                String calleePid = participantIds.get(calleeClass);
+                
+                if (callerPid == null || calleePid == null) {
+                    logger.warn("[技术时序图] 找不到参与者ID: caller={} (pid={}), callee={} (pid={})", 
+                               callerClass, callerPid, calleeClass, calleePid);
+                    continue;
+                }
+                
+                // 检查是否有边界点
+                List<BoundaryEntity> boundaries = boundaryRepo.findByRepoIdAndFullMethod(repoId, child.fullMethod());
+                
+                // 选择操作图标
+                String icon = selectMethodIcon(calleeMethod, boundaries);
+                
+                // 生成调用（使用参与者ID）
+                sb.append("    ").append(callerPid).append("->>");
+                sb.append(calleePid).append(": ").append(icon).append(" ");
+                sb.append(shortenMethodName(calleeMethod)).append("\n");
+                sb.append("    activate ").append(calleePid).append("\n");
+                
+                // 如果有边界点，添加注释
+                if (!boundaries.isEmpty()) {
+                    for (BoundaryEntity b : boundaries) {
+                        String boundaryIcon = selectBoundaryIcon(b.getBoundaryType());
+                        sb.append("    Note over ").append(calleePid).append(": ");
+                        sb.append(boundaryIcon).append(" ").append(b.getBoundaryType()).append("\n");
+                        break; // 只显示第一个
+                    }
+                }
+                
+                // 递归处理子调用
+                if (child.children() != null && !child.children().isEmpty()) {
+                    generateCallSequenceWithIds(child, sb, participants, participantIds, visited, repoId, depth + 1);
+                }
+                
+                sb.append("    ").append(calleePid).append("-->>");
+                sb.append(callerPid).append(": 返回\n");
+                sb.append("    deactivate ").append(calleePid).append("\n");
+            }
+        }
+    }
+    
+    /**
+     * 生成调用序列（旧方法，保留用于其他地方可能的调用）
+     */
+    private void generateCallSequence(CallGraphEngine.CallTreeNodeDTO node, StringBuilder sb,
+                                       Map<String, String> participants, Set<String> visited,
+                                       Long repoId, int depth) {
+        if (node == null || depth > 8) return; // 限制深度避免过于复杂
+        
+        String callerClass = shortClass(extractClassName(node.fullMethod()));
+        String methodName = extractMethodName(node.fullMethod());
+        
+        if (node.children() != null && !node.children().isEmpty()) {
+            for (var child : node.children()) {
+                String calleeClass = shortClass(extractClassName(child.fullMethod()));
+                String calleeMethod = extractMethodName(child.fullMethod());
+                
+                // 检查是否有边界点
+                List<BoundaryEntity> boundaries = boundaryRepo.findByRepoIdAndFullMethod(repoId, child.fullMethod());
+                
+                // 选择操作图标
+                String icon = selectMethodIcon(calleeMethod, boundaries);
+                
+                // 生成调用
+                String callerEmoji = selectClassIcon(callerClass);
+                String calleeEmoji = selectClassIcon(calleeClass);
+                
+                sb.append("    ").append(callerEmoji).append("->>");
+                sb.append(calleeEmoji).append(": ").append(icon).append(" ");
+                sb.append(shortenMethodName(calleeMethod)).append("\n");
+                sb.append("    activate ").append(calleeEmoji).append("\n");
+                
+                // 如果有边界点，添加注释
+                if (!boundaries.isEmpty()) {
+                    for (BoundaryEntity b : boundaries) {
+                        String boundaryIcon = selectBoundaryIcon(b.getBoundaryType());
+                        sb.append("    Note over ").append(calleeEmoji).append(": ");
+                        sb.append(boundaryIcon).append(" ").append(b.getBoundaryType()).append("\n");
+                        break; // 只显示第一个
+                    }
+                }
+                
+                // 递归处理子调用
+                if (child.children() != null && !child.children().isEmpty()) {
+                    generateCallSequence(child, sb, participants, visited, repoId, depth + 1);
+                }
+                
+                sb.append("    ").append(calleeEmoji).append("-->>");
+                sb.append(callerEmoji).append(": 返回\n");
+                sb.append("    deactivate ").append(calleeEmoji).append("\n");
+            }
+        }
+    }
+
+    /**
+     * 为类选择合适的 Emoji 图标
+     */
+    private String selectClassIcon(String className) {
+        String lower = className.toLowerCase();
+        
+        if (lower.contains("controller")) return "🖥️";
+        if (lower.contains("service")) return "⚙️";
+        if (lower.contains("manager")) return "🔧";
+        if (lower.contains("mapper") || lower.contains("dao") || lower.contains("repository")) return "💾";
+        if (lower.contains("client") || lower.contains("feign")) return "🌐";
+        if (lower.contains("producer") || lower.contains("consumer")) return "📨";
+        if (lower.contains("handler")) return "🔨";
+        if (lower.contains("provider")) return "📦";
+        if (lower.contains("validator")) return "✅";
+        if (lower.contains("converter") || lower.contains("transformer")) return "🔄";
+        if (lower.contains("filter") || lower.contains("interceptor")) return "🚦";
+        if (lower.contains("config") || lower.contains("configuration")) return "⚙️";
+        
+        return "📄";
+    }
+
+    /**
+     * 为方法选择合适的 Emoji 图标
+     */
+    private String selectMethodIcon(String methodName, List<BoundaryEntity> boundaries) {
+        String lower = methodName.toLowerCase();
+        
+        // 优先根据边界点类型
+        if (!boundaries.isEmpty()) {
+            BoundaryEntity b = boundaries.get(0);
+            if ("DB".equals(b.getBoundaryType())) {
+                if (lower.contains("insert") || lower.contains("save") || lower.contains("add")) return "➕";
+                if (lower.contains("update") || lower.contains("modify")) return "✏️";
+                if (lower.contains("delete") || lower.contains("remove")) return "🗑️";
+                if (lower.contains("select") || lower.contains("get") || lower.contains("find") || lower.contains("query")) return "🔍";
+                return "💾";
+            }
+            if ("HTTP".equals(b.getBoundaryType()) || "GRPC".equals(b.getBoundaryType())) return "🌐";
+            if ("MQ".equals(b.getBoundaryType())) return "📨";
+        }
+        
+        // 基于方法名
+        if (lower.contains("valid") || lower.contains("check") || lower.contains("verify")) return "✅";
+        if (lower.contains("create") || lower.contains("add") || lower.contains("insert") || lower.contains("save")) return "➕";
+        if (lower.contains("update") || lower.contains("modify") || lower.contains("edit")) return "✏️";
+        if (lower.contains("delete") || lower.contains("remove")) return "🗑️";
+        if (lower.contains("get") || lower.contains("find") || lower.contains("query") || lower.contains("select") || lower.contains("search")) return "🔍";
+        if (lower.contains("send") || lower.contains("push") || lower.contains("publish")) return "📤";
+        if (lower.contains("receive") || lower.contains("consume") || lower.contains("handle")) return "📥";
+        if (lower.contains("convert") || lower.contains("transform") || lower.contains("map")) return "🔄";
+        if (lower.contains("build") || lower.contains("construct")) return "🔨";
+        if (lower.contains("parse") || lower.contains("decode")) return "🔓";
+        if (lower.contains("encrypt") || lower.contains("encode")) return "🔐";
+        if (lower.contains("calculate") || lower.contains("compute")) return "🧮";
+        if (lower.contains("login") || lower.contains("auth")) return "🔑";
+        if (lower.contains("logout")) return "🚪";
+        if (lower.contains("pay")) return "💰";
+        
+        return "⚙️";
+    }
+
+    /**
+     * 为边界点类型选择图标
+     */
+    private String selectBoundaryIcon(String boundaryType) {
+        if ("DB".equals(boundaryType)) return "💾";
+        if ("HTTP".equals(boundaryType)) return "🌐";
+        if ("GRPC".equals(boundaryType)) return "🔗";
+        if ("MQ".equals(boundaryType)) return "📨";
+        if ("REDIS".equals(boundaryType)) return "📦";
+        return "🔌";
+    }
+
+    /**
+     * 缩短方法名（去掉参数）
+     */
+    private String shortenMethodName(String methodName) {
+        int paren = methodName.indexOf('(');
+        if (paren > 0) {
+            return methodName.substring(0, paren);
+        }
+        return methodName;
     }
 
     /**
@@ -1027,17 +1732,1273 @@ public class DocGenerator {
     // ========== 原有的静态文档生成方法保留 ==========
 
     /**
-     * 生成产品视角文档（静态，不调 AI）
+     * 生成产品视角文档（业务流程图 + 业务逻辑说明）
      */
     public String generateProductDoc(Long repoId, String entryMethod) {
-        // ... 保留原有逻辑
         CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, entryMethod, 15);
         if (tree.root() == null) return "接口未找到";
-        return codeGenerator.generate(repoId, entryMethod);
+
+        // 1. 获取入口点信息
+        var endpoint = apiEndpointRepo.findByRepoIdAndFullMethod(repoId, entryMethod).orElse(null);
+        String entryDesc = buildEntryDescription(endpoint, entryMethod);
+
+        // 2. 提取业务节点和边界点
+        List<BoundaryEntity> boundaries = collectBoundaries(repoId, tree.root());
+        List<BusinessNode> businessNodes = extractBusinessNodesWithBoundaries(tree.root(), boundaries);
+
+        // 3. 收集调用链中的所有方法
+        List<String> allMethods = new ArrayList<>();
+        collectAllMethods(tree.root(), new HashSet<>(), allMethods);
+
+        // 4. 分析数据流转
+        DataFlowSummary dataFlow = analyzeDataFlow(boundaries);
+
+        // 5. 尝试用 AI 生成（如果配置了）
+        if (claudeClient.isConfigured()) {
+            try {
+                return generateProductDocWithAI(repoId, tree.root(), entryDesc, businessNodes, dataFlow, boundaries, allMethods);
+            } catch (Exception e) {
+                logger.warn("AI 生成产品文档失败，使用模板生成", e);
+            }
+        }
+
+        // 6. Fallback: 模板生成
+        return generateProductDocTemplateWithBoundaries(repoId, entryDesc, businessNodes, dataFlow, boundaries, allMethods);
+    }
+    
+    private void collectAllMethods(CallGraphEngine.CallTreeNodeDTO node, Set<String> visited, List<String> result) {
+        if (node == null || !visited.add(node.fullMethod())) return;
+        result.add(node.fullMethod());
+        if (node.children() != null) {
+            for (var child : node.children()) {
+                collectAllMethods(child, visited, result);
+            }
+        }
     }
 
     /**
-     * 生成研发视角文档（静态，不调 AI）
+     * AI 生成产品文档（增强版：Mermaid 图代码生成 + 业务描述 AI 生成）
+     */
+    private String generateProductDocWithAI(Long repoId, CallGraphEngine.CallTreeNodeDTO root, String entryDesc, 
+                                             List<BusinessNode> nodes, DataFlowSummary dataFlow, 
+                                             List<BoundaryEntity> boundaries, List<String> allMethods) {
+        // 1. 代码生成 Mermaid 时序图（稳定可靠，基于调用链树）
+        logger.info("[产品文档] 开始生成 Mermaid 时序图，节点数: {}", nodes.size());
+        String sequenceDiagram = generateTechnicalSequenceDiagram(root, repoId);
+        logger.info("[产品文档] Mermaid 图生成完成，长度: {}", sequenceDiagram.length());
+        logger.debug("[产品文档] Mermaid 图内容:\n{}", sequenceDiagram);
+        
+        // 2. AI 生成业务描述（不包含图表）
+        logger.info("[产品文档] 开始调用 AI 生成业务描述");
+        String prompt = buildProductDocPromptWithoutDiagram(repoId, entryDesc, nodes, dataFlow, boundaries, allMethods);
+        String aiContent = claudeClient.chat(PRODUCT_DOC_SYSTEM_PROMPT_WITHOUT_DIAGRAM, List.of(
+            Map.of("role", "user", "content", prompt)
+        ));
+        logger.info("[产品文档] AI 生成完成，内容长度: {}", aiContent.length());
+        logger.debug("[产品文档] AI 返回内容:\n{}", aiContent);
+        
+        // 3. 直接在开头插入 Mermaid 图，然后追加 AI 内容
+        StringBuilder result = new StringBuilder();
+        
+        // 添加标题和业务流程图
+        result.append("## 业务流程图\n\n");
+        result.append(sequenceDiagram).append("\n\n");
+        
+        // 追加 AI 生成的业务描述
+        result.append(aiContent);
+        
+        String finalDoc = result.toString();
+        logger.info("[产品文档] 最终文档生成完成，总长度: {}, 是否包含mermaid: {}", 
+                    finalDoc.length(), finalDoc.contains("```mermaid"));
+        
+        return finalDoc;
+    }
+
+    /**
+     * 构建不包含图表生成要求的 AI Prompt
+     */
+    private String buildProductDocPromptWithoutDiagram(Long repoId, String entryDesc, List<BusinessNode> nodes,
+                                                        DataFlowSummary dataFlow, List<BoundaryEntity> boundaries,
+                                                        List<String> allMethods) {
+        // 复用原有的 prompt 构建逻辑，但移除图表生成要求
+        return buildProductDocPromptWithBoundaries(repoId, entryDesc, nodes, dataFlow, boundaries, allMethods);
+    }
+
+    // Product doc system prompt (不要求 AI 生成图表)
+    private static final String PRODUCT_DOC_SYSTEM_PROMPT_WITHOUT_DIAGRAM = """
+        你是一位产品经理，正在为团队编写产品需求文档。你的读者是产品经理、测试工程师、客服人员、业务方。
+        
+        ## 输出要求
+        1. **业务逻辑**：用业务语言描述，避免技术术语（不要出现类名、方法名、SQL、表名）
+        2. **判断条件详情**：必须包含所有关键判断条件的具体数值和含义
+           - 例如：不要写"检查状态"，要写"当状态=1时表示待审核，状态=2表示已通过"
+           - 例如：不要写"验证类型"，要写"type=ORDER表示订单，type=REFUND表示退款"
+        3. **常量和枚举**：列出所有用到的状态码、类型码、错误码及其含义
+        4. **异常场景**：必须包含具体的错误码、错误信息、触发条件
+        5. **数据流转**：说明哪些数据被创建/修改/删除，用业务术语
+        6. **用户感知**：从用户角度描述输入、输出和可能的错误提示
+        
+        ## 禁止事项
+        - 不要贴代码或伪代码
+        - 不要提及类名、方法名、表名、字段名
+        - 不要编造内容，所有信息必须来自提供的数据
+        - 不要假设或推断未提供的信息
+        - 不要省略判断条件的具体数值
+        - **不要生成 Mermaid 图表**（图表已单独生成）
+        
+        ## 关键信息优先级
+        1. **判断条件的具体值**（最重要）：状态码、类型码、标志位的具体数值和含义
+        2. **异常和错误码**：所有可能的错误情况、错误码、错误信息
+        3. **常量定义**：业务用到的所有常量及其含义
+        4. **枚举值**：所有枚举类型的可选值及其业务含义
+        5. **业务规则阈值**：数量限制、金额限制、时间限制等具体数值
+        
+        ## 输出格式
+        纯 Markdown，必须包含以下章节（不包含业务流程图）：
+        
+        ### 1. 功能概述
+        1-2句话描述功能
+        
+        ### 2. 主要业务逻辑
+        分步骤说明，每个判断点必须包含具体的判断值
+        
+        ### 3. 判断条件与常量
+        表格形式列出所有判断条件的具体值：
+        | 字段/常量 | 可选值 | 含义 | 备注 |
+        
+        ### 4. 异常场景与错误码
+        表格形式列出所有异常：
+        | 错误码 | 错误信息 | 触发条件 | 用户看到什么 |
+        
+        ### 5. 数据变更
+        用业务术语描述数据操作
+        """;
+
+    // Product doc system prompt (原版，包含图表要求)
+    private static final String PRODUCT_DOC_SYSTEM_PROMPT = """
+        你是一位产品经理，正在为团队编写产品需求文档。你的读者是产品经理、测试工程师、客服人员、业务方。
+        
+        ## 输出要求
+        1. **业务流程图**：必须使用 Mermaid sequenceDiagram 或 flowchart 展示完整流程，使用 emoji 图标增强可读性
+        2. **业务逻辑**：用业务语言描述，避免技术术语（不要出现类名、方法名、SQL、表名）
+        3. **判断条件详情**：必须包含所有关键判断条件的具体数值和含义
+           - 例如：不要写"检查状态"，要写"当状态=1时表示待审核，状态=2表示已通过"
+           - 例如：不要写"验证类型"，要写"type=ORDER表示订单，type=REFUND表示退款"
+        4. **常量和枚举**：列出所有用到的状态码、类型码、错误码及其含义
+        5. **异常场景**：必须包含具体的错误码、错误信息、触发条件
+        6. **数据流转**：说明哪些数据被创建/修改/删除，用业务术语
+        7. **用户感知**：从用户角度描述输入、输出和可能的错误提示
+        
+        ## 禁止事项
+        - 不要贴代码或伪代码
+        - 不要提及类名、方法名、表名、字段名
+        - 不要编造内容，所有信息必须来自提供的数据
+        - 不要假设或推断未提供的信息
+        - 不要省略判断条件的具体数值
+        
+        ## 关键信息优先级
+        1. **判断条件的具体值**（最重要）：状态码、类型码、标志位的具体数值和含义
+        2. **异常和错误码**：所有可能的错误情况、错误码、错误信息
+        3. **常量定义**：业务用到的所有常量及其含义
+        4. **枚举值**：所有枚举类型的可选值及其业务含义
+        5. **业务规则阈值**：数量限制、金额限制、时间限制等具体数值
+        
+        ## Mermaid 图标建议
+        - 用户/客户端：👤 🧑 👨‍💼
+        - 系统/服务：🖥️ ⚙️ 🔧
+        - 判断/分支：🔀 ❓
+        - 数据库：💾 🗄️
+        - 缓存：📦 💿
+        - 消息队列：📨 📬 ✉️
+        - 外部服务：🌐 🔗 📡
+        - 成功：✅ ✓
+        - 失败/错误：❌ ⚠️
+        - 开始：🚀 ▶️
+        - 结束：🏁 ⏹️
+        
+        ## 输出格式
+        纯 Markdown，必须包含以下章节：
+        
+        ### 1. 功能概述
+        1-2句话描述功能
+        
+        ### 2. 业务流程图
+        Mermaid 图表，在关键判断节点标注具体条件值
+        
+        ### 3. 主要业务逻辑
+        分步骤说明，每个判断点必须包含具体的判断值
+        
+        ### 4. 判断条件与常量
+        表格形式列出所有判断条件的具体值：
+        | 字段/常量 | 可选值 | 含义 | 备注 |
+        
+        ### 5. 异常场景与错误码
+        表格形式列出所有异常：
+        | 错误码 | 错误信息 | 触发条件 | 用户看到什么 |
+        
+        ### 6. 数据变更
+        用业务术语描述数据操作
+        
+        ## Mermaid 主题配置模板
+        ```mermaid
+        %%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#e3f2fd','primaryTextColor':'#0d47a1','primaryBorderColor':'#1976d2','lineColor':'#1976d2'}}}%%
+        flowchart TD
+            Start([🚀 开始])
+            Check{🔀 状态=1?}
+            Check -->|是| Action1[处理A]
+            Check -->|否| Action2[处理B]
+        ```
+        
+        注意：图表中的判断节点必须标注具体的判断值！
+        """;
+
+    /**
+     * 构建产品文档 AI prompt - 增强版，包含边界点异常详情和真实常量数据
+     */
+    private String buildProductDocPromptWithBoundaries(Long repoId, String entryDesc, List<BusinessNode> nodes, 
+                                                        DataFlowSummary dataFlow, List<BoundaryEntity> boundaries,
+                                                        List<String> allMethods) {
+        StringBuilder prompt = new StringBuilder();
+        
+        prompt.append("# 接口信息\n\n");
+        prompt.append(entryDesc).append("\n\n");
+        
+        prompt.append("# 业务处理步骤\n\n");
+        prompt.append("以下是代码中的关键业务逻辑节点（已去除纯技术组件）：\n\n");
+        for (int i = 0; i < nodes.size(); i++) {
+            BusinessNode node = nodes.get(i);
+            prompt.append(i + 1).append(". ").append(node.description());
+            if (node.boundaries() != null && !node.boundaries().isEmpty()) {
+                prompt.append(" — 涉及：").append(String.join("、", node.boundaries()));
+            }
+            prompt.append("\n");
+        }
+        prompt.append("\n");
+        
+        // 添加枚举常量信息（从静态分析提取）
+        List<AnalysisDataExtractor.EnumConstant> enums = analysisDataExtractor.extractEnumConstantsFromChain(repoId, allMethods);
+        if (!enums.isEmpty()) {
+            prompt.append("# 枚举常量（从源码静态分析提取）\n\n");
+            prompt.append("调用链中使用了以下枚举常量：\n\n");
+            
+            Map<String, List<AnalysisDataExtractor.EnumConstant>> byClass = new LinkedHashMap<>();
+            for (var e : enums) {
+                String shortClass = e.enumClass().contains(".") ? 
+                    e.enumClass().substring(e.enumClass().lastIndexOf('.') + 1) : e.enumClass();
+                byClass.computeIfAbsent(shortClass, k -> new ArrayList<>()).add(e);
+            }
+            
+            for (Map.Entry<String, List<AnalysisDataExtractor.EnumConstant>> entry : byClass.entrySet()) {
+                prompt.append("**").append(entry.getKey()).append("**：\n");
+                for (var e : entry.getValue()) {
+                    prompt.append("- `").append(e.constName()).append("`");
+                    if (!e.description().isEmpty()) {
+                        prompt.append("：").append(e.description());
+                    }
+                    prompt.append("\n");
+                }
+                prompt.append("\n");
+            }
+        }
+        
+        // 添加方法中使用的常量
+        List<AnalysisDataExtractor.MethodConstantUsage> constants = analysisDataExtractor.extractMethodConstantsFromChain(repoId, allMethods);
+        if (!constants.isEmpty()) {
+            prompt.append("# 使用的常量（从源码静态分析提取）\n\n");
+            for (var c : constants) {
+                String shortMethod = shortMethod(c.fullMethod());
+                prompt.append("- **").append(c.constantName()).append("**");
+                if (!c.constantValue().isEmpty()) {
+                    prompt.append(" = `").append(c.constantValue()).append("`");
+                }
+                prompt.append(" (见 `").append(shortMethod).append("`)\n");
+            }
+            prompt.append("\n");
+        }
+        
+        prompt.append("# 数据操作\n\n");
+        if (!dataFlow.inserts().isEmpty()) {
+            prompt.append("**新增数据：** ").append(String.join("、", dataFlow.inserts())).append("\n\n");
+        }
+        if (!dataFlow.updates().isEmpty()) {
+            prompt.append("**修改数据：** ").append(String.join("、", dataFlow.updates())).append("\n\n");
+        }
+        if (!dataFlow.queries().isEmpty()) {
+            prompt.append("**查询数据：** ").append(String.join("、", dataFlow.queries())).append("\n\n");
+        }
+        if (!dataFlow.deletes().isEmpty()) {
+            prompt.append("**删除数据：** ").append(String.join("、", dataFlow.deletes())).append("\n\n");
+        }
+        if (!dataFlow.externalCalls().isEmpty()) {
+            prompt.append("**调用外部服务：** ").append(String.join("、", dataFlow.externalCalls())).append("\n\n");
+        }
+        if (!dataFlow.messages().isEmpty()) {
+            prompt.append("**发送消息：** ").append(String.join("、", dataFlow.messages())).append("\n\n");
+        }
+        
+        // 添加异常信息（从边界点提取）
+        List<ExceptionInfo> exceptions = extractExceptionsFromBoundaries(boundaries);
+        if (!exceptions.isEmpty()) {
+            prompt.append("# 异常场景（从源码静态分析提取）\n\n");
+            for (ExceptionInfo ex : exceptions) {
+                prompt.append("- **").append(ex.exceptionType()).append("**");
+                if (!ex.message().isEmpty()) {
+                    prompt.append("：").append(ex.message());
+                }
+                if (!ex.trigger().isEmpty()) {
+                    prompt.append(" [触发条件：").append(ex.trigger()).append("]");
+                }
+                prompt.append(" (见 `").append(ex.location()).append("`)\n");
+            }
+            prompt.append("\n");
+        }
+        
+        prompt.append("---\n\n");
+        prompt.append("## ⚠️ 重要提示\n\n");
+        prompt.append("上面已经提供了从源码静态分析提取的枚举常量和使用的常量，请在文档中使用这些**真实数据**：\n\n");
+        prompt.append("1. **判断条件的具体值** - 使用上面提供的枚举常量，如：`状态=PAID`表示已支付\n");
+        prompt.append("2. **常量定义** - 使用上面提供的常量列表\n");
+        prompt.append("3. **错误码** - 使用上面提供的异常场景列表\n");
+        prompt.append("4. **业务阈值** - 如果源码中有数字常量，在上面的常量列表中会显示\n");
+        prompt.append("5. **枚举说明** - 直接使用上面枚举常量后面的中文描述\n\n");
+        prompt.append("**禁止编造任何不在上述列表中的枚举值、常量或错误码！**\n\n");
+        prompt.append("请基于以上信息，生成产品需求文档，必须包含带主题配置的 Mermaid 流程图、业务逻辑说明、判断条件详情表（使用真实枚举值）、错误码表。\n");
+        
+        return prompt.toString();
+    }
+    
+    /**
+     * 模板生成产品文档（带边界点信息和真实常量数据）
+     */
+    private String generateProductDocTemplateWithBoundaries(Long repoId, String entryDesc, List<BusinessNode> nodes,
+                                                            DataFlowSummary dataFlow, List<BoundaryEntity> boundaries,
+                                                            List<String> allMethods) {
+        StringBuilder sb = new StringBuilder();
+        
+        // 1. 功能概述
+        sb.append("# 产品文档\n\n");
+        sb.append("## 功能概述\n\n");
+        sb.append(entryDesc).append("\n\n");
+        
+        // 2. 业务流程图
+        sb.append("## 业务流程\n\n");
+        sb.append(generateMermaidFlowchart(nodes, dataFlow));
+        sb.append("\n\n");
+        
+        // 3. 主要业务逻辑
+        sb.append("## 主要业务逻辑\n\n");
+        for (int i = 0; i < nodes.size(); i++) {
+            BusinessNode node = nodes.get(i);
+            sb.append(i + 1).append(". **").append(node.description()).append("**");
+            if (node.boundaries() != null && !node.boundaries().isEmpty()) {
+                sb.append("\n   - 涉及：").append(String.join("、", node.boundaries()));
+            }
+            sb.append("\n");
+        }
+        sb.append("\n");
+        
+        // 4. 业务规则详情（从源码提取真实数据）
+        sb.append("## 业务规则与判断条件\n\n");
+        sb.append(extractBusinessRulesWithRealData(repoId, nodes, allMethods));
+        sb.append("\n");
+        
+        // 5. 数据变更
+        sb.append("## 数据变更\n\n");
+        boolean hasDataChanges = false;
+        if (!dataFlow.inserts().isEmpty()) {
+            sb.append("- **新增：** ").append(String.join("、", dataFlow.inserts())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!dataFlow.updates().isEmpty()) {
+            sb.append("- **修改：** ").append(String.join("、", dataFlow.updates())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!dataFlow.queries().isEmpty()) {
+            sb.append("- **查询：** ").append(String.join("、", dataFlow.queries())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!dataFlow.deletes().isEmpty()) {
+            sb.append("- **删除：** ").append(String.join("、", dataFlow.deletes())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!hasDataChanges) {
+            sb.append("未检测到数据库操作\n");
+        }
+        sb.append("\n");
+        
+        // 6. 异常与错误码（从边界点提取）
+        sb.append("## 异常场景与错误码\n\n");
+        sb.append(extractExceptionInfoFromBoundaries(boundaries));
+        sb.append("\n");
+        
+        // 7. 外部依赖
+        if (!dataFlow.externalCalls().isEmpty() || !dataFlow.messages().isEmpty()) {
+            sb.append("## 外部交互\n\n");
+            if (!dataFlow.externalCalls().isEmpty()) {
+                sb.append("- **调用外部服务：** ").append(String.join("、", dataFlow.externalCalls())).append("\n");
+            }
+            if (!dataFlow.messages().isEmpty()) {
+                sb.append("- **发送消息：** ").append(String.join("、", dataFlow.messages())).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        sb.append("> 💡 提示：配置 Claude API 可获得更详细的业务逻辑说明和异常场景分析\n");
+        
+        return sb.toString();
+    }
+    
+    /**
+     * 从源码提取真实的业务规则（包含枚举和常量）
+     */
+    private String extractBusinessRulesWithRealData(Long repoId, List<BusinessNode> nodes, List<String> allMethods) {
+        StringBuilder sb = new StringBuilder();
+        
+        // 提取枚举常量
+        List<AnalysisDataExtractor.EnumConstant> enums = analysisDataExtractor.extractEnumConstantsFromChain(repoId, allMethods);
+        
+        // 提取方法常量
+        List<AnalysisDataExtractor.MethodConstantUsage> constants = analysisDataExtractor.extractMethodConstantsFromChain(repoId, allMethods);
+        
+        if (enums.isEmpty() && constants.isEmpty()) {
+            sb.append("源码中未检测到明显的业务判断条件\n\n");
+            sb.append("> ⚠️ **提示**：配置 Claude API 可以通过 AI 分析源码，提取更详细的业务规则和判断条件。\n");
+            return sb.toString();
+        }
+        
+        // 枚举常量表
+        if (!enums.isEmpty()) {
+            sb.append("### 使用的枚举常量\n\n");
+            sb.append("| 枚举类 | 常量名 | 说明 |\n");
+            sb.append("|--------|--------|------|\n");
+            
+            Map<String, List<AnalysisDataExtractor.EnumConstant>> byClass = new LinkedHashMap<>();
+            for (var e : enums) {
+                String shortClass = e.enumClass().contains(".") ? 
+                    e.enumClass().substring(e.enumClass().lastIndexOf('.') + 1) : e.enumClass();
+                byClass.computeIfAbsent(shortClass, k -> new ArrayList<>()).add(e);
+            }
+            
+            for (Map.Entry<String, List<AnalysisDataExtractor.EnumConstant>> entry : byClass.entrySet()) {
+                for (var e : entry.getValue()) {
+                    sb.append("| `").append(entry.getKey()).append("` | ");
+                    sb.append("`").append(e.constName()).append("` | ");
+                    sb.append(e.description().isEmpty() ? "-" : e.description()).append(" |\n");
+                }
+            }
+            sb.append("\n");
+        }
+        
+        // 使用的常量表
+        if (!constants.isEmpty()) {
+            sb.append("### 使用的常量\n\n");
+            sb.append("| 常量名 | 值 | 使用位置 |\n");
+            sb.append("|--------|-----|----------|\n");
+            
+            for (var c : constants) {
+                sb.append("| `").append(c.constantName()).append("` | ");
+                sb.append(c.constantValue().isEmpty() ? "-" : "`" + c.constantValue() + "`").append(" | ");
+                sb.append("`").append(shortMethod(c.fullMethod())).append("` |\n");
+            }
+            sb.append("\n");
+        }
+        
+        return sb.toString();
+    }
+    
+    /**
+     * 从边界点列表中提取异常信息（用于模板生成）
+     */
+    private String extractExceptionInfoFromBoundaries(List<BoundaryEntity> boundaries) {
+        List<ExceptionInfo> exceptions = extractExceptionsFromBoundaries(boundaries);
+        
+        if (exceptions.isEmpty()) {
+            return "源码中未检测到显式异常抛出点\n\n" +
+                   "> ⚠️ **提示**：配置 Claude API 可以自动分析源码中的所有异常抛出点，提取完整的错误码和错误信息。\n";
+        }
+        
+        StringBuilder sb = new StringBuilder();
+        sb.append("从源码静态分析提取的异常场景：\n\n");
+        sb.append("| 异常类型 | 错误信息 | 触发条件 | 来源方法 |\n");
+        sb.append("|----------|----------|----------|----------|\n");
+        
+        for (ExceptionInfo ex : exceptions) {
+            sb.append("| ").append(ex.exceptionType()).append(" | ");
+            sb.append(ex.message().isEmpty() ? "-" : ex.message()).append(" | ");
+            sb.append(ex.trigger().isEmpty() ? "-" : ex.trigger()).append(" | ");
+            sb.append("`").append(ex.location()).append("` |\n");
+        }
+        
+        sb.append("\n");
+        return sb.toString();
+    }
+    
+    /**
+     * 提取业务节点（带边界点详情）
+     */
+    private List<BusinessNode> extractBusinessNodesWithBoundaries(CallGraphEngine.CallTreeNodeDTO root,
+                                                                   List<BoundaryEntity> allBoundaries) {
+        // 构建方法到边界点的映射
+        Map<String, List<BoundaryEntity>> methodBoundaries = new HashMap<>();
+        for (BoundaryEntity b : allBoundaries) {
+            methodBoundaries.computeIfAbsent(b.getFullMethod(), k -> new ArrayList<>()).add(b);
+        }
+        
+        List<BusinessNode> nodes = new ArrayList<>();
+        extractBusinessNodesRecursiveWithBoundaries(root, nodes, new HashSet<>(), methodBoundaries);
+        return nodes;
+    }
+
+    private void extractBusinessNodesRecursiveWithBoundaries(CallGraphEngine.CallTreeNodeDTO node, 
+                                                              List<BusinessNode> result, 
+                                                              Set<String> visited,
+                                                              Map<String, List<BoundaryEntity>> methodBoundaries) {
+        if (node == null || !visited.add(node.fullMethod())) return;
+        
+        String className = extractClassName(node.fullMethod());
+        String methodName = extractMethodName(node.fullMethod());
+        
+        // 过滤掉纯技术组件
+        if (isBusinessNode(className, methodName)) {
+            String desc = buildBusinessDescription(className, methodName);
+            List<String> boundaries = new ArrayList<>();
+            
+            // 从边界点映射中获取该方法的边界点
+            List<BoundaryEntity> nodeBoundaries = methodBoundaries.get(node.fullMethod());
+            if (nodeBoundaries != null) {
+                for (BoundaryEntity b : nodeBoundaries) {
+                    boundaries.add(translateBoundary(b.getBoundaryType()));
+                }
+            }
+            
+            result.add(new BusinessNode(desc, boundaries));
+        }
+        
+        // 递归子节点
+        if (node.children() != null) {
+            for (var child : node.children()) {
+                extractBusinessNodesRecursiveWithBoundaries(child, result, visited, methodBoundaries);
+            }
+        }
+    }
+
+    /**
+     * 模板生成产品文档（Fallback）
+     */
+    private String generateProductDocTemplate(String entryDesc, List<BusinessNode> nodes,
+                                               DataFlowSummary dataFlow) {
+        StringBuilder sb = new StringBuilder();
+        
+        // 1. 功能概述
+        sb.append("# 产品文档\n\n");
+        sb.append("## 功能概述\n\n");
+        sb.append(entryDesc).append("\n\n");
+        
+        // 2. 业务流程图
+        sb.append("## 业务流程\n\n");
+        sb.append(generateMermaidFlowchart(nodes, dataFlow));
+        sb.append("\n\n");
+        
+        // 3. 主要业务逻辑
+        sb.append("## 主要业务逻辑\n\n");
+        for (int i = 0; i < nodes.size(); i++) {
+            BusinessNode node = nodes.get(i);
+            sb.append(i + 1).append(". **").append(node.description()).append("**");
+            if (node.boundaries() != null && !node.boundaries().isEmpty()) {
+                sb.append("\n   - 涉及：").append(String.join("、", node.boundaries()));
+            }
+            sb.append("\n");
+        }
+        sb.append("\n");
+        
+        // 4. 业务规则详情（新增）
+        sb.append("## 业务规则与判断条件\n\n");
+        sb.append(extractBusinessRules(nodes));
+        sb.append("\n");
+        
+        // 5. 数据变更
+        sb.append("## 数据变更\n\n");
+        boolean hasDataChanges = false;
+        if (!dataFlow.inserts().isEmpty()) {
+            sb.append("- **新增：** ").append(String.join("、", dataFlow.inserts())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!dataFlow.updates().isEmpty()) {
+            sb.append("- **修改：** ").append(String.join("、", dataFlow.updates())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!dataFlow.queries().isEmpty()) {
+            sb.append("- **查询：** ").append(String.join("、", dataFlow.queries())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!dataFlow.deletes().isEmpty()) {
+            sb.append("- **删除：** ").append(String.join("、", dataFlow.deletes())).append("\n");
+            hasDataChanges = true;
+        }
+        if (!hasDataChanges) {
+            sb.append("未检测到数据库操作\n");
+        }
+        sb.append("\n");
+        
+        // 6. 异常与错误码（新增）
+        sb.append("## 异常场景与错误码\n\n");
+        sb.append(extractExceptionInfo(dataFlow));
+        sb.append("\n");
+        
+        // 7. 外部依赖
+        if (!dataFlow.externalCalls().isEmpty() || !dataFlow.messages().isEmpty()) {
+            sb.append("## 外部交互\n\n");
+            if (!dataFlow.externalCalls().isEmpty()) {
+                sb.append("- **调用外部服务：** ").append(String.join("、", dataFlow.externalCalls())).append("\n");
+            }
+            if (!dataFlow.messages().isEmpty()) {
+                sb.append("- **发送消息：** ").append(String.join("、", dataFlow.messages())).append("\n");
+            }
+            sb.append("\n");
+        }
+        
+        sb.append("> 💡 提示：配置 Claude API 可获得更详细的业务逻辑说明和异常场景分析\n");
+        
+        return sb.toString();
+    }
+
+    /**
+     * 从调用链中提取业务规则和判断条件
+     * 增强版：真正从源码中提取判断条件和常量
+     */
+    private String extractBusinessRules(List<BusinessNode> nodes) {
+        if (nodes.isEmpty()) {
+            return "源码中未检测到明显的业务判断条件\n";
+        }
+        
+        StringBuilder sb = new StringBuilder();
+        
+        // 收集所有节点相关的源码，从中提取判断条件
+        List<SourceCondition> conditions = new ArrayList<>();
+        Set<ConstantDef> constants = new LinkedHashSet<>();
+        
+        for (BusinessNode node : nodes) {
+            // 这里需要通过 node 的原始方法信息获取源码
+            // 暂时先构建一个基于现有信息的输出
+            // TODO: 需要在 BusinessNode 中增加 fullMethod 字段以便查询源码
+        }
+        
+        // 如果没有提取到任何条件，返回提示
+        if (conditions.isEmpty() && constants.isEmpty()) {
+            sb.append("源码中未检测到明显的业务判断条件\n\n");
+            sb.append("> ⚠️ **提示**：配置 Claude API 可以通过 AI 分析源码，提取更详细的业务规则和判断条件。\n");
+            return sb.toString();
+        }
+        
+        // 输出判断条件表
+        if (!conditions.isEmpty()) {
+            sb.append("### 判断条件详情\n\n");
+            sb.append("| 判断条件 | 可选值 | 含义 | 位置 |\n");
+            sb.append("|----------|--------|------|------|\n");
+            
+            for (SourceCondition cond : conditions) {
+                sb.append("| ").append(cond.expression()).append(" | ");
+                sb.append(cond.values()).append(" | ");
+                sb.append(cond.meaning()).append(" | ");
+                sb.append(cond.location()).append(" |\n");
+            }
+            sb.append("\n");
+        }
+        
+        // 输出常量表
+        if (!constants.isEmpty()) {
+            sb.append("### 使用的常量\n\n");
+            sb.append("| 常量名 | 值 | 说明 |\n");
+            sb.append("|--------|-----|------|\n");
+            
+            for (ConstantDef constant : constants) {
+                sb.append("| `").append(constant.name()).append("` | ");
+                sb.append("`").append(constant.value()).append("` | ");
+                sb.append(constant.description()).append(" |\n");
+            }
+            sb.append("\n");
+        }
+        
+        return sb.toString();
+    }
+    
+    // 辅助记录类：源码判断条件
+    private record SourceCondition(String expression, String values, String meaning, String location) {}
+    
+    // 辅助记录类：常量定义
+    private record ConstantDef(String name, String value, String description) {}
+
+    /**
+     * 提取异常信息和错误码
+     * 增强版：从 BoundaryEntity 的 EXCEPTION 类型中提取详细错误信息
+     */
+    private String extractExceptionInfo(DataFlowSummary dataFlow) {
+        // 这里需要传入 boundaries 才能提取异常信息
+        // 暂时返回提示信息
+        
+        StringBuilder sb = new StringBuilder();
+        sb.append("从调用链中提取的异常场景：\n\n");
+        sb.append("| 异常类型 | 错误信息 | 触发条件 | 来源方法 |\n");
+        sb.append("|----------|----------|----------|----------|\n");
+        
+        // 占位行
+        sb.append("| _待从源码提取_ | _待从源码提取_ | _待从源码提取_ | _待从源码提取_ |\n");
+        
+        sb.append("\n> ⚠️ **提示**：配置 Claude API 可以自动分析源码中的所有异常抛出点，提取完整的错误码和错误信息。\n");
+        
+        return sb.toString();
+    }
+    
+    /**
+     * 从 BoundaryEntity 列表中提取异常信息（供 AI 和模板使用）
+     */
+    private List<ExceptionInfo> extractExceptionsFromBoundaries(List<BoundaryEntity> boundaries) {
+        List<ExceptionInfo> exceptions = new ArrayList<>();
+        
+        for (BoundaryEntity b : boundaries) {
+            if ("EXCEPTION".equals(b.getBoundaryType()) && b.getContext() != null) {
+                String[] lines = b.getContext().split("\n");
+                String exceptionType = lines[0].trim();
+                String message = "";
+                String trigger = "";
+                
+                // 尝试从 context 中提取异常信息
+                for (String line : lines) {
+                    if (line.trim().startsWith("Message:") || line.trim().startsWith("message:")) {
+                        message = line.substring(line.indexOf(':') + 1).trim();
+                    } else if (line.trim().startsWith("Condition:") || line.trim().startsWith("condition:")) {
+                        trigger = line.substring(line.indexOf(':') + 1).trim();
+                    }
+                }
+                
+                String location = shortMethod(b.getFullMethod());
+                exceptions.add(new ExceptionInfo(exceptionType, message, trigger, location));
+            }
+        }
+        
+        return exceptions;
+    }
+    
+    // 辅助记录类：异常信息
+    private record ExceptionInfo(String exceptionType, String message, String trigger, String location) {}
+
+    /**
+     * 生成产品文档的图表数据（供前端切换使用）
+     */
+    public Map<String, String> generateProductDocDiagrams(Long repoId, String entryMethod) {
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, entryMethod, 15);
+        if (tree.root() == null) return Map.of();
+
+        List<BusinessNode> businessNodes = extractBusinessNodes(tree.root());
+        List<BoundaryEntity> boundaries = collectBoundaries(repoId, tree.root());
+        DataFlowSummary dataFlow = analyzeDataFlow(boundaries);
+
+        Map<String, String> diagrams = new LinkedHashMap<>();
+        diagrams.put("flowchart", generateFlowchart(businessNodes, dataFlow));
+        // 使用技术级时序图（详细的调用链）
+        diagrams.put("sequence", generateTechnicalSequenceDiagram(tree.root(), repoId));
+        diagrams.put("swimlane", generateSwimlane(businessNodes, dataFlow));
+        
+        return diagrams;
+    }
+
+    /**
+     * 生成 Mermaid 流程图（占位符，实际图表由前端根据用户选择替换）
+     */
+    private String generateMermaidFlowchart(List<BusinessNode> nodes, DataFlowSummary dataFlow) {
+        // 只输出一个占位的 Mermaid 代码块
+        // 前端会根据用户选择的图表类型（flowchart/sequence/swimlane）替换这个占位符
+        return "```mermaid\n" + generateFlowchart(nodes, dataFlow).replace("```mermaid\n", "") + "```";
+    }
+
+    /**
+     * 生成流程图 (Flowchart TD)
+     */
+    private String generateFlowchart(List<BusinessNode> nodes, DataFlowSummary dataFlow) {
+        StringBuilder sb = new StringBuilder();
+        
+        // Mermaid 主题配置
+        sb.append("```mermaid\n");
+        sb.append("%%{init: {'theme':'base', 'themeVariables': {");
+        sb.append("'primaryColor':'#e3f2fd',");
+        sb.append("'primaryTextColor':'#0d47a1',");
+        sb.append("'primaryBorderColor':'#1976d2',");
+        sb.append("'lineColor':'#1976d2',");
+        sb.append("'secondaryColor':'#fff3e0',");
+        sb.append("'tertiaryColor':'#f3e5f5'");
+        sb.append("}}}%%\n");
+        
+        sb.append("flowchart TD\n");
+        sb.append("    Start([\"🚀 开始\"])\n");
+        
+        // 业务节点
+        for (int i = 0; i < Math.min(nodes.size(), 10); i++) {
+            BusinessNode node = nodes.get(i);
+            String nodeId = "Node" + i;
+            String icon = selectNodeIcon(node);
+            sb.append("    ").append(nodeId).append("[\"").append(icon).append(" ").append(node.description()).append("\"]\n");
+        }
+        
+        // 数据库节点
+        if (!dataFlow.inserts().isEmpty() || !dataFlow.updates().isEmpty() || 
+            !dataFlow.queries().isEmpty() || !dataFlow.deletes().isEmpty()) {
+            sb.append("    DB[(\"💾 数据库操作\")]\n");
+        }
+        
+        // 外部调用节点
+        if (!dataFlow.externalCalls().isEmpty()) {
+            sb.append("    External[\"🌐 外部服务\"]\n");
+        }
+        
+        // 消息队列节点
+        if (!dataFlow.messages().isEmpty()) {
+            sb.append("    MQ[\"📨 消息队列\"]\n");
+        }
+        
+        sb.append("    End([\"✅ 结束\"])\n\n");
+        
+        // 连线
+        sb.append("    Start --> Node0\n");
+        for (int i = 0; i < Math.min(nodes.size(), 10) - 1; i++) {
+            sb.append("    Node").append(i).append(" --> Node").append(i + 1).append("\n");
+        }
+        
+        int lastNode = Math.min(nodes.size(), 10) - 1;
+        if (!dataFlow.inserts().isEmpty() || !dataFlow.updates().isEmpty() || 
+            !dataFlow.queries().isEmpty() || !dataFlow.deletes().isEmpty()) {
+            sb.append("    Node").append(lastNode).append(" --> DB\n");
+            sb.append("    DB --> End\n");
+        } else {
+            sb.append("    Node").append(lastNode).append(" --> End\n");
+        }
+        
+        if (!dataFlow.externalCalls().isEmpty()) {
+            sb.append("    Node").append(lastNode).append(" -.->|调用| External\n");
+        }
+        if (!dataFlow.messages().isEmpty()) {
+            sb.append("    Node").append(lastNode).append(" -.->|发送| MQ\n");
+        }
+        
+        sb.append("```");
+        
+        return sb.toString();
+    }
+
+    /**
+     * 生成时序图 (Sequence Diagram)
+     */
+    private String generateSequenceDiagram(List<BusinessNode> nodes, DataFlowSummary dataFlow) {
+        StringBuilder sb = new StringBuilder();
+        
+        sb.append("```mermaid\n");
+        sb.append("%%{init: {'theme':'base', 'themeVariables': {");
+        sb.append("'primaryColor':'#e3f2fd',");
+        sb.append("'actorBorder':'#1976d2',");
+        sb.append("'actorBkg':'#e3f2fd',");
+        sb.append("'signalColor':'#1976d2',");
+        sb.append("'sequenceNumberColor':'white'");
+        sb.append("}}}%%\n");
+        
+        sb.append("sequenceDiagram\n");
+        sb.append("    participant 👤 as 用户\n");
+        sb.append("    participant 🖥️ as 系统\n");
+        
+        // 添加数据库参与者
+        if (!dataFlow.inserts().isEmpty() || !dataFlow.updates().isEmpty() || 
+            !dataFlow.queries().isEmpty() || !dataFlow.deletes().isEmpty()) {
+            sb.append("    participant 💾 as 数据库\n");
+        }
+        
+        // 添加外部服务参与者
+        if (!dataFlow.externalCalls().isEmpty()) {
+            sb.append("    participant 🌐 as 外部服务\n");
+        }
+        
+        // 添加消息队列参与者
+        if (!dataFlow.messages().isEmpty()) {
+            sb.append("    participant 📨 as 消息队列\n");
+        }
+        
+        sb.append("\n");
+        sb.append("    👤->>🖥️: 发起请求\n");
+        sb.append("    activate 🖥️\n");
+        
+        // 业务节点作为系统内部处理步骤
+        for (int i = 0; i < Math.min(nodes.size(), 8); i++) {
+            BusinessNode node = nodes.get(i);
+            String desc = node.description();
+            String icon = selectNodeIcon(node);
+            
+            // 根据边界点类型生成不同的交互
+            if (node.boundaries() != null && node.boundaries().contains("数据库")) {
+                sb.append("    🖥️->>💾: ").append(icon).append(" ").append(desc).append("\n");
+                sb.append("    activate 💾\n");
+                sb.append("    💾-->>🖥️: 返回结果\n");
+                sb.append("    deactivate 💾\n");
+            } else if (node.boundaries() != null && node.boundaries().contains("外部接口")) {
+                sb.append("    🖥️->>🌐: ").append(icon).append(" ").append(desc).append("\n");
+                sb.append("    activate 🌐\n");
+                sb.append("    🌐-->>🖥️: 响应\n");
+                sb.append("    deactivate 🌐\n");
+            } else if (node.boundaries() != null && node.boundaries().contains("消息队列")) {
+                sb.append("    🖥️->>📨: ").append(icon).append(" ").append(desc).append("\n");
+            } else {
+                sb.append("    Note over 🖥️: ").append(icon).append(" ").append(desc).append("\n");
+            }
+        }
+        
+        sb.append("    🖥️-->>👤: 返回结果\n");
+        sb.append("    deactivate 🖥️\n");
+        sb.append("```");
+        
+        return sb.toString();
+    }
+
+    /**
+     * 生成泳道图 (Swimlane with Flowchart)
+     */
+    private String generateSwimlane(List<BusinessNode> nodes, DataFlowSummary dataFlow) {
+        StringBuilder sb = new StringBuilder();
+        
+        sb.append("```mermaid\n");
+        sb.append("%%{init: {'theme':'base', 'themeVariables': {");
+        sb.append("'primaryColor':'#e3f2fd',");
+        sb.append("'primaryTextColor':'#0d47a1',");
+        sb.append("'primaryBorderColor':'#1976d2',");
+        sb.append("'lineColor':'#1976d2'");
+        sb.append("}}}%%\n");
+        
+        sb.append("graph TB\n");
+        
+        // 定义泳道（子图）
+        sb.append("    subgraph 应用层\n");
+        int appNodeCount = 0;
+        for (int i = 0; i < Math.min(nodes.size(), 10); i++) {
+            BusinessNode node = nodes.get(i);
+            if (node.boundaries() == null || node.boundaries().isEmpty() || 
+                (!node.boundaries().contains("数据库") && !node.boundaries().contains("外部接口"))) {
+                String nodeId = "App" + appNodeCount;
+                String icon = selectNodeIcon(node);
+                sb.append("        ").append(nodeId).append("[\"").append(icon).append(" ").append(node.description()).append("\"]\n");
+                appNodeCount++;
+            }
+        }
+        sb.append("    end\n\n");
+        
+        // 数据层
+        if (!dataFlow.inserts().isEmpty() || !dataFlow.updates().isEmpty() || 
+            !dataFlow.queries().isEmpty() || !dataFlow.deletes().isEmpty()) {
+            sb.append("    subgraph 数据层\n");
+            sb.append("        DB[(\"💾 数据库\")]\n");
+            sb.append("    end\n\n");
+        }
+        
+        // 外部服务层
+        if (!dataFlow.externalCalls().isEmpty() || !dataFlow.messages().isEmpty()) {
+            sb.append("    subgraph 外部依赖\n");
+            if (!dataFlow.externalCalls().isEmpty()) {
+                sb.append("        External[\"🌐 外部服务\"]\n");
+            }
+            if (!dataFlow.messages().isEmpty()) {
+                sb.append("        MQ[\"📨 消息队列\"]\n");
+            }
+            sb.append("    end\n\n");
+        }
+        
+        // 连线
+        for (int i = 0; i < appNodeCount - 1; i++) {
+            sb.append("    App").append(i).append(" --> App").append(i + 1).append("\n");
+        }
+        
+        if (!dataFlow.inserts().isEmpty() || !dataFlow.updates().isEmpty() || 
+            !dataFlow.queries().isEmpty() || !dataFlow.deletes().isEmpty()) {
+            sb.append("    App").append(appNodeCount - 1).append(" --> DB\n");
+        }
+        
+        if (!dataFlow.externalCalls().isEmpty()) {
+            sb.append("    App").append(Math.max(0, appNodeCount / 2)).append(" -.-> External\n");
+        }
+        
+        if (!dataFlow.messages().isEmpty()) {
+            sb.append("    App").append(appNodeCount - 1).append(" -.-> MQ\n");
+        }
+        
+        sb.append("```");
+        
+        return sb.toString();
+    }
+
+    /**
+     * 根据节点类型选择图标（增强版）
+     */
+    private String selectNodeIcon(BusinessNode node) {
+        String desc = node.description().toLowerCase();
+        
+        // 操作类型
+        if (desc.contains("校验") || desc.contains("验证") || desc.contains("检查") || desc.contains("审核")) return "✅";
+        if (desc.contains("创建") || desc.contains("新增") || desc.contains("添加") || desc.contains("注册")) return "➕";
+        if (desc.contains("更新") || desc.contains("修改") || desc.contains("编辑") || desc.contains("变更")) return "✏️";
+        if (desc.contains("删除") || desc.contains("移除") || desc.contains("清除")) return "🗑️";
+        if (desc.contains("查询") || desc.contains("获取") || desc.contains("查找") || desc.contains("搜索")) return "🔍";
+        
+        // 业务场景
+        if (desc.contains("计算") || desc.contains("统计") || desc.contains("分析")) return "🧮";
+        if (desc.contains("发送") || desc.contains("通知") || desc.contains("推送")) return "📤";
+        if (desc.contains("接收") || desc.contains("监听") || desc.contains("消费")) return "📥";
+        if (desc.contains("支付") || desc.contains("扣费") || desc.contains("充值")) return "💰";
+        if (desc.contains("权限") || desc.contains("认证") || desc.contains("授权") || desc.contains("登录")) return "🔐";
+        if (desc.contains("生成") || desc.contains("构建") || desc.contains("创建")) return "🔨";
+        if (desc.contains("转换") || desc.contains("映射") || desc.contains("格式化")) return "🔄";
+        if (desc.contains("审批") || desc.contains("批准") || desc.contains("驳回")) return "📋";
+        if (desc.contains("上传") || desc.contains("导入")) return "⬆️";
+        if (desc.contains("下载") || desc.contains("导出")) return "⬇️";
+        if (desc.contains("同步") || desc.contains("刷新")) return "🔃";
+        if (desc.contains("锁定") || desc.contains("解锁")) return "🔒";
+        if (desc.contains("启用") || desc.contains("禁用") || desc.contains("开关")) return "🔘";
+        if (desc.contains("重试") || desc.contains("回滚")) return "↩️";
+        if (desc.contains("完成") || desc.contains("结束") || desc.contains("成功")) return "✔️";
+        if (desc.contains("失败") || desc.contains("错误") || desc.contains("异常")) return "❌";
+        if (desc.contains("警告") || desc.contains("提醒")) return "⚠️";
+        
+        // 默认图标
+        return "⚙️";
+    }
+
+    /**
+     * 提取业务节点
+     */
+    private List<BusinessNode> extractBusinessNodes(CallGraphEngine.CallTreeNodeDTO root) {
+        List<BusinessNode> nodes = new ArrayList<>();
+        extractBusinessNodesRecursive(root, nodes, new HashSet<>());
+        return nodes;
+    }
+
+    private void extractBusinessNodesRecursive(CallGraphEngine.CallTreeNodeDTO node, 
+                                                List<BusinessNode> result, Set<String> visited) {
+        if (node == null || !visited.add(node.fullMethod())) return;
+        
+        String className = extractClassName(node.fullMethod());
+        String methodName = extractMethodName(node.fullMethod());
+        
+        // 过滤掉纯技术组件
+        if (isBusinessNode(className, methodName)) {
+            String desc = buildBusinessDescription(className, methodName);
+            List<String> boundaries = new ArrayList<>();
+            
+            // 添加边界点信息
+            if (node.boundaries() != null) {
+                for (var b : node.boundaries()) {
+                    boundaries.add(translateBoundary(b.boundaryType()));
+                }
+            }
+            
+            result.add(new BusinessNode(desc, boundaries));
+        }
+        
+        // 递归子节点
+        if (node.children() != null) {
+            for (var child : node.children()) {
+                extractBusinessNodesRecursive(child, result, visited);
+            }
+        }
+    }
+
+    /**
+     * 判断是否为业务节点
+     */
+    private boolean isBusinessNode(String className, String methodName) {
+        String lowerClass = className.toLowerCase();
+        String lowerMethod = methodName.toLowerCase();
+        
+        // 排除纯技术类
+        if (lowerClass.contains("util") || lowerClass.contains("helper") || 
+            lowerClass.contains("converter") || lowerClass.contains("mapper") ||
+            lowerClass.contains("config") || lowerClass.endsWith("dto") ||
+            lowerClass.endsWith("vo") || lowerClass.endsWith("entity") ||
+            lowerClass.endsWith("dao") || lowerClass.endsWith("repository")) {
+            return false;
+        }
+        
+        // 排除 getter/setter/toString 等
+        if (lowerMethod.startsWith("get") || lowerMethod.startsWith("set") ||
+            lowerMethod.equals("tostring") || lowerMethod.equals("hashcode") ||
+            lowerMethod.equals("equals") || lowerMethod.startsWith("lambda$")) {
+            return false;
+        }
+        
+        return true;
+    }
+
+    /**
+     * 构建业务描述
+     */
+    private String buildBusinessDescription(String className, String methodName) {
+        String simpleClass = className.substring(className.lastIndexOf('.') + 1)
+                                      .replace("ServiceImpl", "")
+                                      .replace("Service", "")
+                                      .replace("Manager", "")
+                                      .replace("Handler", "");
+        
+        String desc = methodName;
+        String lower = methodName.toLowerCase();
+        
+        if (lower.startsWith("create") || lower.startsWith("add") || lower.startsWith("insert")) 
+            desc = "创建" + simpleClass;
+        else if (lower.startsWith("update") || lower.startsWith("modify") || lower.startsWith("edit")) 
+            desc = "更新" + simpleClass;
+        else if (lower.startsWith("delete") || lower.startsWith("remove")) 
+            desc = "删除" + simpleClass;
+        else if (lower.startsWith("query") || lower.startsWith("get") || lower.startsWith("find") || lower.startsWith("list")) 
+            desc = "查询" + simpleClass;
+        else if (lower.startsWith("check") || lower.startsWith("validate") || lower.startsWith("verify")) 
+            desc = "校验" + simpleClass;
+        else if (lower.startsWith("calculate") || lower.startsWith("compute")) 
+            desc = "计算" + simpleClass;
+        else if (lower.startsWith("send") || lower.startsWith("notify") || lower.startsWith("publish")) 
+            desc = "发送通知";
+        else if (lower.startsWith("process") || lower.startsWith("handle")) 
+            desc = "处理" + simpleClass;
+        else 
+            desc = methodName + "（" + simpleClass + "）";
+        
+        return desc;
+    }
+
+    /**
+     * 翻译边界点类型为业务术语
+     */
+    private String translateBoundary(String boundaryType) {
+        return switch (boundaryType) {
+            case "DB" -> "数据库";
+            case "HTTP" -> "外部接口";
+            case "MQ" -> "消息队列";
+            case "CACHE" -> "缓存";
+            case "GRPC" -> "RPC调用";
+            default -> boundaryType;
+        };
+    }
+
+    /**
+     * 收集调用链中所有方法的边界点
+     */
+    private List<BoundaryEntity> collectBoundaries(Long repoId, CallGraphEngine.CallTreeNodeDTO root) {
+        Set<String> methods = new HashSet<>();
+        collectAllMethods(root, methods);
+        
+        List<BoundaryEntity> result = new ArrayList<>();
+        for (String method : methods) {
+            result.addAll(boundaryRepo.findByRepoIdAndFullMethod(repoId, method));
+        }
+        return result;
+    }
+
+    private void collectAllMethods(CallGraphEngine.CallTreeNodeDTO node, Set<String> result) {
+        if (node == null || !result.add(node.fullMethod())) return;
+        if (node.children() != null) {
+            for (var child : node.children()) {
+                collectAllMethods(child, result);
+            }
+        }
+    }
+
+    /**
+     * 分析数据流转
+     */
+    private DataFlowSummary analyzeDataFlow(List<BoundaryEntity> boundaries) {
+        Set<String> inserts = new LinkedHashSet<>();
+        Set<String> updates = new LinkedHashSet<>();
+        Set<String> queries = new LinkedHashSet<>();
+        Set<String> deletes = new LinkedHashSet<>();
+        Set<String> externalCalls = new LinkedHashSet<>();
+        Set<String> messages = new LinkedHashSet<>();
+        
+        for (BoundaryEntity b : boundaries) {
+            if ("DB".equals(b.getBoundaryType())) {
+                String context = b.getContext().toLowerCase();
+                String table = extractBusinessEntityName(b.getContext());
+                if (context.contains("insert") || context.contains("save")) {
+                    inserts.add(table);
+                } else if (context.contains("update")) {
+                    updates.add(table);
+                } else if (context.contains("delete")) {
+                    deletes.add(table);
+                } else if (context.contains("select") || context.contains("query") || context.contains("find")) {
+                    queries.add(table);
+                }
+            } else if ("HTTP".equals(b.getBoundaryType())) {
+                externalCalls.add(extractServiceName(b.getBoundaryType(), b.getContext()));
+            } else if ("MQ".equals(b.getBoundaryType())) {
+                messages.add(extractServiceName(b.getBoundaryType(), b.getContext()));
+            }
+        }
+        
+        return new DataFlowSummary(
+            new ArrayList<>(inserts),
+            new ArrayList<>(updates),
+            new ArrayList<>(queries),
+            new ArrayList<>(deletes),
+            new ArrayList<>(externalCalls),
+            new ArrayList<>(messages)
+        );
+    }
+
+    /**
+     * 提取业务实体名（从表名或 Mapper 方法名）
+     */
+    private String extractBusinessEntityName(String context) {
+        // 从 SQL 中提取表名
+        String lower = context.toLowerCase();
+        String[] keywords = {"from ", "into ", "update ", "join "};
+        for (String kw : keywords) {
+            int idx = lower.indexOf(kw);
+            if (idx >= 0) {
+                String after = context.substring(idx + kw.length()).trim();
+                String table = after.split("\\s+")[0].replaceAll("[`;]", "");
+                if (!table.isEmpty() && !table.equals("*")) {
+                    // 转换为业务术语（去掉 t_、tb_ 前缀）
+                    return table.replaceFirst("^(t_|tb_|tbl_)", "")
+                                .replace("_", "");
+                }
+            }
+        }
+        return "数据";
+    }
+
+    private String buildEntryDescription(ApiEndpointEntity endpoint, String entryMethod) {
+        if (endpoint != null) {
+            String method = endpoint.getHttpMethod() != null ? endpoint.getHttpMethod() : "";
+            String path = endpoint.getUrlPath() != null ? endpoint.getUrlPath() : "";
+            return method + " " + path;
+        }
+        return shortMethod(entryMethod);
+    }
+
+    // 辅助类
+    private record BusinessNode(String description, List<String> boundaries) {}
+    
+    private record DataFlowSummary(
+        List<String> inserts,
+        List<String> updates,
+        List<String> queries,
+        List<String> deletes,
+        List<String> externalCalls,
+        List<String> messages
+    ) {}
+
+    private String extractClassName(String fullMethod) {
+        int colon = fullMethod.lastIndexOf(':');
+        return colon > 0 ? fullMethod.substring(0, colon) : fullMethod;
+    }
+
+    private String extractMethodName(String fullMethod) {
+        int colon = fullMethod.lastIndexOf(':');
+        String methodPart = colon > 0 ? fullMethod.substring(colon + 1) : fullMethod;
+        int paren = methodPart.indexOf('(');
+        return paren > 0 ? methodPart.substring(0, paren) : methodPart;
+    }
+
+    /**
+     * 生成研发视角文档（技术实现细节）
      */
     public String generateDevDoc(Long repoId, String entryMethod) {
         CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, entryMethod, 15);

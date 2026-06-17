@@ -59,6 +59,18 @@ export interface CallTreeNode {
   children: CallTreeNode[];
   isRecursive: boolean;
   isLazyLoad: boolean;
+  ambiguous: boolean;
+}
+
+export interface AmbiguityWarning {
+  fullMethod: string;
+  locations: AmbiguityLocation[];
+}
+
+export interface AmbiguityLocation {
+  repoId: number;
+  repoName: string;
+  filePath: string;
 }
 
 export interface CallTree {
@@ -66,6 +78,7 @@ export interface CallTree {
   totalNodes: number;
   maxDepth: number;
   hasCycle: boolean;
+  warnings?: AmbiguityWarning[];
 }
 
 export interface CallerInfo {
@@ -385,6 +398,12 @@ export async function generateProductDoc(repoId: number, method: string): Promis
 
 export async function generateDevDoc(repoId: number, method: string): Promise<string> {
   const res = await api.get<ApiResponse<string>>(`/repos/${repoId}/doc/dev`, { params: { method } });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '生成失败');
+  return res.data.data;
+}
+
+export async function generateProductDocDiagrams(repoId: number, method: string): Promise<Record<string, string>> {
+  const res = await api.get<ApiResponse<Record<string, string>>>(`/repos/${repoId}/doc/diagrams`, { params: { method } });
   if (!res.data.success) throw new Error(res.data.error?.message ?? '生成失败');
   return res.data.data;
 }

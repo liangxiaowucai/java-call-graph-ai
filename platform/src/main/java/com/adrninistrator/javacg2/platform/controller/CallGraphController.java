@@ -103,4 +103,9 @@ public class CallGraphController {
     public ApiResponse<String> getDevDoc(@PathVariable Long repoId, @RequestParam String method) {
         return ApiResponse.ok(docGenerator.generateDevDoc(repoId, method));
     }
+    
+    @GetMapping("/doc/diagrams")
+    public ApiResponse<Map<String, String>> getProductDocDiagrams(@PathVariable Long repoId, @RequestParam String method) {
+        return ApiResponse.ok(docGenerator.generateProductDocDiagrams(repoId, method));
+    }
 }

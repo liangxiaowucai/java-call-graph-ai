@@ -81,11 +81,78 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         int[] nodeCount = {0};
         boolean[] hasCycle = {false};
 
+        // 预先收集所有可能的歧义方法签名（这样在构建树时可以标记节点）
+        Map<Long, String> repoNames = new HashMap<>();
+        repositoryRepo.findAll().forEach(r -> repoNames.put(r.getId(), r.getName()));
+        
+        // 先做一次快速扫描，找出当前仓库中哪些方法在其他仓库也有定义
+        Set<String> ambiguousMethods = new HashSet<>();
+        // 只检查入口方法周边的方法，避免全量扫描
+        collectPotentialAmbiguousMethods(repoId, entryMethod, ambiguousMethods, new HashSet<>(), 0, maxDepth);
+        
         // 逐层按需查询，不全量加载
         CallTreeNodeDTO root = buildNodeLazy(repoId, entryMethod, packagePrefixes,
-                visited, expanded, 0, maxDepth, nodeCount, hasCycle);
+                visited, expanded, 0, maxDepth, nodeCount, hasCycle, ambiguousMethods);
 
-        return new CallTreeDTO(root, nodeCount[0], maxDepth, hasCycle[0]);
+        // 收集详细的歧义告警信息（用于顶部统计显示）
+        Map<String, AmbiguityWarning> ambiguities = new LinkedHashMap<>();
+        collectAmbiguitiesFromTree(root, repoNames, ambiguities);
+        List<AmbiguityWarning> warnings = new ArrayList<>(ambiguities.values());
+        
+        if (!warnings.isEmpty()) {
+            logger.info("[调用树] method={} 节点={} 歧义={}", entryMethod, nodeCount[0], warnings.size());
+        }
+
+        return new CallTreeDTO(root, nodeCount[0], maxDepth, hasCycle[0], warnings);
+    }
+    
+    /**
+     * 快速扫描收集可能的歧义方法（浅层扫描，不递归太深）
+     */
+    private void collectPotentialAmbiguousMethods(Long repoId, String method, 
+                                                   Set<String> ambiguousMethods, 
+                                                   Set<String> visited, int depth, int maxDepth) {
+        if (depth > 3 || visited.contains(method)) return; // 只扫描3层深度
+        visited.add(method);
+        
+        // 检查这个方法是否在其他仓库也有定义
+        List<ChunkEntity> allDefs = chunkRepo.findByFullMethod(method);
+        if (allDefs.size() > 1) {
+            // 检查是否跨仓库
+            Set<Long> repos = allDefs.stream().map(ChunkEntity::getRepoId).collect(Collectors.toSet());
+            if (repos.size() > 1) {
+                ambiguousMethods.add(method);
+            }
+        }
+        
+        // 递归扫描直接调用的方法
+        if (depth < 3) {
+            List<CallGraphEntity> callees = callGraphRepo.findByRepoIdAndCallerMethod(repoId, method);
+            for (CallGraphEntity callee : callees) {
+                if (callee.getEnabled() != null && callee.getEnabled()) {
+                    collectPotentialAmbiguousMethods(repoId, callee.getCalleeMethod(), 
+                                                     ambiguousMethods, visited, depth + 1, maxDepth);
+                }
+            }
+        }
+    }
+    
+    /**
+     * 从调用树中收集所有可能的歧义方法（用于生成详细的警告信息）
+     */
+    private void collectAmbiguitiesFromTree(CallTreeNodeDTO node, Map<Long, String> repoNames, 
+                                            Map<String, AmbiguityWarning> ambiguities) {
+        if (node == null) return;
+        
+        // 检查当前节点是否有歧义
+        addAmbiguityIfAny(node.fullMethod(), repoNames, ambiguities);
+        
+        // 递归检查子节点
+        if (node.children() != null) {
+            for (CallTreeNodeDTO child : node.children()) {
+                collectAmbiguitiesFromTree(child, repoNames, ambiguities);
+            }
+        }
     }
 
     /**
@@ -96,29 +163,32 @@ public class CallGraphEngineImpl implements CallGraphEngine {
      */
     private CallTreeNodeDTO buildNodeLazy(Long repoId, String fullMethod, List<String> packagePrefixes,
                                            Set<String> visited, Set<String> expanded, int depth, int maxDepth,
-                                           int[] nodeCount, boolean[] hasCycle) {
+                                           int[] nodeCount, boolean[] hasCycle, Set<String> ambiguousMethods) {
         nodeCount[0]++;
+        
+        // 检查当前方法是否是歧义方法
+        boolean isAmbiguous = ambiguousMethods.contains(fullMethod);
 
         // 递归检测（当前路径上已出现 → 成环）
         if (visited.contains(fullMethod)) {
             hasCycle[0] = true;
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    List.of(), List.of(), true, false);
+                    List.of(), List.of(), true, false, isAmbiguous);
         }
 
         // 深度限制 或 节点总数超限 → 标记懒加载
         if (depth >= maxDepth || nodeCount[0] > MAX_TOTAL_NODES) {
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    List.of(), List.of(), false, true);
+                    List.of(), List.of(), false, true, isAmbiguous);
         }
 
         // 已在别处完整展开过（菱形汇聚点）→ 折叠为懒加载，不重复展开
         if (expanded.contains(fullMethod)) {
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    List.of(), List.of(), false, true);
+                    List.of(), List.of(), false, true, isAmbiguous);
         }
 
         visited.add(fullMethod);
@@ -148,44 +218,48 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         // 超过懒加载深度 → 只返回当前节点，子节点标记懒加载
         if (depth >= LAZY_LOAD_DEFAULT_DEPTH && nodeCount[0] > LAZY_LOAD_DEFAULT_DEPTH * 10) {
             List<CallTreeNodeDTO> lazyChildren = new ArrayList<>(callees.stream()
-                    .map(c -> new CallTreeNodeDTO(c.getCalleeMethod(), extractClassName(c.getCalleeMethod()),
-                            extractMethodName(c.getCalleeMethod()), c.getCallType(), c.getLineNumber(),
-                            List.of(), List.of(), false, true))
+                    .map(c -> {
+                        boolean childAmbiguous = ambiguousMethods.contains(c.getCalleeMethod());
+                        return new CallTreeNodeDTO(c.getCalleeMethod(), extractClassName(c.getCalleeMethod()),
+                                extractMethodName(c.getCalleeMethod()), c.getCallType(), c.getLineNumber(),
+                                List.of(), List.of(), false, true, childAmbiguous);
+                    })
                     .collect(Collectors.toList()));
             for (String impl : implTargets) {
+                boolean implAmbiguous = ambiguousMethods.contains(impl);
                 lazyChildren.add(new CallTreeNodeDTO(impl, extractClassName(impl), extractMethodName(impl),
-                        "IMPL", null, List.of(), List.of(), false, true));
+                        "IMPL", null, List.of(), List.of(), false, true, implAmbiguous));
             }
             visited.remove(fullMethod);
             expanded.add(fullMethod);
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    boundaries, lazyChildren, false, false);
+                    boundaries, lazyChildren, false, false, isAmbiguous);
         }
 
         // 递归展开子节点（visited 共享，进入子节点前已 add 当前节点，返回后统一 remove）
         List<CallTreeNodeDTO> children = new ArrayList<>();
         for (CallGraphEntity callee : callees) {
             CallTreeNodeDTO child = buildNodeLazy(repoId, callee.getCalleeMethod(), packagePrefixes,
-                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle);
+                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, ambiguousMethods);
             children.add(new CallTreeNodeDTO(child.fullMethod(), child.className(), child.methodName(),
                     callee.getCallType(), callee.getLineNumber(),
-                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad()));
+                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad(), child.ambiguous()));
         }
         // 桥接的实现方法以合成 IMPL 边接入，递归展开其方法体
         for (String impl : implTargets) {
             CallTreeNodeDTO child = buildNodeLazy(repoId, impl, packagePrefixes,
-                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle);
+                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, ambiguousMethods);
             children.add(new CallTreeNodeDTO(child.fullMethod(), child.className(), child.methodName(),
                     "IMPL", null,
-                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad()));
+                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad(), child.ambiguous()));
         }
 
         visited.remove(fullMethod);  // 离开当前路径，允许其它分支再次经过（环检测仍由 expanded 兜底防重复展开）
         expanded.add(fullMethod);
         return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                 extractMethodName(fullMethod), null, null,
-                boundaries, children, false, false);
+                boundaries, children, false, false, isAmbiguous);
     }
 
     /** 过滤构造方法、setter/getter 等非业务方法 */

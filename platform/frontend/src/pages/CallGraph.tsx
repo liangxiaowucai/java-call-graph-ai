@@ -6,14 +6,45 @@ import {
   DownOutlined, RightOutlined,
 } from '@ant-design/icons';
 import G6, { type TreeGraph as TreeGraphType } from '@antv/g6';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import mermaid from 'mermaid';
 import {
   fetchRepos, fetchEntryPoints, fetchCallTree, fetchMethodSource, fetchMethodSourceDetail,
   analyzeLog, getMock, saveMock, generateCallChainCode,
-  generateProductDoc, generateDevDoc,
+  generateProductDoc, generateDevDoc, generateProductDocDiagrams,
   type RepoEntity, type EntryPoint, type CallTree, type CallTreeNode,
   type LogAnalysisResult, type MethodSourceDetail,
 } from '../api';
 import JavaCodeViewer from '../components/JavaCodeViewer';
+
+// ─── Mermaid initialization ──────────────────────────────────────────────────
+
+mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
+
+// ─── MermaidBlock component ──────────────────────────────────────────────────
+
+function MermaidBlock({ code }: { code: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [svg, setSvg] = useState('');
+
+  useEffect(() => {
+    const id = 'mermaid-' + Math.random().toString(36).slice(2);
+    mermaid.parse(code)
+      .then(() => mermaid.render(id, code))
+      .then(({ svg }) => setSvg(svg))
+      .catch((err) => {
+        console.error('Mermaid render error:', err);
+        setSvg('');
+      });
+  }, [code]);
+
+  return svg ? (
+    <div ref={ref} dangerouslySetInnerHTML={{ __html: svg }} style={{ overflow: 'auto', margin: '8px 0' }} />
+  ) : (
+    <pre style={{ background: '#f5f5f5', padding: 12, borderRadius: 6, fontSize: 12 }}>{code}</pre>
+  );
+}
 
 // ─── Boundary color mapping ──────────────────────────────────────────────────
 
@@ -51,6 +82,7 @@ interface G6Node {
   boundaries: { boundaryType: string; lineNumber: number; context: string }[];
   isRecursive: boolean;
   isLazyLoad: boolean;
+  ambiguous: boolean;
   children: G6Node[];
   // 日志诊断状态
   diagStatus?: 'OK' | 'ERROR' | 'UNKNOWN';
@@ -73,6 +105,7 @@ function transformNode(node: CallTreeNode): G6Node {
     boundaries: node.boundaries ?? [],
     isRecursive: node.isRecursive,
     isLazyLoad: node.isLazyLoad,
+    ambiguous: node.ambiguous,
     children: (node.children ?? []).map(transformNode),
   };
 }
@@ -91,6 +124,7 @@ function registerCustomNode() {
         const label = (cfg.label as string) ?? '';
         const boundaries = (cfg.boundaries as G6Node['boundaries']) ?? [];
         const isRecursive = cfg.isRecursive as boolean;
+        const isAmbiguous = cfg.ambiguous as boolean;
         const callType = (cfg.callType as string) ?? '';
 
         // Measure text width
@@ -98,9 +132,10 @@ function registerCustomNode() {
         const boundaryWidth = boundaries.length * 12;
         const width = Math.max(NODE_MIN_WIDTH, textWidth + boundaryWidth + 40);
 
-        // Background rect
-        const strokeColor = isRecursive ? '#ff4d4f' : '#d9d9d9';
-        const fillColor = isRecursive ? '#fff2f0' : '#ffffff';
+        // Background rect - 歧义节点用橙色边框，递归节点用红色边框
+        const strokeColor = isRecursive ? '#ff4d4f' : isAmbiguous ? '#faad14' : '#d9d9d9';
+        const fillColor = isRecursive ? '#fff2f0' : isAmbiguous ? '#fffbe6' : '#ffffff';
+        const lineWidth = (isRecursive || isAmbiguous) ? 2 : 1;
         const keyShape = group.addShape('rect', {
           attrs: {
             x: 0,
@@ -110,7 +145,7 @@ function registerCustomNode() {
             radius: 6,
             fill: fillColor,
             stroke: strokeColor,
-            lineWidth: 1,
+            lineWidth: lineWidth,
             shadowColor: 'rgba(0,0,0,0.06)',
             shadowBlur: 4,
             shadowOffsetY: 2,
@@ -307,6 +342,9 @@ export default function CallGraph() {
   const [docContent, setDocContent] = useState('');
   const [docLoading, setDocLoading] = useState(false);
   const [docType, setDocType] = useState<'product' | 'dev'>('product');
+  const [docDiagrams, setDocDiagrams] = useState<Record<string, string>>({});
+  const [selectedDiagramType, setSelectedDiagramType] = useState<'flowchart' | 'sequence' | 'swimlane'>('sequence');
+  const [diagramLoading, setDiagramLoading] = useState(false);
 
   const graphContainerRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<TreeGraphType | null>(null);
@@ -470,10 +508,19 @@ export default function CallGraph() {
     setDocLoading(true);
     setDocDrawerOpen(true);
     try {
-      const doc = type === 'product'
-          ? await generateProductDoc(selectedRepoId, selectedEntry)
-          : await generateDevDoc(selectedRepoId, selectedEntry);
-      setDocContent(doc);
+      if (type === 'product') {
+        // 只获取文档内容，图表按需加载
+        const doc = await generateProductDoc(selectedRepoId, selectedEntry);
+        setDocContent(doc);
+        setDocDiagrams({}); // 清空之前的图表
+        setSelectedDiagramType('sequence'); // 默认时序图
+        // 立即加载默认图表（时序图）
+        loadDiagram('sequence');
+      } else {
+        const doc = await generateDevDoc(selectedRepoId, selectedEntry);
+        setDocContent(doc);
+        setDocDiagrams({}); // 研发文档不需要图表切换
+      }
     } catch (err: unknown) {
       if (err instanceof Error) message.error(err.message);
       setDocContent('生成失败');
@@ -481,6 +528,32 @@ export default function CallGraph() {
       setDocLoading(false);
     }
   }, [selectedRepoId, selectedEntry]);
+
+  // 按需加载图表
+  const loadDiagram = useCallback(async (diagramType: 'flowchart' | 'sequence' | 'swimlane') => {
+    if (!selectedRepoId || !selectedEntry) return;
+    
+    // 如果已经加载过，直接返回
+    if (docDiagrams[diagramType]) {
+      return;
+    }
+    
+    setDiagramLoading(true);
+    try {
+      const allDiagrams = await generateProductDocDiagrams(selectedRepoId, selectedEntry);
+      setDocDiagrams(allDiagrams);
+    } catch (err: unknown) {
+      if (err instanceof Error) message.error('图表加载失败: ' + err.message);
+    } finally {
+      setDiagramLoading(false);
+    }
+  }, [selectedRepoId, selectedEntry, docDiagrams]);
+
+  // 切换图表类型
+  const handleDiagramTypeChange = useCallback((type: 'flowchart' | 'sequence' | 'swimlane') => {
+    setSelectedDiagramType(type);
+    loadDiagram(type);
+  }, [loadDiagram]);
 
   // Render / update G6 graph
   useEffect(() => {
@@ -853,6 +926,33 @@ export default function CallGraph() {
                   <Tag color="warning" style={{ margin: 0 }}>存在循环</Tag>
                 </>
               )}
+              {callTree.warnings && callTree.warnings.length > 0 && (
+                <>
+                  <span style={{ margin: '0 8px' }}>|</span>
+                  <Tooltip title={
+                    <div style={{ maxWidth: 400 }}>
+                      <div style={{ marginBottom: 8, fontWeight: 600 }}>以下方法在多个仓库中有相同签名定义：</div>
+                      {callTree.warnings.map((w, i) => (
+                        <div key={i} style={{ marginBottom: 6, fontSize: 12 }}>
+                          <div style={{ color: '#ffe58f' }}>{w.fullMethod.split(':').pop()}</div>
+                          <div style={{ paddingLeft: 8 }}>
+                            {w.locations.map((loc, j) => (
+                              <div key={j}>• {loc.repoName}</div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                      <div style={{ marginTop: 8, color: '#d9d9d9', fontSize: 11 }}>
+                        静态分析无法确定调用指向哪个仓库的实现，请人工确认
+                      </div>
+                    </div>
+                  }>
+                    <Tag color="warning" style={{ margin: 0, cursor: 'pointer' }}>
+                      歧义: {callTree.warnings.length}
+                    </Tag>
+                  </Tooltip>
+                </>
+              )}
             </div>
 
             {/* Graph */}
@@ -942,6 +1042,18 @@ export default function CallGraph() {
             {detailNode.isRecursive && (
               <div style={{ padding: '8px 12px', background: '#fff2f0', borderRadius: 6, marginBottom: 12, color: '#ff4d4f' }}>
                 ⚠️ 递归调用 — 此节点在调用链中形成环
+              </div>
+            )}
+
+            {/* 歧义标记 */}
+            {detailNode.ambiguous && (
+              <div style={{ padding: '8px 12px', background: '#fff7e6', borderRadius: 6, marginBottom: 12, color: '#d48806', borderLeft: '3px solid #faad14' }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                  ⚠️ 此节点在多个仓库中非唯一性
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  此方法签名在多个仓库中有相同定义。静态分析仅靠签名匹配，无法确定调用真正指向哪个仓库的实现，请人工确认。
+                </div>
               </div>
             )}
 
@@ -1234,6 +1346,20 @@ export default function CallGraph() {
           <Space>
             <Button size="small" type={docType === 'product' ? 'primary' : 'default'} onClick={() => handleGenerateDoc('product')}>产品视角</Button>
             <Button size="small" type={docType === 'dev' ? 'primary' : 'default'} onClick={() => handleGenerateDoc('dev')}>研发视角</Button>
+            {docType === 'product' && (
+              <Select
+                size="small"
+                value={selectedDiagramType}
+                onChange={handleDiagramTypeChange}
+                style={{ width: 120 }}
+                loading={diagramLoading}
+                options={[
+                  { label: '📊 流程图', value: 'flowchart' },
+                  { label: '⏱️ 时序图', value: 'sequence' },
+                  { label: '🏊 泳道图', value: 'swimlane' },
+                ]}
+              />
+            )}
             <Button size="small" onClick={() => {
               navigator.clipboard.writeText(docContent);
               message.success('已复制到剪贴板');
@@ -1244,21 +1370,37 @@ export default function CallGraph() {
         {docLoading ? (
           <div style={{ textAlign: 'center', padding: 40 }}><Spin size="large" /></div>
         ) : (
-          <div className="doc-content" style={{
-            fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif',
-            fontSize: 14, lineHeight: 1.8, color: '#333',
-            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-          }}>
-            {docContent.split('\n').map((line, i) => {
-              if (line.startsWith('# ')) return <h1 key={i} style={{ fontSize: 22, fontWeight: 700, margin: '16px 0 8px', borderBottom: '2px solid #1890ff', paddingBottom: 8 }}>{line.slice(2)}</h1>;
-              if (line.startsWith('## ')) return <h2 key={i} style={{ fontSize: 18, fontWeight: 600, margin: '14px 0 6px', color: '#1a1a2e' }}>{line.slice(3)}</h2>;
-              if (line.startsWith('### ')) return <h3 key={i} style={{ fontSize: 15, fontWeight: 600, margin: '10px 0 4px' }}>{line.slice(4)}</h3>;
-              if (line.startsWith('```')) return <hr key={i} style={{ border: 'none', borderTop: '1px solid #f0f0f0', margin: '4px 0' }} />;
-              if (line.startsWith('|')) return <div key={i} style={{ fontFamily: 'monospace', fontSize: 12, background: '#fafafa', padding: '2px 8px' }}>{line}</div>;
-              if (line.startsWith('- ')) return <div key={i} style={{ paddingLeft: 16 }}>{line}</div>;
-              if (line.match(/^\d+\./)) return <div key={i} style={{ paddingLeft: 8, fontWeight: line.includes('**') ? 500 : 400 }}>{line.replace(/\*\*/g, '')}</div>;
-              return <div key={i}>{line || '\u00A0'}</div>;
-            })}
+          <div className="markdown-body" style={{ padding: '0 8px' }}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                code: ({ className, children }) => {
+                  const match = /language-mermaid/.exec(className || '');
+                  if (match) {
+                    // 如果是产品文档且有图表数据，使用选中的图表类型
+                    if (docType === 'product' && docDiagrams[selectedDiagramType]) {
+                      // 从图表数据中提取纯 Mermaid 代码（去掉 ```mermaid 标记）
+                      let mermaidCode = docDiagrams[selectedDiagramType];
+                      if (mermaidCode.startsWith('```mermaid')) {
+                        mermaidCode = mermaidCode.replace(/^```mermaid\n/, '').replace(/\n```$/, '');
+                      }
+                      return <MermaidBlock code={mermaidCode} />;
+                    }
+                    return <MermaidBlock code={String(children).trim()} />;
+                  }
+                  // Inline code
+                  if (!className) {
+                    return <code style={{ background: '#f0f0f0', padding: '2px 6px', borderRadius: 3, fontSize: '0.9em' }}>{children}</code>;
+                  }
+                  // Regular code block
+                  return <code className={className}>{children}</code>;
+                },
+                pre: ({ children }) => <>{children}</>,
+                // Support HTML details/summary for collapsible sections
+                details: ({ children }) => <details style={{ marginBottom: 16 }}>{children}</details>,
+                summary: ({ children }) => <summary style={{ cursor: 'pointer', padding: '8px 0', fontWeight: 500, fontSize: 14, color: '#1890ff' }}>{children}</summary>,
+              }}
+            >{docContent}</ReactMarkdown>
           </div>
         )}
       </Drawer>

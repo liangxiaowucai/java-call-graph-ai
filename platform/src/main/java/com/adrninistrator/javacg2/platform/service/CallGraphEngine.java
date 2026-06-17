@@ -55,13 +55,13 @@ public interface CallGraphEngine {
         List<String> fields   // "fieldName: fieldType // 注释"
     ) {}
 
-    record CallTreeDTO(CallTreeNodeDTO root, int totalNodes, int maxDepth, boolean hasCycle) {}
+    record CallTreeDTO(CallTreeNodeDTO root, int totalNodes, int maxDepth, boolean hasCycle, List<AmbiguityWarning> warnings) {}
 
     record CallTreeNodeDTO(String fullMethod, String className, String methodName,
                             String callType, Integer lineNumber,
                             List<BoundaryDTO> boundaries,
                             List<CallTreeNodeDTO> children,
-                            boolean isRecursive, boolean isLazyLoad) {}
+                            boolean isRecursive, boolean isLazyLoad, boolean ambiguous) {}
 
     record BoundaryDTO(String boundaryType, Integer lineNumber, String context) {}
 
