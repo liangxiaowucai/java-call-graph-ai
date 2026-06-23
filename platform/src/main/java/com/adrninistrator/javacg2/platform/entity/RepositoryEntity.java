@@ -47,6 +47,9 @@ public class RepositoryEntity {
     @Column(columnDefinition = "TEXT")
     private String overview;
 
+    @Column(name = "url_path_identifier", length = 200)
+    private String urlPathIdentifier;
+
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
     public String getName() { return name; }
@@ -73,4 +76,6 @@ public class RepositoryEntity {
     public void setProfile(String profile) { this.profile = profile; }
     public String getOverview() { return overview; }
     public void setOverview(String overview) { this.overview = overview; }
+    public String getUrlPathIdentifier() { return urlPathIdentifier; }
+    public void setUrlPathIdentifier(String urlPathIdentifier) { this.urlPathIdentifier = urlPathIdentifier; }
 }

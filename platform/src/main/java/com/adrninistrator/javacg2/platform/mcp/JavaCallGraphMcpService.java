@@ -31,7 +31,7 @@ public class JavaCallGraphMcpService {
 
     private static final Logger logger = LoggerFactory.getLogger(JavaCallGraphMcpService.class);
     private static final ObjectMapper mapper = new ObjectMapper();
-    private static final int MAX_DEPTH = 20;
+    private static final int MAX_DEPTH = 5;  // 从20改为5，避免性能问题
 
     private final CallGraphEngine callGraphEngine;
     private final BoundaryRepo boundaryRepo;

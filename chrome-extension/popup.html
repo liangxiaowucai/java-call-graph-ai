@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JavaCG2 请求链追踪</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <h3>🔍 请求链追踪</h3>
+      <div class="actions">
+        <button id="settingsBtn" class="btn btn-small" title="设置">⚙️</button>
+        <button id="toggleRecording" class="btn btn-small" title="暂停/继续录制">
+          <span id="recordingIcon">⏸️</span>
+        </button>
+        <button id="clearBtn" class="btn btn-small btn-danger" title="清空">🗑️</button>
+      </div>
+    </div>
+
+    <!-- User Action Input -->
+    <div class="user-action-section">
+      <input 
+        type="text" 
+        id="userActionInput" 
+        class="input-text" 
+        placeholder="描述你的操作，如：点击提交订单按钮"
+        maxlength="100"
+      />
+      <input 
+        type="text" 
+        id="filterInput" 
+        class="input-text filter-input" 
+        placeholder="🔍 筛选请求（URL/方法/状态码）"
+      />
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <div class="status-item">
+        <span class="label">状态:</span>
+        <span id="recordingStatus" class="badge badge-success">🟢 录制中</span>
+      </div>
+      <div class="status-item">
+        <span class="label">请求数:</span>
+        <span id="requestCount" class="badge">0</span>
+      </div>
+      <div class="status-item">
+        <span class="label">失败:</span>
+        <span id="errorCount" class="badge badge-danger">0</span>
+      </div>
+    </div>
+
+    <!-- Request List -->
+    <div class="request-list" id="requestList">
+      <div class="empty-state">
+        <p>📡 等待捕获请求...</p>
+        <p class="tip">在网页中进行操作，插件会自动捕获API请求</p>
+      </div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="footer">
+      <button id="exportBtn" class="btn btn-primary" disabled>
+        📋 导出JSON
+      </button>
+      <button id="analyzeBtn" class="btn btn-success" disabled>
+        🔬 智能分析
+      </button>
+    </div>
+
+    <!-- Analysis Result (Hidden by default) -->
+    <div id="analysisResult" class="analysis-result" style="display: none;">
+      <div class="analysis-header">
+        <h4>分析结果</h4>
+        <button id="closeAnalysis" class="btn-close">✕</button>
+      </div>
+      <div id="analysisContent" class="analysis-content">
+        <!-- 动态填充 -->
+      </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+      <div class="spinner"></div>
+      <p>正在分析...</p>
+    </div>
+
+    <!-- Settings Panel -->
+    <div id="settingsPanel" class="settings-panel" style="display: none;">
+      <div class="settings-header">
+        <h4>⚙️ 设置</h4>
+        <button id="closeSettings" class="btn-close">✕</button>
+      </div>
+      <div class="settings-content">
+        <div class="setting-section">
+          <h5 class="section-title">🌐 Host 配置</h5>
+          <div class="setting-item">
+            <label for="backendUrlInput">后端服务地址</label>
+            <input 
+              type="text" 
+              id="backendUrlInput" 
+              class="input-text" 
+              placeholder="http://localhost:8080"
+            />
+            <div class="setting-hint">
+              用于智能分析功能的后端服务地址
+            </div>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h5 class="section-title">🔍 URL 匹配规则</h5>
+          <div class="setting-item">
+            <label for="urlPrefixInput">URL 前缀匹配</label>
+            <input 
+              type="text" 
+              id="urlPrefixInput" 
+              class="input-text" 
+              placeholder="例如：/api/,/archivos/"
+            />
+            <div class="setting-hint">
+              多个规则用逗号分隔，只捕获匹配这些前缀的请求<br>
+              留空则捕获所有请求
+            </div>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h5 class="section-title">⏱️ 性能过滤</h5>
+          <div class="setting-item">
+            <label for="minDurationInput">最小响应时间（秒）</label>
+            <input 
+              type="number" 
+              id="minDurationInput" 
+              class="input-text" 
+              placeholder="例如：1"
+              min="0"
+              step="0.1"
+            />
+            <div class="setting-hint">
+              只显示响应时间超过此阈值的请求（单位：秒）<br>
+              留空或填 0 则显示所有请求
+            </div>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h5 class="section-title">📌 前置条件 URL</h5>
+          <div class="setting-item">
+            <label for="prependUrlInput">前置 URL（可选）</label>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <input 
+                type="text" 
+                id="prependUrlInput" 
+                class="input-text" 
+                placeholder="例如：/api/user/info"
+                style="flex: 1;"
+              />
+              <label style="display: flex; align-items: center; gap: 4px; margin: 0; white-space: nowrap;">
+                <input type="checkbox" id="prependEnabledCheckbox" />
+                启用
+              </label>
+            </div>
+            <div class="setting-hint">
+              启用后，导出JSON时会自动包含此URL的请求和响应数据<br>
+              常用于包含登录用户信息等上下文数据
+            </div>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h5 class="section-title">📦 导出选项</h5>
+          <div class="setting-item">
+            <label>数据包含选项</label>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              <label style="display: flex; align-items: center; gap: 8px; margin: 0;">
+                <input type="checkbox" id="includeHeadersCheckbox" />
+                <span>包含请求和响应的 Headers</span>
+              </label>
+            </div>
+            <div class="setting-hint">
+              启用后，导出的 JSON 将包含每个请求的请求头 (requestHeaders) 和响应头 (responseHeaders)
+            </div>
+          </div>
+        </div>
+
+        <div class="setting-actions">
+          <button id="saveSettings" class="btn btn-primary">保存</button>
+          <button id="cancelSettings" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Request Detail Panel -->
+    <div id="requestDetailPanel" class="request-detail-panel" style="display: none;">
+      <div class="detail-header">
+        <h4>📋 请求详情</h4>
+        <button id="closeDetail" class="btn-close">✕</button>
+      </div>
+      <div class="detail-content" id="requestDetailContent">
+        <!-- 动态填充 -->
+      </div>
+    </div>
+
+    <!-- Export Selection Panel -->
+    <div id="exportSelectionPanel" class="export-selection-panel" style="display: none;">
+      <div class="export-header">
+        <h4>📋 选择要导出的请求</h4>
+        <button id="closeExportSelection" class="btn-close">✕</button>
+      </div>
+      <div class="export-content">
+        <div class="export-toolbar">
+          <button id="selectAllBtn" class="btn btn-small">全选</button>
+          <button id="deselectAllBtn" class="btn btn-small">全不选</button>
+          <button id="invertSelectionBtn" class="btn btn-small">反选</button>
+        </div>
+        <div id="exportRequestList" class="export-request-list">
+          <!-- 动态填充 -->
+        </div>
+        <div class="export-actions">
+          <button id="confirmExportBtn" class="btn btn-primary">确认导出</button>
+          <button id="cancelExportBtn" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 提示容器 -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

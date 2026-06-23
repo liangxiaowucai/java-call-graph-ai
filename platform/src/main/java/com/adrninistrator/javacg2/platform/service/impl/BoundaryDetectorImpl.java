@@ -28,15 +28,21 @@ public class BoundaryDetectorImpl {
 
     // 被调用方法类名前缀 -> [边界类型, 描述]
     private static final List<String[]> CALLEE_RULES = List.of(
-            // HTTP
+            // HTTP - 只匹配实际执行调用的类，排除配置和构建器  
             new String[]{"org.springframework.web.client.RestTemplate", "HTTP", "RestTemplate"},
-            new String[]{"org.springframework.web.reactive.function.client.WebClient", "HTTP", "WebClient"},
-            new String[]{"org.apache.http.client", "HTTP", "Apache HttpClient"},
-            new String[]{"org.apache.hc.client5", "HTTP", "Apache HttpClient5"},
+            new String[]{"org.springframework.web.reactive.function.client.WebClient$", "HTTP", "WebClient"},
+            // Apache HttpClient - 匹配 impl 包（包含实现类和工厂类）
+            // 但排除 config/params 等配置包
+            new String[]{"org.apache.http.impl.client.", "HTTP", "Apache HttpClient"},
+            new String[]{"org.apache.http.impl.execchain.", "HTTP", "Apache HttpClient"},
+            // Apache HttpClient5
+            new String[]{"org.apache.hc.client5.http.impl.classic.", "HTTP", "Apache HttpClient5"},
+            new String[]{"org.apache.hc.client5.http.impl.async.", "HTTP", "Apache HttpClient5"},
             new String[]{"java.net.HttpURLConnection", "HTTP", "HttpURLConnection"},
             new String[]{"java.net.http.HttpClient", "HTTP", "Java HttpClient"},
-            new String[]{"okhttp3.", "HTTP", "OkHttp"},
-            new String[]{"feign.", "HTTP", "Feign"},
+            new String[]{"okhttp3.OkHttpClient", "HTTP", "OkHttp"},
+            new String[]{"okhttp3.Call", "HTTP", "OkHttp"},
+            new String[]{"feign.Client", "HTTP", "Feign"},
             new String[]{"org.springframework.cloud.openfeign", "HTTP", "OpenFeign"},
             // gRPC
             new String[]{"io.grpc.", "GRPC", "gRPC"},
@@ -145,22 +151,31 @@ public class BoundaryDetectorImpl {
 
                     // 构建上下文
                     StringBuilder ctx = new StringBuilder();
-                    ctx.append(rule[2]).append(": ").append(calleeClass).append(".").append(calleeMethodName);
-
+                    boolean shouldRecord = true;
+                    
                     // 只对 HTTP/GRPC 提取 URL（最耗时的操作）
                     if ("HTTP".equals(boundaryType) || "GRPC".equals(boundaryType)) {
                         String urlFromSource = extractUrlFromSourceCached(repoId, repoPath, callerMethod, allConfigs, sourceCache);
                         if (urlFromSource != null) {
-                            ctx.append("\n📌 URL: ").append(urlFromSource);
+                            // 只显示 URL，不加描述前缀
+                            ctx.append("📌 URL: ").append(urlFromSource);
+                        } else {
+                            // 如果没有提取到 URL，不记录此边界
+                            shouldRecord = false;
+                        }
+                    } else {
+                        // 非 HTTP/GRPC：显示操作方法 + 源码行（看清 Redis key / DB SQL 等具体操作）
+                        ctx.append(rule[2]).append(": ").append(calleeMethodName);
+                        String srcLine = readSrcLineCached(repoPath, callerMethod, call.getLineNumber(), sourceCache);
+                        if (srcLine != null && !srcLine.isBlank()) {
+                            // 解析源码行中的静态常量引用（如 RedisConstant.KEY → 实际值）
+                            srcLine = resolveStaticConstants(repoPath, srcLine, sourceCache);
+                            ctx.append("\n📝 ").append(srcLine.length() > 200 ? srcLine.substring(0, 200) : srcLine);
                         }
                     }
-
-                    // 附加配置
-                    Map<String, String> relatedConfigs = configsByType.get(boundaryType);
-                    if (relatedConfigs != null && !relatedConfigs.isEmpty()) {
-                        ctx.append("\n--- 相关配置 ---");
-                        relatedConfigs.entrySet().stream().limit(8).forEach(cfg ->
-                                ctx.append("\n").append(cfg.getKey()).append(" = ").append(cfg.getValue()));
+                    
+                    if (!shouldRecord) {
+                        break; // 跳过此规则，继续尝试其他规则
                     }
 
                     BoundaryEntity boundary = new BoundaryEntity();
@@ -186,22 +201,24 @@ public class BoundaryDetectorImpl {
             if (calleeClass.endsWith("Client") || calleeClass.endsWith("FeignClient")) {
                 String callerMethod = call.getCallerMethod();
                 if (!methodBoundaryTypes.getOrDefault(callerMethod, Set.of()).contains("HTTP")) {
-                    String ctx = "Feign 远程调用: " + calleeClass + "." + calleeMethodName;
                     String urlFromSource = extractUrlFromSourceCached(repoId, repoPath, callerMethod, allConfigs, sourceCache);
-                    if (urlFromSource != null) ctx += "\n📌 URL: " + urlFromSource;
+                    // 只有成功提取到 URL 才记录
+                    if (urlFromSource != null) {
+                        String ctx = "📌 URL: " + urlFromSource;
 
-                    BoundaryEntity boundary = new BoundaryEntity();
-                    boundary.setRepoId(repoId);
-                    boundary.setFullMethod(callerMethod);
-                    boundary.setBoundaryType("HTTP");
-                    boundary.setLineNumber(call.getLineNumber());
-                    boundary.setCalleeMethod(call.getCalleeMethod());
-                    boundary.setContext(ctx);
-                    String dedupKey2 = callerMethod + "|HTTP|" + calleeClass;
-                    if (dedup.add(dedupKey2)) {
-                        batchBoundaries.add(boundary);
-                        count++;
-                        methodBoundaryTypes.computeIfAbsent(callerMethod, k -> new HashSet<>()).add("HTTP");
+                        BoundaryEntity boundary = new BoundaryEntity();
+                        boundary.setRepoId(repoId);
+                        boundary.setFullMethod(callerMethod);
+                        boundary.setBoundaryType("HTTP");
+                        boundary.setLineNumber(call.getLineNumber());
+                        boundary.setCalleeMethod(call.getCalleeMethod());
+                        boundary.setContext(ctx);
+                        String dedupKey2 = callerMethod + "|HTTP|" + calleeClass;
+                        if (dedup.add(dedupKey2)) {
+                            batchBoundaries.add(boundary);
+                            count++;
+                            methodBoundaryTypes.computeIfAbsent(callerMethod, k -> new HashSet<>()).add("HTTP");
+                        }
                     }
                 }
             }
@@ -273,6 +290,73 @@ public class BoundaryDetectorImpl {
     /**
      * 从调用方的源码中提取 URL 信息
      */
+    /**
+     * 解析源码行中的静态常量引用（如 RedisConstant.AS_CLASS_ARCHIVE_KEY）→ 替换为实际值。
+     * 匹配 ClassName.UPPER_FIELD 模式，从源码中查找 FIELD = "value" 赋值行。
+     */
+    private String resolveStaticConstants(String repoPath, String srcLine, Map<String, String> sourceCache) {
+        Matcher m = Pattern.compile("([A-Z][a-zA-Z0-9]*(?:Constant|Constants|Config|Keys|Key))\\.([A-Z][A-Z0-9_]+)").matcher(srcLine);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String constClass = m.group(1);
+            String fieldName = m.group(2);
+            String resolved = resolveFieldValue(repoPath, constClass, fieldName, sourceCache);
+            if (resolved != null) {
+                m.appendReplacement(sb, Matcher.quoteReplacement(constClass + "." + fieldName + "/*" + resolved + "*/"));
+            }
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+
+    /** 从常量类源码中提取 static final 字段的字面量值 */
+    private String resolveFieldValue(String repoPath, String simpleClassName, String fieldName, Map<String, String> sourceCache) {
+        // 在 sourceCache 的所有已加载源码中搜索（常量类通常很短）
+        for (Map.Entry<String, String> entry : sourceCache.entrySet()) {
+            if (entry.getKey().endsWith(simpleClassName) && !entry.getValue().isEmpty()) {
+                Matcher fm = Pattern.compile(fieldName + "\\s*=\\s*\"([^\"]+)\"").matcher(entry.getValue());
+                if (fm.find()) return fm.group(1);
+            }
+        }
+        // 尝试从 repoPath 加载该常量类
+        try (var walk = Files.walk(Path.of(repoPath), 10)) {
+            Path constFile = walk
+                    .filter(p -> p.getFileName().toString().equals(simpleClassName + ".java"))
+                    .findFirst().orElse(null);
+            if (constFile != null) {
+                String src = Files.readString(constFile);
+                sourceCache.put(simpleClassName, src);
+                Matcher fm = Pattern.compile(fieldName + "\\s*=\\s*\"([^\"]+)\"").matcher(src);
+                if (fm.find()) return fm.group(1);
+            }
+        } catch (IOException ignored) {}
+        return null;
+    }
+
+    /** 读取调用方源码指定行（带缓存），用于给 DB/Redis/MQ 边界附上真实操作源码 */
+    private String readSrcLineCached(String repoPath, String callerMethod, Integer lineNumber, Map<String, String> sourceCache) {
+        if (lineNumber == null || lineNumber <= 0) return null;
+        String className = extractClassName(callerMethod);
+        String topLevelClass = className.contains("$") ? className.substring(0, className.indexOf('$')) : className;
+        String source = sourceCache.get(topLevelClass);
+        if (source == null) {
+            String relativePath = topLevelClass.replace('.', '/') + ".java";
+            Path sourceFile = findSourceFile(Path.of(repoPath), relativePath);
+            if (sourceFile == null) { sourceCache.put(topLevelClass, ""); return null; }
+            try {
+                source = Files.readString(sourceFile);
+                sourceCache.put(topLevelClass, source);
+            } catch (IOException e) {
+                sourceCache.put(topLevelClass, "");
+                return null;
+            }
+        }
+        if (source.isEmpty()) return null;
+        String[] arr = source.split("\n", -1);
+        if (lineNumber - 1 >= 0 && lineNumber - 1 < arr.length) return arr[lineNumber - 1].trim();
+        return null;
+    }
+
     /**
      * 带缓存的 URL 提取
      */

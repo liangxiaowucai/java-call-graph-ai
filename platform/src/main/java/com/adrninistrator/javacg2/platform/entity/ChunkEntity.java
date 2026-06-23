@@ -52,6 +52,22 @@ public class ChunkEntity {
     @Column(name = "call_summary", columnDefinition = "TEXT")
     private String callSummary;
 
+    // 干净的字符串常量（method_call_info 中 type=v 的 String 常量，换行分隔），用于调用链展示
+    @Column(name = "constants", columnDefinition = "TEXT")
+    private String constants;
+
+    // 方法抛出/捕获的异常类型（短类名，换行分隔），用于调用链展示
+    @Column(name = "exceptions", columnDefinition = "TEXT")
+    private String exceptions;
+
+    // 解析后的外部调用 URL（field→@Value→config 数据流解析，换行分隔）
+    @Column(name = "resolved_urls", columnDefinition = "TEXT")
+    private String resolvedUrls;
+
+    // 业务错误码+消息（Result.buildResult/throw 语句解析，JSON 数组），用于调用链展示
+    @Column(name = "error_codes", columnDefinition = "TEXT")
+    private String errorCodes;
+
     @Column(name = "jar_num")
     private Integer jarNum;
 
@@ -89,6 +105,14 @@ public class ChunkEntity {
     public void setParameters(String parameters) { this.parameters = parameters; }
     public String getCallSummary() { return callSummary; }
     public void setCallSummary(String callSummary) { this.callSummary = callSummary; }
+    public String getConstants() { return constants; }
+    public void setConstants(String constants) { this.constants = constants; }
+    public String getExceptions() { return exceptions; }
+    public void setExceptions(String exceptions) { this.exceptions = exceptions; }
+    public String getResolvedUrls() { return resolvedUrls; }
+    public void setResolvedUrls(String resolvedUrls) { this.resolvedUrls = resolvedUrls; }
+    public String getErrorCodes() { return errorCodes; }
+    public void setErrorCodes(String errorCodes) { this.errorCodes = errorCodes; }
     public Integer getJarNum() { return jarNum; }
     public void setJarNum(Integer jarNum) { this.jarNum = jarNum; }
     public String getMethodHash() { return methodHash; }

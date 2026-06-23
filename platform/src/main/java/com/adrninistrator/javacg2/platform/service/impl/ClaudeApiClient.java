@@ -110,6 +110,74 @@ public class ClaudeApiClient {
     }
 
     /**
+     * 流式调用 Claude API，逐 token 回调。返回完整文本。
+     */
+    public String chatStream(String systemPrompt, List<Map<String, String>> messages, java.util.function.Consumer<String> onToken) {
+        String apiUrl = configRepo.findByConfigKey("claude.api.url")
+                .map(c -> c.getConfigValue())
+                .filter(s -> s != null && !s.isBlank())
+                .orElse("https://api.anthropic.com");
+        String apiKey = configRepo.findByConfigKey("claude.api.key")
+                .map(c -> c.getConfigValue())
+                .orElse(null);
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new ClaudeApiException("NOT_CONFIGURED", "请先在系统配置中设置 Claude API Key", "进入系统配置页面");
+        }
+
+        try {
+            Map<String, Object> body = Map.of(
+                    "model", "claude-sonnet-4-20250514",
+                    "max_tokens", 4096,
+                    "system", systemPrompt,
+                    "messages", messages,
+                    "stream", true
+            );
+            String jsonBody = mapper.writeValueAsString(body);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(apiUrl + "/v1/messages"))
+                    .header("Content-Type", "application/json")
+                    .header("x-api-key", apiKey)
+                    .header("anthropic-version", "2023-06-01")
+                    .timeout(Duration.ofSeconds(180))
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                    .build();
+
+            logger.info("流式调用 Claude API: {}", apiUrl);
+            HttpResponse<java.util.stream.Stream<String>> response =
+                    httpClient.send(request, HttpResponse.BodyHandlers.ofLines());
+
+            if (response.statusCode() != 200) {
+                throw new ClaudeApiException("API_ERROR", "Claude API 错误: " + response.statusCode(), "");
+            }
+
+            StringBuilder full = new StringBuilder();
+            response.body().forEach(line -> {
+                if (line == null || !line.startsWith("data:")) return;
+                String data = line.substring(5).trim();
+                if (data.isEmpty() || "[DONE]".equals(data)) return;
+                try {
+                    JsonNode node = mapper.readTree(data);
+                    if ("content_block_delta".equals(node.path("type").asText())) {
+                        String text = node.path("delta").path("text").asText("");
+                        if (!text.isEmpty()) {
+                            full.append(text);
+                            onToken.accept(text);
+                        }
+                    }
+                } catch (Exception ignored) {}
+            });
+            return full.toString();
+
+        } catch (ClaudeApiException e) {
+            throw e;
+        } catch (Exception e) {
+            logger.error("Claude API 流式调用失败", e);
+            throw new ClaudeApiException("NETWORK_ERROR", "网络错误: " + e.getMessage(), "请检查网络连接和 API 地址");
+        }
+    }
+
+    /**
      * 支持 function calling 的 Claude 调用。
      * 每轮传入 messages（含历史 tool_result）和工具定义，返回结构化响应。
      *

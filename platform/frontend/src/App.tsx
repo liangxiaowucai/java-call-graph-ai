@@ -3,16 +3,16 @@ import { BrowserRouter, Routes, Route, useNavigate, useLocation } from 'react-ro
 import { Layout, Menu } from 'antd';
 import {
   DatabaseOutlined,
-  FileTextOutlined,
   ApartmentOutlined,
   RobotOutlined,
   SettingOutlined,
+  BugOutlined,
 } from '@ant-design/icons';
 import RepoManager from './pages/RepoManager';
 import CallGraph from './pages/CallGraph';
 import QAChat from './pages/QAChat';
-import ProjectOverview from './pages/ProjectOverview';
 import Settings from './pages/Settings';
+import RequestChainAnalyzer from './pages/RequestChainAnalyzer';
 import OperationLogPanel from './components/OperationLogPanel';
 import { useOperationLog, type LogEntry } from './hooks/useOperationLog';
 
@@ -20,8 +20,8 @@ const { Sider, Content } = Layout;
 
 const menuItems = [
   { key: '/repos', icon: <DatabaseOutlined />, label: '仓库管理' },
-  { key: '/overview', icon: <FileTextOutlined />, label: '项目概览' },
   { key: '/callgraph', icon: <ApartmentOutlined />, label: '调用链分析' },
+  { key: '/request-analyzer', icon: <BugOutlined />, label: '调用链追踪' },
   { key: '/qa', icon: <RobotOutlined />, label: 'AI 问答' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统配置' },
 ];
@@ -59,8 +59,8 @@ function AppLayout() {
           <Content className="site-layout-content">
             <Routes>
               <Route path="/repos" element={<RepoManager />} />
-              <Route path="/overview" element={<ProjectOverview />} />
               <Route path="/callgraph" element={<CallGraph />} />
+              <Route path="/request-analyzer" element={<RequestChainAnalyzer />} />
               <Route path="/qa" element={<QAChat />} />
               <Route path="/settings" element={<Settings />} />
               <Route path="*" element={<RepoManager />} />

@@ -8,7 +8,7 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import {
-  fetchRepos, cloneRepo, pullRepo, analyzeRepo, deleteRepo, fetchBranches, fetchBuildLogs, resetRepo,
+  fetchRepos, cloneRepo, pullRepo, analyzeRepo, deleteRepo, updateRepo, fetchBranches, fetchBuildLogs, resetRepo,
   uploadJarToRepo, uploadNewRepo, fetchRepoJars, fetchRepoConfigs, updateRepoConfig, uploadRepoConfigFile,
   fetchEmbeddingStatus, rebuildEmbeddingSSE, continueEmbeddingSSE,
   type RepoEntity, type CloneRequest, type RepoConfigItem,
@@ -48,6 +48,9 @@ export default function RepoManager() {
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
   const [branches, setBranches] = useState<string[]>([]);
   const [loadingBranches, setLoadingBranches] = useState(false);
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editingRepo, setEditingRepo] = useState<RepoEntity | null>(null);
+  const [editForm] = Form.useForm();
   const [form] = Form.useForm<CloneRequest>();
   const [logModalOpen, setLogModalOpen] = useState(false);
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -226,7 +229,7 @@ export default function RepoManager() {
     setLoadingJars(true);
     try {
       const list = await fetchRepoJars(id);
-      setJarList(list.map((name) => ({ name, source: '分析生成', size: '-' })));
+      setJarList(list);
     } catch {
       message.error('获取 jar 列表失败');
     } finally {
@@ -544,6 +547,28 @@ export default function RepoManager() {
           <Button size="small" icon={<ContainerOutlined />} onClick={() => showJars(record.id, record.name)}>jar列表</Button>
           <Button size="small" icon={<UploadOutlined />} onClick={() => { setUploadRepoId(record.id); uploadFilesRef.current = []; setUploadModalOpen(true); }}>上传jar</Button>
           <Button size="small" icon={<SettingOutlined />} onClick={() => openConfigModal(record.id, record.name)}>配置</Button>
+          <Button size="small" icon={<EditOutlined />} onClick={async () => { 
+            setEditingRepo(record); 
+            
+            // 加载包前缀配置
+            let packagePrefixValue = '';
+            try {
+              const configs = await fetchRepoConfigs(record.id);
+              const packagePrefixConfig = configs.find(c => c.configKey === 'analyze.package.prefix');
+              packagePrefixValue = packagePrefixConfig?.configValue || '';
+            } catch (err) {
+              console.error('加载包前缀配置失败:', err);
+            }
+            
+            editForm.setFieldsValue({ 
+              name: record.name || '',
+              gitUrl: record.gitUrl || '',
+              branch: record.branch || '',
+              packagePrefix: packagePrefixValue,
+              urlPathIdentifier: record.urlPathIdentifier || '' 
+            }); 
+            setEditModalOpen(true); 
+          }}>编辑</Button>
           {(record.status === 'ERROR' || busy) && (
             <Button size="small" icon={<UndoOutlined />} onClick={async () => { await resetRepo(record.id); message.success('已重置'); load(); }}>重置</Button>
           )}
@@ -641,6 +666,13 @@ export default function RepoManager() {
             tooltip="只分析这些包下的代码，跳过第三方依赖。多个用逗号分隔"
           >
             <Input placeholder="例如: com.example 或 com.example.order, com.example.payment" />
+          </Form.Item>
+          <Form.Item
+            name="urlPathIdentifier"
+            label="URL 路径标识符（可选）"
+            tooltip="智能推荐时，只有包含这些标识符的 URL 才会匹配此仓库。支持多个标识符，用逗号分隔。例如：/api/order、/user、/payment 等"
+          >
+            <Input placeholder="例如: /api/order, /api/payment, /user" />
           </Form.Item>
         </Form>
       </Modal>
@@ -784,38 +816,16 @@ export default function RepoManager() {
         footer={null}
         width={900}
       >
-        {/* 包前缀配置（醒目区域） */}
-        <div style={{ padding: '10px 12px', background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, marginBottom: 12 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>📦 分析包前缀（必填，多个用逗号分隔）</div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Input
-              placeholder="例如: com.example.order, com.example.payment"
-              value={configItems.find(c => c.configKey === 'analyze.package.prefix')?.configValue ?? ''}
-              onChange={e => {
-                setConfigItems(prev => {
-                  const idx = prev.findIndex(c => c.configKey === 'analyze.package.prefix');
-                  if (idx >= 0) {
-                    const updated = [...prev];
-                    updated[idx] = { ...updated[idx], configValue: e.target.value };
-                    return updated;
-                  }
-                  return [...prev, { id: -1, repoId: configRepoId!, configKey: 'analyze.package.prefix', configValue: e.target.value, source: 'USER', defaultValue: null }];
-                });
-              }}
-              style={{ fontFamily: 'monospace', fontSize: 12 }}
-            />
-            <Button type="primary" onClick={() => {
-              const item = configItems.find(c => c.configKey === 'analyze.package.prefix');
-              if (item && configRepoId) saveConfigValue('analyze.package.prefix', item.configValue ?? '');
-            }}>保存</Button>
-          </div>
-          <div style={{ fontSize: 11, color: '#8c8c8c', marginTop: 4 }}>
-            只分析这些包下的代码，跳过第三方依赖。每个仓库独立配置。
+        {/* 提示信息 */}
+        <div style={{ padding: '10px 12px', background: '#e6f7ff', border: '1px solid #91d5ff', borderRadius: 6, marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: '#0050b3' }}>
+            💡 <strong>提示：</strong>仓库名称、Git URL、分支、包前缀、URL 路径标识符等基础配置，请使用"<strong>编辑</strong>"按钮修改。<br/>
+            本页面用于管理 JDK 编译路径、javacg2 高级配置等其他配置项。
           </div>
         </div>
 
         {/* 编译 JDK 配置（醒目区域） */}
-        <div style={{ padding: '10px 12px', background: '#e6f4ff', border: '1px solid #91caff', borderRadius: 6, marginBottom: 12 }}>
+        <div style={{ padding: '10px 12px', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 6, marginBottom: 12 }}>
           <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>☕ 编译 JDK（选填，本仓库专用）</div>
           <div style={{ display: 'flex', gap: 8 }}>
             <Input
@@ -1056,6 +1066,83 @@ export default function RepoManager() {
           ))}
           <div ref={embeddingLogEndRef} />
         </div>
+      </Modal>
+
+      {/* 编辑仓库 Modal */}
+      <Modal
+        title={`编辑仓库 — ${editingRepo?.name}`}
+        open={editModalOpen}
+        onOk={async () => {
+          if (!editingRepo) return;
+          try {
+            const values = await editForm.validateFields();
+            await updateRepo(editingRepo.id, {
+              name: values.name || '',
+              gitUrl: values.gitUrl || '',
+              branch: values.branch || '',
+              packagePrefix: values.packagePrefix || '',
+              urlPathIdentifier: values.urlPathIdentifier || ''
+            });
+            message.success('更新成功');
+            setEditModalOpen(false);
+            load();
+          } catch (err: unknown) {
+            if (err instanceof Error) message.error(err.message);
+          }
+        }}
+        onCancel={() => setEditModalOpen(false)}
+        okText="保存"
+        cancelText="取消"
+        width={600}
+      >
+        <Form form={editForm} layout="vertical" style={{ marginTop: 16 }}>
+          <Form.Item
+            name="name"
+            label="仓库名称"
+            rules={[{ required: true, message: '请输入仓库名称' }]}
+          >
+            <Input placeholder="例如: my-project" />
+          </Form.Item>
+          
+          <Form.Item
+            name="gitUrl"
+            label="Git 仓库地址"
+            rules={[{ required: true, message: '请输入 Git 仓库地址' }]}
+          >
+            <Input placeholder="https://github.com/user/repo.git" />
+          </Form.Item>
+          
+          <Form.Item
+            name="branch"
+            label="分支"
+            rules={[{ required: true, message: '请输入分支名称' }]}
+          >
+            <Input placeholder="例如: main, master, develop" />
+          </Form.Item>
+          
+          <Form.Item
+            name="packagePrefix"
+            label="分析包前缀（必填）"
+            rules={[{ required: true, message: '请输入包前缀' }]}
+            tooltip="只分析这些包下的代码，跳过第三方依赖。多个用逗号分隔"
+          >
+            <Input placeholder="例如: com.example.order, com.mycompany" />
+          </Form.Item>
+          
+          <Form.Item
+            name="urlPathIdentifier"
+            label="URL 路径标识符（可选）"
+            tooltip="智能推荐时，只有包含这些标识符的 URL 才会匹配此仓库。多个标识符用逗号分隔。"
+          >
+            <Input placeholder="例如: /api/order, /api/payment, /user" />
+          </Form.Item>
+          
+          <div style={{ fontSize: 12, color: '#8c8c8c', marginTop: -8, padding: '8px 12px', background: '#f5f5f5', borderRadius: 4 }}>
+            💡 <strong>配置说明：</strong><br/>
+            • <strong>分析包前缀：</strong>只分析指定包下的代码，跳过第三方依赖。修改后需要重新分析仓库。<br/>
+            • <strong>URL 路径标识符：</strong>用于智能仓库推荐和前缀剥离匹配。修改后立即生效，无需重新分析。
+          </div>
+        </Form>
       </Modal>
     </div>
   );

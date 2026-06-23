@@ -32,7 +32,17 @@ public class CallGraphController {
     public ApiResponse<CallGraphEngine.CallTreeDTO> getCallTree(
             @PathVariable Long repoId,
             @RequestParam String method,
-            @RequestParam(defaultValue = "20") int maxDepth) {
+            @RequestParam(defaultValue = "3") int maxDepth) {  // 改为3，初始只加载浅层
+        
+        // 限制最大深度为5，防止性能问题（深度20会导致119秒）
+        if (maxDepth > 5) {
+            maxDepth = 5;
+        }
+        
+        if (maxDepth < 1) {
+            maxDepth = 1;
+        }
+        
         return ApiResponse.ok(callGraphEngine.expandCallTree(repoId, method, maxDepth));
     }
 
@@ -107,5 +117,27 @@ public class CallGraphController {
     @GetMapping("/doc/diagrams")
     public ApiResponse<Map<String, String>> getProductDocDiagrams(@PathVariable Long repoId, @RequestParam String method) {
         return ApiResponse.ok(docGenerator.generateProductDocDiagrams(repoId, method));
+    }
+    
+    /**
+     * 懒加载：展开指定节点的子树
+     * 用于前端点击节点时动态加载其下游调用
+     */
+    @GetMapping("/expand-node")
+    public ApiResponse<CallGraphEngine.CallTreeDTO> expandNode(
+            @PathVariable Long repoId,
+            @RequestParam String method,
+            @RequestParam(defaultValue = "2") int depth) {
+        
+        // 限制每次展开的深度
+        if (depth > 3) {
+            depth = 3;
+        }
+        
+        if (depth < 1) {
+            depth = 1;
+        }
+        
+        return ApiResponse.ok(callGraphEngine.expandCallTree(repoId, method, depth));
     }
 }

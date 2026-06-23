@@ -1,0 +1,21 @@
+{
+  "sessionId": 1234567890,
+  "userAction": "测试完整功能展示",
+  "timestamp": 1719057000000,
+  "url": "http://localhost:8080",
+  "requestChain": [
+    {
+      "timestamp": 1719057001000,
+      "seq": 1,
+      "method": "POST",
+      "url": "/api/product/list",
+      "fullUrl": "http://localhost:8080/api/product/list",
+      "requestBody": "{\"page\":1,\"size\":20}",
+      "responseStatus": 200,
+      "responseBody": "{\"code\":200,\"data\":[...]}",
+      "duration": 850,
+      "success": true
+    }
+  ],
+  "dataFlow": []
+}

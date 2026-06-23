@@ -26,11 +26,15 @@ public class ProjectInfoExtractor {
     public ProjectInfo extract(String repoPath) {
         ProjectInfo info = new ProjectInfo();
 
+        logger.debug("开始提取项目信息，路径: {}", repoPath);
+        
         // 尝试 Maven：扫描所有 pom.xml（多模块项目的实际依赖在子模块 pom 中）
         List<Path> pomFiles = findAllFiles(repoPath, "pom.xml", 3);
+        logger.debug("找到 {} 个 pom.xml 文件", pomFiles.size());
         if (!pomFiles.isEmpty()) {
             info.buildTool = "Maven";
             for (Path pomFile : pomFiles) {
+                logger.debug("解析 pom.xml: {}", pomFile);
                 parsePom(pomFile, info);
             }
         }
@@ -99,16 +103,21 @@ public class ProjectInfoExtractor {
 
     private void parsePom(Path pomFile, ProjectInfo info) {
         try {
+            logger.debug("开始解析 pom.xml: {}", pomFile);
             Document doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(pomFile.toFile());
             doc.getDocumentElement().normalize();
 
             // 先收集所有 properties（含父 pom）
             Map<String, String> properties = new LinkedHashMap<>();
             collectProperties(pomFile, properties);
+            logger.debug("收集到 {} 个 properties", properties.size());
 
             // Java 版本 - 不覆盖已有值
             String jv = properties.getOrDefault("java.version", properties.get("maven.compiler.source"));
-            if (jv != null && !jv.isBlank() && info.javaVersion == null) info.javaVersion = jv;
+            if (jv != null && !jv.isBlank() && info.javaVersion == null) {
+                info.javaVersion = jv;
+                logger.debug("Java 版本: {}", jv);
+            }
 
             // Spring Boot 版本（从 parent 或 properties）- 不覆盖已有值
             if (info.springBootVersion == null) {
@@ -118,15 +127,20 @@ public class ProjectInfoExtractor {
                     String artifactId = getChildText(parent, "artifactId");
                     if ("spring-boot-starter-parent".equals(artifactId)) {
                         info.springBootVersion = resolveProperty(getChildText(parent, "version"), properties);
+                        logger.debug("从 parent 找到 Spring Boot 版本: {}", info.springBootVersion);
                     }
                 }
                 if (info.springBootVersion == null) {
                     info.springBootVersion = properties.get("spring-boot.version");
+                    if (info.springBootVersion != null) {
+                        logger.debug("从 properties 找到 Spring Boot 版本: {}", info.springBootVersion);
+                    }
                 }
             }
 
             // 依赖：只收集 <dependencies> 下的直接依赖，跳过 <dependencyManagement> 中的版本声明
             NodeList deps = doc.getElementsByTagName("dependency");
+            int addedDeps = 0;
             for (int i = 0; i < deps.getLength(); i++) {
                 Element dep = (Element) deps.item(i);
                 // 检查祖先节点中是否存在 dependencyManagement，是则跳过（版本管理声明，非实际依赖）
@@ -139,8 +153,10 @@ public class ProjectInfoExtractor {
                             (groupId != null ? groupId + ":" : "") + artifactId,
                             version != null ? version : ""
                     );
+                    addedDeps++;
                 }
             }
+            logger.debug("从 {} 添加了 {} 个依赖", pomFile.getFileName(), addedDeps);
         } catch (Exception e) {
             logger.warn("解析 pom.xml 失败: {}", pomFile, e);
         }
@@ -196,11 +212,18 @@ public class ProjectInfoExtractor {
                     .filter(p -> p.getFileName().toString().equals(fileName))
                     .filter(p -> {
                         String s = p.toString();
-                        return !s.contains("/target/") && !s.contains("/node_modules/")
-                                && !s.contains("/.git/") && !s.contains("/data/");
+                        // 排除构建产物目录，但不排除仓库根路径本身
+                        // 只排除项目内的 target/、node_modules/、.git/ 目录
+                        String relativePath = Path.of(repoPath).relativize(p).toString();
+                        return !relativePath.contains("target/") 
+                                && !relativePath.contains("node_modules/")
+                                && !relativePath.contains(".git/");
                     })
                     .collect(Collectors.toList());
-        } catch (IOException e) { return List.of(); }
+        } catch (IOException e) { 
+            logger.warn("扫描文件失败: repoPath={}, fileName={}", repoPath, fileName, e);
+            return List.of(); 
+        }
     }
 
     /** 收集 properties：当前 pom + 父 pom（向上查找） */

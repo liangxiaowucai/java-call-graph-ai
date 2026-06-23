@@ -10,8 +10,12 @@ CREATE TABLE IF NOT EXISTS repositories (
     last_commit_hash VARCHAR(64),
     last_sync_time TIMESTAMP,
     status VARCHAR(20) DEFAULT 'CREATED',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    url_path_identifier VARCHAR(200)
 );
+
+-- H2 兼容的列存在性检查：用 ALTER TABLE 追加
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS url_path_identifier VARCHAR(200);
 
 -- chunks 方法分块表
 CREATE TABLE IF NOT EXISTS chunks (
@@ -37,6 +41,12 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 -- H2 兼容的列存在性检查：用 ALTER TABLE 追加（首次运行 schema.sql 会创建，后续 ddl-auto=update 补列）
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding_status VARCHAR(10) DEFAULT NULL;
+
+-- 调用链展示用的干净结构化数据（与 call_summary 搜索索引分离）
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS constants TEXT;
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS exceptions TEXT;
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS resolved_urls TEXT;
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS error_codes TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_chunks_repo_class ON chunks(repo_id, class_name);
 CREATE INDEX IF NOT EXISTS idx_chunks_repo_package ON chunks(repo_id, package_name);

@@ -12,6 +12,9 @@ import com.adrninistrator.javacg2.platform.service.BytecodeAnalyzer;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
 import com.adrninistrator.javacg2.platform.service.BuildLogService;
 import com.adrninistrator.javacg2.platform.service.EmbeddingService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.slf4j.Logger;
@@ -276,6 +279,9 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         buildLogService.append(repoId, "📝 充实搜索索引...");
         enrichCallSummary(repoId, actualOutputDir, repo.getLocalPath());
 
+        // 5.6.1 提取调用链展示用的干净结构化数据（常量/异常/解析后的URL）
+        enrichStructuredData(repoId, actualOutputDir, repo.getLocalPath());
+
         // 5.7 生成仓库画像（用于多仓库场景快速定位）
         buildLogService.append(repoId, "🏠 生成仓库画像...");
         buildRepoProfile(repoId, actualOutputDir, repo);
@@ -362,6 +368,10 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         // 充实 call_summary
         enrichCallSummary(repoId, actualOutputDir, repo.getLocalPath());
         buildLogService.append(repoId, "✅ 搜索索引已充实");
+
+        // 提取调用链展示用的干净结构化数据（常量/异常/解析后的URL）
+        enrichStructuredData(repoId, actualOutputDir, repo.getLocalPath());
+        buildLogService.append(repoId, "✅ 结构化数据已提取");
 
         // 生成仓库画像
         buildRepoProfile(repoId, actualOutputDir, repo);
@@ -947,6 +957,416 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         }
         logger.info("提取源码注释: {} 个方法有注释", commentCount);
         buildLogService.append(repoId, "提取源码注释: " + commentCount + " 个方法");
+    }
+
+    /**
+     * 提取调用链展示用的「干净结构化数据」，与 call_summary 搜索索引分离。
+     * 分别写入 chunks 表的 constants / exceptions / resolved_urls 列：
+     *  - constants:     method_call_info 中的字符串常量（type=v, java.lang.String）
+     *  - exceptions:    method_throw（抛出）+ method_catch（捕获）的异常短类名
+     *  - resolved_urls: 通过「字段作为调用参数 → @Value 注解 → 配置值」数据流解析出的外部调用 URL
+     */
+    private void enrichStructuredData(Long repoId, String outputDir, String repoPath) {
+        Map<String, ChunkEntity> chunkMap = new HashMap<>();
+        chunkRepo.findByRepoId(repoId).forEach(c -> chunkMap.put(c.getFullMethod(), c));
+
+        ObjectMapper jsonMapper = new ObjectMapper();
+        // 源码文件行缓存：类名 → 该文件所有行
+        Map<String, List<String>> srcCache = new HashMap<>();
+
+        // 每个方法的常量值（保持顺序、去重）—— 只收集静态常量/枚举引用，不再收集字面量值
+        // 字面量值（字符串"courseId is empty"、数字0等）已在「入参绑定」和「错误码」区展示，常量区只展示有名称的引用
+        Map<String, Set<String>> methodConstants = new HashMap<>();
+        // 每个方法的异常：列表，每项 [kind(throws/catch), type, lineStr]
+        Map<String, List<String[]>> methodExceptions = new HashMap<>();
+        // 每个方法的 URL：列表，每项 [url, configKey, field]
+        Map<String, List<String[]>> methodUrls = new HashMap<>();
+
+        // 1. 枚举/静态常量引用：method_call_static_field（callId|?|?|fieldClass|fieldName|fieldType|caller|returnType）
+        //    只保留首字母大写的字段名（枚举常量如 ROLE_TYPE_STUDENT / 静态常量如 APPLICATION_JSON），
+        //    过滤 log/logger/httpClient 等小写实例字段噪音
+        for (String line : readTsvFile(outputDir, "method_call_static_field")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 7) continue;
+            String fieldClass = cols[3];
+            String fieldName = cols[4];
+            String caller = cols[6];
+            if (fieldName == null || fieldName.isBlank()) continue;
+            if (!Character.isUpperCase(fieldName.charAt(0))) continue;   // 仅枚举/静态常量
+            // 过滤日志相关（log/LOG/logger）
+            if (fieldName.equals("LOG") || fieldName.equals("LOGGER")) continue;
+            methodConstants.computeIfAbsent(caller, k -> new LinkedHashSet<>())
+                    .add(shortName(fieldClass) + "." + fieldName);
+        }
+
+        // 2. 抛出的异常：method_throw（[3]throw行号 [5]异常类型）
+        for (String line : readTsvFile(outputDir, "method_throw")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 6) continue;
+            String caller = cols[0];
+            String exType = cols[5];
+            if (exType == null || exType.isBlank()) continue;
+            methodExceptions.computeIfAbsent(caller, k -> new ArrayList<>())
+                    .add(new String[]{"throws", shortName(exType), cols[3]});
+        }
+
+        // 3. 捕获的异常：method_catch（[2]异常类型 [3]标志 [10]catch行号）
+        for (String line : readTsvFile(outputDir, "method_catch")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 11) continue;
+            String caller = cols[0];
+            String exType = cols[2];
+            String flag = cols[3];
+            if (flag != null && !flag.isBlank()) continue;   // 跳过编译器生成的 switch/try-with-resource
+            if (exType == null || exType.isBlank()) continue;
+            methodExceptions.computeIfAbsent(caller, k -> new ArrayList<>())
+                    .add(new String[]{"catch", shortName(exType), cols[10]});
+        }
+
+        // 4. URL 数据流解析：field_annotation(@Value) + method_call_non_static_field(字段作为参数) + 配置值
+        Map<String, String> fieldValueKey = new HashMap<>();   // "className#fieldName" → 配置key
+        for (String line : readTsvFile(outputDir, "field_annotation")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 5) continue;
+            String className = cols[0];
+            String fieldName = cols[1];
+            String annotationClass = cols[2];
+            String attrValue = cols[4];
+            if (annotationClass == null || !annotationClass.contains("Value")) continue;
+            if (attrValue == null) continue;
+            String key = extractPlaceholderKey(attrValue);
+            if (key != null) fieldValueKey.put(className + "#" + fieldName, key);
+        }
+        if (!fieldValueKey.isEmpty()) {
+            Set<String> urlDedup = new HashSet<>();
+            for (String line : readTsvFile(outputDir, "method_call_non_static_field")) {
+                String[] cols = line.split("\t");
+                if (cols.length < 7) continue;
+                String fieldName = cols[4];
+                String caller = cols[6];
+                if (fieldName == null || fieldName.isBlank()) continue;
+                String callerClass = caller.contains(":") ? caller.substring(0, caller.lastIndexOf(':')) : caller;
+                String cfgKey = fieldValueKey.get(callerClass + "#" + fieldName);
+                if (cfgKey != null && urlDedup.add(caller + "#" + cfgKey)) {
+                    String resolved = configExtractor.getEffectiveValue(repoId, cfgKey, null);
+                    String url = (resolved != null && !resolved.isBlank()) ? resolved : "(未配置)";
+                    methodUrls.computeIfAbsent(caller, k -> new ArrayList<>())
+                            .add(new String[]{url, cfgKey, fieldName});
+                }
+            }
+        }
+        // 4c. 硬编码 URL 常量
+        for (Map.Entry<String, Set<String>> e : methodConstants.entrySet()) {
+            for (String c : e.getValue()) {
+                if (c.startsWith("http://") || c.startsWith("https://")) {
+                    methodUrls.computeIfAbsent(e.getKey(), k -> new ArrayList<>())
+                            .add(new String[]{c, null, null});
+                }
+            }
+        }
+
+        // 4d. 解析枚举常量的构造参数值（enum_init_assign_info）：用于把 XxxEnum.CONST 还原成 code + msg
+        //     格式: enumClass:constructor | constName | ordinal | argSeq | valueType | arrayDim | value
+        Map<String, java.util.TreeMap<Integer, String>> enumArgs = new HashMap<>();
+        for (String line : readTsvFile(outputDir, "enum_init_assign_info")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 7) continue;
+            String enumClass = cols[0].contains(":") ? cols[0].substring(0, cols[0].indexOf(':')) : cols[0];
+            String key = shortName(enumClass) + "." + cols[1];
+            Integer argSeq = parseIntSafe(cols[3]);
+            if (argSeq == null) continue;
+            enumArgs.computeIfAbsent(key, k -> new java.util.TreeMap<>()).put(argSeq, cols[6]);
+        }
+
+        // 5. 写入 chunks 表（带源码引用的 JSON）
+        List<ChunkEntity> batch = new ArrayList<>();
+        Set<String> allMethods = new HashSet<>();
+        allMethods.addAll(methodConstants.keySet());
+        allMethods.addAll(methodExceptions.keySet());
+        allMethods.addAll(methodUrls.keySet());
+
+        for (String method : allMethods) {
+            ChunkEntity chunk = chunkMap.get(method);
+            if (chunk == null) continue;
+            String shortClass = chunk.getClassName() != null ? shortName(chunk.getClassName()) + ".java" : null;
+
+            // 常量 JSON：[{value, resolvedValue, line, code, file}] —— 只有静态常量/枚举引用（带解析后的实际值）
+            Set<String> consts = methodConstants.get(method);
+            if (consts != null && !consts.isEmpty()) {
+                ArrayNode arr = jsonMapper.createArrayNode();
+                int n = 0;
+                for (String v : consts) {
+                    if (n >= 30) break;
+                    ObjectNode o = jsonMapper.createObjectNode();
+                    o.put("value", v);
+                    // 解析枚举实际值（如 CommonApiCodeEnum.PARAM_CHECK_ERROR → 40001, 参数校验失败）
+                    java.util.TreeMap<Integer, String> eArgs = enumArgs.get(v);
+                    if (eArgs != null && !eArgs.isEmpty()) {
+                        StringBuilder resolved = new StringBuilder();
+                        for (String ev : eArgs.values()) {
+                            if (resolved.length() > 0) resolved.append(", ");
+                            resolved.append(ev);
+                        }
+                        o.put("resolvedValue", resolved.toString());
+                    }
+                    int[] cite = findConstantCitation(repoPath, method, chunk.getStartLine(), chunk.getEndLine(), v, srcCache);
+                    if (cite != null) {
+                        o.put("line", cite[0]);
+                        o.put("code", srcLine(srcCache, method, repoPath, cite[0]));
+                    }
+                    if (shortClass != null) o.put("file", shortClass);
+                    arr.add(o);
+                    n++;
+                }
+                chunk.setConstants(arr.size() > 0 ? arr.toString() : null);
+            } else {
+                chunk.setConstants(null);
+            }
+
+            // 异常 JSON：[{kind, type, line, code}]
+            List<String[]> excs = methodExceptions.get(method);
+            if (excs != null && !excs.isEmpty()) {
+                ArrayNode arr = jsonMapper.createArrayNode();
+                Set<String> dedup = new HashSet<>();
+                int n = 0;
+                for (String[] ex : excs) {
+                    if (n++ >= 20) break;
+                    int lineNo = parseIntSafe(ex[2]) != null ? parseIntSafe(ex[2]) : 0;
+                    String dk = ex[0] + ex[1] + lineNo;
+                    if (!dedup.add(dk)) { n--; continue; }
+                    ObjectNode o = jsonMapper.createObjectNode();
+                    o.put("kind", ex[0]);
+                    o.put("type", ex[1]);
+                    if (lineNo > 0) {
+                        o.put("line", lineNo);
+                        String code = srcLine(srcCache, method, repoPath, lineNo);
+                        if (code != null) o.put("code", code);
+                    }
+                    if (shortClass != null) o.put("file", shortClass);
+                    arr.add(o);
+                }
+                chunk.setExceptions(arr.toString());
+            } else {
+                chunk.setExceptions(null);
+            }
+
+            // URL JSON：[{url, configKey, field}]
+            List<String[]> urls = methodUrls.get(method);
+            if (urls != null && !urls.isEmpty()) {
+                ArrayNode arr = jsonMapper.createArrayNode();
+                int n = 0;
+                for (String[] u : urls) {
+                    if (n++ >= 20) break;
+                    ObjectNode o = jsonMapper.createObjectNode();
+                    o.put("url", u[0]);
+                    if (u[1] != null) o.put("configKey", u[1]);
+                    if (u[2] != null) o.put("field", u[2]);
+                    arr.add(o);
+                }
+                chunk.setResolvedUrls(arr.toString());
+            } else {
+                chunk.setResolvedUrls(null);
+            }
+
+            // 业务错误码+消息 JSON：[{code, msg, line, codeText, file}]
+            List<String[]> errs = extractErrorCodes(repoPath, method, chunk.getStartLine(), chunk.getEndLine(), srcCache, enumArgs);
+            if (!errs.isEmpty()) {
+                ArrayNode arr = jsonMapper.createArrayNode();
+                int n = 0;
+                for (String[] e : errs) {
+                    if (n++ >= 30) break;
+                    ObjectNode o = jsonMapper.createObjectNode();
+                    if (e[0] != null) o.put("code", e[0]);
+                    if (e[1] != null) o.put("msg", e[1]);
+                    if (e[2] != null) o.put("line", parseIntSafe(e[2]));
+                    if (e[3] != null) o.put("codeText", e[3]);
+                    if (shortClass != null) o.put("file", shortClass);
+                    arr.add(o);
+                }
+                chunk.setErrorCodes(arr.toString());
+            } else {
+                chunk.setErrorCodes(null);
+            }
+
+            batch.add(chunk);
+            if (batch.size() >= 500) {
+                chunkRepo.saveAll(batch);
+                batch.clear();
+            }
+        }
+        if (!batch.isEmpty()) chunkRepo.saveAll(batch);
+        logger.info("提取结构化数据(带源码引用): 常量方法={}, 异常方法={}, URL方法={}",
+                methodConstants.size(), methodExceptions.size(), methodUrls.size());
+        buildLogService.append(repoId, "提取结构化数据: 常量 " + methodConstants.size()
+                + " / 异常 " + methodExceptions.size() + " / URL " + methodUrls.size() + " 个方法");
+    }
+
+    /** 读取某方法所在源码文件的全部行（缓存） */
+    private List<String> loadSourceLines(Map<String, List<String>> cache, String fullMethod, String repoPath) {
+        String className = fullMethod.lastIndexOf(':') > 0 ? fullMethod.substring(0, fullMethod.lastIndexOf(':')) : null;
+        if (className == null) return null;
+        String topLevel = className.contains("$") ? className.substring(0, className.indexOf('$')) : className;
+        if (cache.containsKey(topLevel)) return cache.get(topLevel);
+        List<String> lines = null;
+        String relativePath = topLevel.replace('.', '/') + ".java";
+        Path sourceFile = findSourceFileInRepo(Path.of(repoPath), relativePath);
+        if (sourceFile != null) {
+            try { lines = Files.readAllLines(sourceFile); } catch (IOException ignored) {}
+        }
+        cache.put(topLevel, lines);
+        return lines;
+    }
+
+    /** 取指定行的源码（去首尾空白），行号从 1 开始 */
+    private String srcLine(Map<String, List<String>> cache, String fullMethod, String repoPath, int lineNo) {
+        List<String> lines = loadSourceLines(cache, fullMethod, repoPath);
+        if (lines == null || lineNo < 1 || lineNo > lines.size()) return null;
+        return lines.get(lineNo - 1).trim();
+    }
+
+    /** 在方法源码范围内查找包含常量值的行，返回 [行号]；找不到返回 null */
+    private int[] findConstantCitation(String repoPath, String fullMethod, Integer startLine, Integer endLine,
+                                       String value, Map<String, List<String>> cache) {
+        List<String> lines = loadSourceLines(cache, fullMethod, repoPath);
+        if (lines == null) return null;
+        int from = (startLine != null && startLine > 0) ? startLine : 1;
+        int to = (endLine != null && endLine > 0 && endLine <= lines.size()) ? endLine : lines.size();
+        // 枚举/静态常量 A.B 只搜后半部分常量名；字符串字面量直接搜
+        String needle = value;
+        int dot = value.lastIndexOf('.');
+        boolean enumConst = dot > 0 && Character.isUpperCase(value.charAt(0)) && value.indexOf(' ') < 0;
+        if (enumConst) needle = value.substring(dot + 1);
+        for (int i = from - 1; i < to && i < lines.size(); i++) {
+            if (i < 0) continue;
+            if (lines.get(i).contains(needle)) return new int[]{i + 1};
+        }
+        return null;
+    }
+
+    /**
+     * 从方法源码范围内提取业务错误码+消息：识别 Result.buildResult/throw new XxxException/.error(...) 等错误返回行，
+     * 提取枚举引用（用 enumArgs 还原 code+枚举msg）与字符串字面量 msg。
+     * 返回 [code展示, msg, 行号, 源码行]
+     */
+    private List<String[]> extractErrorCodes(String repoPath, String fullMethod, Integer startLine, Integer endLine,
+                                             Map<String, List<String>> srcCache,
+                                             Map<String, java.util.TreeMap<Integer, String>> enumArgs) {
+        List<String[]> result = new ArrayList<>();
+        List<String> lines = loadSourceLines(srcCache, fullMethod, repoPath);
+        if (lines == null) return result;
+        int from = (startLine != null && startLine > 0) ? startLine : 1;
+        int to = (endLine != null && endLine > 0 && endLine <= lines.size()) ? endLine : lines.size();
+        java.util.regex.Pattern enumRe = java.util.regex.Pattern.compile("([A-Z]\\w*(?:Enum|Code|Status|Error))\\.([A-Z][A-Z0-9_]{1,})");
+        java.util.regex.Pattern strRe = java.util.regex.Pattern.compile("\"([^\"]{1,100})\"");
+        Set<String> dedup = new HashSet<>();
+        for (int i = from - 1; i < to && i < lines.size(); i++) {
+            if (i < 0) continue;
+            String line = lines.get(i);
+            boolean errLine = line.contains("throw ") || line.contains("buildResult")
+                    || line.contains(".error(") || line.contains(".fail(") || line.contains(".failed(")
+                    || line.matches(".*new\\s+\\w*(Exception|Error)\\s*\\(.*")
+                    || (line.contains("Result.") && (line.contains("Code") || line.contains("Error")));
+            if (!errLine) continue;
+
+            String codeDisplay = null, enumMsg = null;
+            java.util.regex.Matcher em = enumRe.matcher(line);
+            if (em.find()) {
+                String ref = em.group(1) + "." + em.group(2);
+                java.util.TreeMap<Integer, String> args = enumArgs.get(ref);
+                if (args != null && !args.isEmpty()) {
+                    for (String v : args.values()) {
+                        if (codeDisplay == null && v != null && v.matches("-?\\d+")) codeDisplay = v;
+                    }
+                    for (String v : args.values()) {
+                        if (v != null && !v.matches("-?\\d+") && !v.isBlank()) { enumMsg = v; break; }
+                    }
+                }
+                if (codeDisplay == null) codeDisplay = ref;
+                else codeDisplay = codeDisplay + " (" + ref + ")";
+            }
+            String litMsg = null;
+            java.util.regex.Matcher sm = strRe.matcher(line);
+            while (sm.find()) {
+                String s = sm.group(1);
+                if (!s.contains("{}") && s.length() >= 2) { litMsg = s; break; }
+            }
+            String msg = litMsg != null ? litMsg : enumMsg;
+            if (codeDisplay == null && msg == null) continue;
+            String dk = codeDisplay + "|" + msg;
+            if (!dedup.add(dk)) continue;
+            result.add(new String[]{codeDisplay, msg, String.valueOf(i + 1), line.trim()});
+        }
+        return result;
+    }
+
+    /**
+     * 判断常量是否有业务/逻辑意义（而非日志模板/格式符/框架噪音）。
+     * 保留：枚举引用(A.B)、业务参数key(驼峰/下划线单词)、URL/路径、Redis key 前缀、错误消息(含中文或 is empty 等)、超时常量(TimeUnit.X)
+     * 过滤：纯数字、单字符、纯符号、日志模板({})、call/response/request 打印文本、含换行/制表、过短
+     */
+    private boolean isBusinessConstant(String v) {
+        if (v == null) return false;
+        int len = v.length();
+        // 太短（<=2字符）或太长（>100）
+        if (len <= 2 || len > 100) return false;
+        // 纯数字
+        if (v.matches("^-?\\d+(\\.\\d+)?$")) return false;
+        // 含日志占位符 {}
+        if (v.contains("{}")) return false;
+        // 纯符号/空白
+        if (v.matches("^[\\W\\s_]+$")) return false;
+        // 日志/调试文本特征：以 "call "/"调用"/"response"/"request" 开头的描述性日志
+        String lower = v.toLowerCase();
+        if (lower.startsWith("call ") || lower.startsWith("调用") || lower.startsWith("response")
+                || lower.matches("^(debug|info|warn|error|trace)\\b.*")) return false;
+        // 枚举引用 A.B（首字母大写.全大写）→ 保留
+        if (v.matches("^[A-Z]\\w+\\.[A-Z][A-Z0-9_]+$")) return true;
+        // URL/路径
+        if (v.startsWith("http://") || v.startsWith("https://") || v.startsWith("/api/")) return true;
+        // Redis/缓存 key 前缀（含冒号分隔）
+        if (v.contains(":") && !v.contains(" ") && v.length() >= 4) return true;
+        // 业务参数 key（纯驼峰/下划线单词，无空格，>=3字符）
+        if (v.matches("^[a-zA-Z][a-zA-Z0-9_]*$") && len >= 3 && len <= 40) return true;
+        // 含中文 → 通常是业务错误消息
+        if (v.matches(".*[\\u4e00-\\u9fff].*")) return true;
+        // 含 "is empty"/"not found"/"invalid" 等错误消息关键词
+        if (lower.contains("is empty") || lower.contains("not found") || lower.contains("invalid")
+                || lower.contains("error") || lower.contains("failed")) return true;
+        // 其余：过滤
+        return false;
+    }
+
+    /** 取短类名：a.b.C → C */
+    private String shortName(String fqcn) {
+        if (fqcn == null) return "";
+        return fqcn.contains(".") ? fqcn.substring(fqcn.lastIndexOf('.') + 1) : fqcn;
+    }
+
+    /** 从 @Value 属性值中提取配置 key：${http.x.url} → http.x.url；${k:default} → k；非占位符返回 null */
+    private String extractPlaceholderKey(String attrValue) {
+        if (attrValue == null) return null;
+        int start = attrValue.indexOf("${");
+        if (start < 0) return null;
+        int end = attrValue.indexOf('}', start);
+        if (end < 0) return null;
+        String inner = attrValue.substring(start + 2, end);
+        int colon = inner.indexOf(':');
+        return colon >= 0 ? inner.substring(0, colon) : inner;
+    }
+
+    /** 将集合用换行拼接，限制条数与总长度 */
+    private String joinLimited(Set<String> values, int maxCount, int maxLen) {
+        if (values == null || values.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder();
+        int count = 0;
+        for (String v : values) {
+            if (count >= maxCount) break;
+            if (sb.length() + v.length() > maxLen) break;
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(v);
+            count++;
+        }
+        return sb.length() > 0 ? sb.toString() : null;
     }
 
     /**
@@ -2033,15 +2453,25 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
     }
 
     private void parseMethodCatch(Long repoId, String outputDir, String repoPath) {
-        // method_catch: 完整方法 | catch序号 | try起始行 | try结束行 | catch起始行 | catch异常类型 | catch标志
+        // method_catch 实际列格式（见 docs/file_format.md 1.35）:
+        // [0]完整方法 [1]返回类型 [2]catch异常类型 [3]catch标志(switch/try-with-resource)
+        // [4]try开始行 [5]try结束行 [6]try最小调用ID [7]try最大调用ID
+        // [8]catch开始偏移 [9]catch结束偏移 [10]catch开始行 [11]catch结束行 ...
         int count = 0;
         for (String line : readTsvFile(outputDir, "method_catch")) {
             String[] cols = line.split("\t");
-            if (cols.length < 6) continue;
+            if (cols.length < 11) continue;
 
             String fullMethod = cols[0];
-            int catchLine = parseIntSafe(cols[4]) != null ? parseIntSafe(cols[4]) : 0;
-            String exceptionType = cols[5];
+            String exceptionType = cols[2];
+            String catchFlag = cols[3];
+            // 跳过编译器生成的 switch / try-with-resource catch 块
+            if (catchFlag != null && !catchFlag.isBlank()) continue;
+            if (exceptionType == null || exceptionType.isBlank()) continue;
+
+            Integer tryStart = parseIntSafe(cols[4]);
+            Integer tryEnd = parseIntSafe(cols[5]);
+            int catchLine = parseIntSafe(cols[10]) != null ? parseIntSafe(cols[10]) : 0;
 
             // 读取 catch 行的源码
             String catchSource = readSourceLine(repoPath, fullMethod, catchLine);
@@ -2051,9 +2481,8 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             if (catchSource != null && !catchSource.isEmpty()) {
                 context.append("\n📝 ").append(catchSource.trim());
             }
-            // try 范围
-            if (cols.length >= 4) {
-                context.append("\n📍 try 范围: 行 ").append(cols[2]).append(" ~ ").append(cols[3]);
+            if (tryStart != null && tryEnd != null) {
+                context.append("\n📍 try 范围: 行 ").append(tryStart).append(" ~ ").append(tryEnd);
             }
 
             BoundaryEntity boundary = new BoundaryEntity();
@@ -2069,15 +2498,19 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
     }
 
     private void parseMethodThrow(Long repoId, String outputDir, String repoPath) {
-        // method_throw: 完整方法 | throw序号 | throw行号 | throw异常类型 | catch标志
+        // method_throw 实际列格式（见 docs/file_format.md 1.44）:
+        // [0]完整方法 [1]返回类型 [2]throw指令偏移量 [3]throw代码行号 [4]序号
+        // [5]throw异常类型 [6]throw标志(ce/mcr/unk) ...
         int count = 0;
         for (String line : readTsvFile(outputDir, "method_throw")) {
             String[] cols = line.split("\t");
-            if (cols.length < 4) continue;
+            if (cols.length < 6) continue;
 
             String fullMethod = cols[0];
-            int throwLine = parseIntSafe(cols[2]) != null ? parseIntSafe(cols[2]) : 0;
-            String exceptionType = cols[3];
+            int throwLine = parseIntSafe(cols[3]) != null ? parseIntSafe(cols[3]) : 0;
+            String exceptionType = cols[5];
+            // mcr(抛方法调用返回值)等情况异常类型为空，跳过
+            if (exceptionType == null || exceptionType.isBlank()) continue;
 
             // 从源码读取 throw 那一行的完整内容
             String throwDetail = readSourceLine(repoPath, fullMethod, throwLine);

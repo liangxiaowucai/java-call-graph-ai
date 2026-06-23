@@ -12,4 +12,6 @@ public record ApiResponse<T>(
     public static <T> ApiResponse<T> error(String errorType, String message, String suggestion) {
         return new ApiResponse<>(false, null, new ErrorResponse(errorType, message, suggestion));
     }
+
+    public record ErrorResponse(String errorType, String message, String suggestion) {}
 }

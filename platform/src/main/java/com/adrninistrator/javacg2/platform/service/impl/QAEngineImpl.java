@@ -935,7 +935,7 @@ public class QAEngineImpl {
                                                    java.util.function.Consumer<ToolCallStep> stepCallback) {
         // 安全阀：最多访问 50 个不同方法节点，防止超大项目无限展开
         final int MAX_NODES = 50;
-        final int MAX_ROUNDS = 15; // 最大轮数限制，防止低效循环
+        final int MAX_ROUNDS = 25; // 最大轮数限制，新增工具后需要更多轮次收集完整业务信息
         Set<String> visitedMethods = new HashSet<>();
         List<String> references = new ArrayList<>();
         List<ToolCallStep> steps = new ArrayList<>();
@@ -963,7 +963,14 @@ public class QAEngineImpl {
                 + "2. 工具返回 SOURCE_NOT_FOUND 时，只能说\"源码中未找到 XXX 的实现\"\n"
                 + "3. 工具返回 NO_CALLEES/NO_CALLERS 时，如实说明\n"
                 + "4. 禁止对未读取源码的方法做任何推断\n"
-                + "5. 如果分析到安全阀上限仍未找到根因，列出\"已分析方法\"和\"缺少的信息\"\n";
+                + "5. 如果分析到安全阀上限仍未找到根因，列出\"已分析方法\"和\"缺少的信息\"\n"
+                + "\n## 工具调用策略（必须遵循）\n"
+                + "1. **先全面收集，再输出结论**：每个入口接口必须依次调用 getCallees → getMethodSource（实现类）→ getExceptions → getConstants → getBoundaries\n"
+                + "2. **多态分派**：遇到接口/抽象方法时，先调 getImplementations 找到实现类，再读实现类源码\n"
+                + "3. **入参分析**：入口方法必须调 getParamClassDef 获取字段定义和校验注解\n"
+                + "4. **聚焦业务逻辑**：优先分析 if/switch 分支、数据转换、外部调用、异常抛出等关键代码\n"
+                + "5. **忽略样板代码**：跳过 getter/setter、日志打印、toString 等无业务含义的代码\n"
+                + "6. **结构化输出**：用表格展示字段、用代码块展示关键逻辑、用列表展示调用链\n";
 
         // 构建初始入参：接口摘要列表
         StringBuilder initialContext = new StringBuilder();
@@ -1219,7 +1226,7 @@ public class QAEngineImpl {
 
             // 加载调用链上每个方法的完整源码
             try {
-                var tree = callGraphEngine.expandCallTree(repoId, method, 10);
+                var tree = callGraphEngine.expandCallTree(repoId, method, Integer.MAX_VALUE, true);
                 if (tree.root() != null) {
                     List<String> chainMethods = new ArrayList<>();
                     collectMethods(tree.root(), chainMethods, new HashSet<>());
@@ -1411,7 +1418,7 @@ public class QAEngineImpl {
     // ========== 预设报告生成 ==========
 
     private String generateRiskReport(Long repoId, String fullMethod) {
-        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, 15);
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, Integer.MAX_VALUE, true);
         List<String> methods = new ArrayList<>();
         collectMethods(tree.root(), methods, new HashSet<>());
 
@@ -1436,7 +1443,7 @@ public class QAEngineImpl {
     }
 
     private String generateDbReport(Long repoId, String fullMethod) {
-        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, 15);
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, Integer.MAX_VALUE, true);
         List<String> methods = new ArrayList<>();
         collectMethods(tree.root(), methods, new HashSet<>());
 
@@ -1459,7 +1466,7 @@ public class QAEngineImpl {
     }
 
     private String generateExternalReport(Long repoId, String fullMethod) {
-        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, 15);
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, Integer.MAX_VALUE, true);
         List<String> methods = new ArrayList<>();
         collectMethods(tree.root(), methods, new HashSet<>());
 

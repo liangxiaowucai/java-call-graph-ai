@@ -16,11 +16,15 @@ prompt/
 # 运行时数据
 platform/data/
 data/
+platform/.jqwik-database
 
 # AI 工具内部配置
 .harness/
 .claude/
 .kiro/
+
+# Chrome 插件私钥
+*.pem
 
 # 前端依赖
 node_modules/

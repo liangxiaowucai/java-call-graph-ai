@@ -10,6 +10,9 @@ public interface CallGraphEngine {
     /** 从入口点展开调用树 */
     CallTreeDTO expandCallTree(Long repoId, String entryMethod, int maxDepth);
 
+    /** 从入口点展开调用树；fullExpand=true 时全展开（禁用懒加载、放大节点上限），用于分析/报告场景 */
+    CallTreeDTO expandCallTree(Long repoId, String entryMethod, int maxDepth, boolean fullExpand);
+
     /** 获取方法的上游调用方 */
     List<CallerDTO> getCallers(Long repoId, String fullMethod, int depth);
 
@@ -61,7 +64,10 @@ public interface CallGraphEngine {
                             String callType, Integer lineNumber,
                             List<BoundaryDTO> boundaries,
                             List<CallTreeNodeDTO> children,
-                            boolean isRecursive, boolean isLazyLoad, boolean ambiguous) {}
+                            boolean isRecursive, boolean isLazyLoad, boolean ambiguous,
+                            String constants,  // 新增：方法中使用的常量（来自 callSummary）
+                            String exceptions  // 新增：方法可能抛出的异常
+                            ) {}
 
     record BoundaryDTO(String boundaryType, Integer lineNumber, String context) {}
 

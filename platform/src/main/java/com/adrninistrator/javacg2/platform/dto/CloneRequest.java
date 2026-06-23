@@ -5,5 +5,6 @@ public record CloneRequest(
     String token,
     String repoType,
     String branch,
-    String packagePrefix
+    String packagePrefix,
+    String urlPathIdentifier
 ) {}

@@ -24,6 +24,7 @@ export interface RepoEntity {
   lastSyncTime: string | null;
   status: string;
   createdAt: string;
+  urlPathIdentifier?: string | null;
 }
 
 export interface CloneRequest {
@@ -32,6 +33,7 @@ export interface CloneRequest {
   repoType: string;
   branch: string;
   packagePrefix?: string;
+  urlPathIdentifier?: string;
 }
 
 export interface EntryPoint {
@@ -124,6 +126,12 @@ export async function deleteRepo(id: number): Promise<void> {
   if (!res.data.success) throw new Error(res.data.error?.message ?? '删除失败');
 }
 
+export async function updateRepo(id: number, updates: Record<string, string>): Promise<RepoEntity> {
+  const res = await api.patch<ApiResponse<RepoEntity>>(`/repos/${id}`, updates);
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '更新失败');
+  return res.data.data;
+}
+
 export async function resetRepo(id: number): Promise<void> {
   const res = await api.post<ApiResponse<string>>(`/repos/${id}/reset`);
   if (!res.data.success) throw new Error(res.data.error?.message ?? '重置失败');
@@ -155,12 +163,39 @@ export async function fetchEntryPoints(repoId: number): Promise<EntryPoint[]> {
   return res.data.data;
 }
 
-export async function fetchCallTree(repoId: number, method: string, maxDepth = 20): Promise<CallTree> {
+export async function fetchCallTree(repoId: number, method: string, maxDepth = 3): Promise<CallTree> {
   const res = await api.get<ApiResponse<CallTree>>(`/repos/${repoId}/call-tree`, {
     params: { method, maxDepth },
   });
   if (!res.data.success) throw new Error(res.data.error?.message ?? '获取调用树失败');
   return res.data.data;
+}
+
+/**
+ * 懒加载：展开指定节点的子树
+ * @param repoId 仓库ID
+ * @param method 方法全名
+ * @param depth 展开深度，默认2层
+ */
+export async function expandCallTreeNode(repoId: number, method: string, depth = 2): Promise<CallTree> {
+  const res = await api.get<ApiResponse<CallTree>>(`/repos/${repoId}/expand-node`, {
+    params: { method, depth },
+  });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '展开节点失败');
+  return res.data.data;
+}
+
+/**
+ * 增强版请求链分析 - 整合时序图 + 调用树（懒加载）
+ * 专为 Chrome 插件优化
+ */
+export async function analyzeWithCallGraph(requestChain: any): Promise<any> {
+  const res = await api.post<any>('/debug/analyze-with-callgraph', requestChain, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return res.data;
 }
 
 export async function fetchCallers(repoId: number, method: string, depth = 5): Promise<CallerInfo[]> {
@@ -271,8 +306,8 @@ export async function saveAnalyzeConfig(config: AnalyzeConfig): Promise<void> {
   if (!res.data.success) throw new Error(res.data.error?.message ?? '保存失败');
 }
 
-export async function fetchRepoJars(id: number): Promise<string[]> {
-  const res = await api.get<ApiResponse<string[]>>(`/repos/${id}/jars`);
+export async function fetchRepoJars(id: number): Promise<Array<{name: string; source: string; size: string}>> {
+  const res = await api.get<ApiResponse<Array<{name: string; source: string; size: string}>>>(`/repos/${id}/jars`);
   return res.data.data ?? [];
 }
 
@@ -674,11 +709,6 @@ export async function fetchQAStatus(): Promise<{ configured: boolean }> {
 
 export async function searchQAEndpoints(repoId: number, keyword: string): Promise<EndpointSearchResult[]> {
   const res = await api.get<ApiResponse<EndpointSearchResult[]>>('/qa/search', { params: { repoId, keyword } });
-  return res.data.data;
-}
-
-export async function fetchPresetAnswer(repoId: number, method: string, type: string): Promise<string> {
-  const res = await api.get<ApiResponse<string>>('/qa/preset', { params: { repoId, method, type } });
   return res.data.data;
 }
 

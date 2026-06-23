@@ -19,6 +19,8 @@ public class CallGraphEngineImpl implements CallGraphEngine {
     private static final int DEFAULT_MAX_DEPTH = 10;
     private static final int LAZY_LOAD_DEFAULT_DEPTH = 3;
     private static final int MAX_TOTAL_NODES = 500;
+    // 分析场景（请求链/报告/MCP）全展开时的节点上限，远大于展示场景，确保异步/深层调用不被截断
+    private static final int FULL_EXPAND_MAX_NODES = 8000;
 
     // 源码未找到的类名去重缓存（避免同一类名重复打印 DEBUG 日志）
     private final Set<String> sourceNotFoundClasses = Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
@@ -28,6 +30,8 @@ public class CallGraphEngineImpl implements CallGraphEngine {
     private static final Path SOURCE_NOT_FOUND = Path.of("__JCG_SOURCE_NOT_FOUND__");
     // 枚举常量值缓存：repoPath|EnumClass.CONSTANT -> 值（缺失用空串标记）
     private final Map<String, String> enumValueCache = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final com.fasterxml.jackson.databind.ObjectMapper jsonMapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
     private final ApiEndpointRepo apiEndpointRepo;
     private final CallGraphRepo callGraphRepo;
@@ -60,7 +64,15 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
     @Override
     public CallTreeDTO expandCallTree(Long repoId, String entryMethod, int maxDepth) {
-        if (maxDepth <= 0) maxDepth = DEFAULT_MAX_DEPTH;
+        // 默认全展开：不再懒加载，所有调用链一次性展开到底
+        return expandCallTree(repoId, entryMethod, maxDepth, true);
+    }
+
+    @Override
+    public CallTreeDTO expandCallTree(Long repoId, String entryMethod, int maxDepth, boolean fullExpand) {
+        // 全展开模式忽略深度限制，确保异步/深层/lambda 调用完整展开
+        if (fullExpand) maxDepth = Integer.MAX_VALUE;
+        else if (maxDepth <= 0) maxDepth = DEFAULT_MAX_DEPTH;
 
         // 从仓库级配置读包前缀（支持多个，逗号分隔）
         String packagePrefixRaw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
@@ -81,67 +93,48 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         int[] nodeCount = {0};
         boolean[] hasCycle = {false};
 
-        // 预先收集所有可能的歧义方法签名（这样在构建树时可以标记节点）
+        // 预先收集仓库信息（用于生成详细的歧义警告）
         Map<Long, String> repoNames = new HashMap<>();
         repositoryRepo.findAll().forEach(r -> repoNames.put(r.getId(), r.getName()));
-        
-        // 先做一次快速扫描，找出当前仓库中哪些方法在其他仓库也有定义
-        Set<String> ambiguousMethods = new HashSet<>();
-        // 只检查入口方法周边的方法，避免全量扫描
-        collectPotentialAmbiguousMethods(repoId, entryMethod, ambiguousMethods, new HashSet<>(), 0, maxDepth);
-        
-        // 逐层按需查询，不全量加载
-        CallTreeNodeDTO root = buildNodeLazy(repoId, entryMethod, packagePrefixes,
-                visited, expanded, 0, maxDepth, nodeCount, hasCycle, ambiguousMethods);
 
-        // 收集详细的歧义告警信息（用于顶部统计显示）
+        // ── 性能优化：全展开模式下批量预加载整个仓库数据到内存 ──
+        // 将 N×3 次逐节点 DB 查询优化为 3 次全量查询 + 内存 HashMap 查找
+        RepoDataCache cache = null;
+        if (fullExpand) {
+            long t0 = System.currentTimeMillis();
+            cache = new RepoDataCache(repoId);
+            logger.info("[调用树] 批量预加载仓库数据 repoId={}, 耗时={}ms, 调用边={}, 边界={}, chunk={}",
+                    repoId, System.currentTimeMillis() - t0,
+                    cache.callGraphMap.values().stream().mapToInt(List::size).sum(),
+                    cache.boundaryMap.values().stream().mapToInt(List::size).sum(),
+                    cache.chunkMap.size());
+        }
+
+        // 先构建调用树（ambiguous 字段初始为 false）
+        CallTreeNodeDTO root = buildNodeLazy(repoId, entryMethod, packagePrefixes,
+                visited, expanded, 0, maxDepth, nodeCount, hasCycle, fullExpand, cache);
+
+        // 构建完成后，收集歧义信息
         Map<String, AmbiguityWarning> ambiguities = new LinkedHashMap<>();
-        collectAmbiguitiesFromTree(root, repoNames, ambiguities);
+        collectAmbiguities(root, repoNames, ambiguities);
+        
         List<AmbiguityWarning> warnings = new ArrayList<>(ambiguities.values());
         
         if (!warnings.isEmpty()) {
             logger.info("[调用树] method={} 节点={} 歧义={}", entryMethod, nodeCount[0], warnings.size());
+            // 标记歧义节点（返回新的树结构）
+            Set<String> ambiguousMethods = ambiguities.keySet();
+            root = markAmbiguousNodes(root, ambiguousMethods);
         }
 
         return new CallTreeDTO(root, nodeCount[0], maxDepth, hasCycle[0], warnings);
     }
     
     /**
-     * 快速扫描收集可能的歧义方法（浅层扫描，不递归太深）
+     * 收集歧义方法（遍历整棵树，检测所有方法）
      */
-    private void collectPotentialAmbiguousMethods(Long repoId, String method, 
-                                                   Set<String> ambiguousMethods, 
-                                                   Set<String> visited, int depth, int maxDepth) {
-        if (depth > 3 || visited.contains(method)) return; // 只扫描3层深度
-        visited.add(method);
-        
-        // 检查这个方法是否在其他仓库也有定义
-        List<ChunkEntity> allDefs = chunkRepo.findByFullMethod(method);
-        if (allDefs.size() > 1) {
-            // 检查是否跨仓库
-            Set<Long> repos = allDefs.stream().map(ChunkEntity::getRepoId).collect(Collectors.toSet());
-            if (repos.size() > 1) {
-                ambiguousMethods.add(method);
-            }
-        }
-        
-        // 递归扫描直接调用的方法
-        if (depth < 3) {
-            List<CallGraphEntity> callees = callGraphRepo.findByRepoIdAndCallerMethod(repoId, method);
-            for (CallGraphEntity callee : callees) {
-                if (callee.getEnabled() != null && callee.getEnabled()) {
-                    collectPotentialAmbiguousMethods(repoId, callee.getCalleeMethod(), 
-                                                     ambiguousMethods, visited, depth + 1, maxDepth);
-                }
-            }
-        }
-    }
-    
-    /**
-     * 从调用树中收集所有可能的歧义方法（用于生成详细的警告信息）
-     */
-    private void collectAmbiguitiesFromTree(CallTreeNodeDTO node, Map<Long, String> repoNames, 
-                                            Map<String, AmbiguityWarning> ambiguities) {
+    private void collectAmbiguities(CallTreeNodeDTO node, Map<Long, String> repoNames, 
+                                    Map<String, AmbiguityWarning> ambiguities) {
         if (node == null) return;
         
         // 检查当前节点是否有歧义
@@ -150,9 +143,40 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         // 递归检查子节点
         if (node.children() != null) {
             for (CallTreeNodeDTO child : node.children()) {
-                collectAmbiguitiesFromTree(child, repoNames, ambiguities);
+                collectAmbiguities(child, repoNames, ambiguities);
             }
         }
+    }
+    
+    /**
+     * 标记歧义节点（因为 Record 不可变，需要创建新的 DTO 实例）
+     */
+    private CallTreeNodeDTO markAmbiguousNodes(CallTreeNodeDTO node, Set<String> ambiguousMethods) {
+        if (node == null) return null;
+        
+        boolean isAmbiguous = ambiguousMethods.contains(node.fullMethod());
+        
+        // 递归标记子节点
+        List<CallTreeNodeDTO> markedChildren = null;
+        if (node.children() != null && !node.children().isEmpty()) {
+            markedChildren = node.children().stream()
+                    .map(child -> markAmbiguousNodes(child, ambiguousMethods))
+                    .collect(Collectors.toList());
+        } else {
+            markedChildren = node.children();
+        }
+        
+        // 如果当前节点是歧义的，或者子节点被修改了，创建新的 DTO
+        if (isAmbiguous || markedChildren != node.children()) {
+            return new CallTreeNodeDTO(
+                    node.fullMethod(), node.className(), node.methodName(),
+                    node.callType(), node.lineNumber(),
+                    node.boundaries(), markedChildren,
+                    node.isRecursive(), node.isLazyLoad(), isAmbiguous,
+                    node.constants(), node.exceptions());
+        }
+        
+        return node;
     }
 
     /**
@@ -163,44 +187,51 @@ public class CallGraphEngineImpl implements CallGraphEngine {
      */
     private CallTreeNodeDTO buildNodeLazy(Long repoId, String fullMethod, List<String> packagePrefixes,
                                            Set<String> visited, Set<String> expanded, int depth, int maxDepth,
-                                           int[] nodeCount, boolean[] hasCycle, Set<String> ambiguousMethods) {
+                                           int[] nodeCount, boolean[] hasCycle, boolean fullExpand,
+                                           RepoDataCache cache) {
         nodeCount[0]++;
-        
-        // 检查当前方法是否是歧义方法
-        boolean isAmbiguous = ambiguousMethods.contains(fullMethod);
+        int maxNodes = fullExpand ? FULL_EXPAND_MAX_NODES : MAX_TOTAL_NODES;
 
         // 递归检测（当前路径上已出现 → 成环）
         if (visited.contains(fullMethod)) {
             hasCycle[0] = true;
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    List.of(), List.of(), true, false, isAmbiguous);
+                    List.of(), List.of(), true, false, false, null, null);
         }
 
         // 深度限制 或 节点总数超限 → 标记懒加载
-        if (depth >= maxDepth || nodeCount[0] > MAX_TOTAL_NODES) {
+        if (depth >= maxDepth || nodeCount[0] > maxNodes) {
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    List.of(), List.of(), false, true, isAmbiguous);
+                    List.of(), List.of(), false, true, false, null, null);
         }
 
         // 已在别处完整展开过（菱形汇聚点）→ 折叠为懒加载，不重复展开
         if (expanded.contains(fullMethod)) {
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    List.of(), List.of(), false, true, isAmbiguous);
+                    List.of(), List.of(), false, true, false, null, null);
         }
 
         visited.add(fullMethod);
 
-        // 按需查询：只查当前方法的直接调用
-        List<CallGraphEntity> callees = callGraphRepo.findByRepoIdAndCallerMethod(repoId, fullMethod)
+        // 查询当前方法的直接调用（优先使用缓存）
+        List<CallGraphEntity> callees = (cache != null
+                ? cache.getCallees(fullMethod)
+                : callGraphRepo.findByRepoIdAndCallerMethod(repoId, fullMethod))
                 .stream()
                 .filter(c -> c.getEnabled() != null && c.getEnabled())
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
                 .filter(c -> !isBoilerplate(c.getCalleeMethod()))
                 .filter(c -> packagePrefixes.isEmpty() || packagePrefixes.stream().anyMatch(p -> c.getCalleeMethod().startsWith(p)))
                 .collect(Collectors.toList());
+        
+        // 调试日志
+        if (fullMethod.contains("queryClassProgressInfo")) {
+            logger.info("[调用树构建] {} 的子调用数: {}", fullMethod, callees.size());
+            callees.forEach(c -> logger.info("  - {} ({})", c.getCalleeMethod(), c.getCallType()));
+        }
 
         // 接口/抽象方法桥接：自身无下游调用边时，接到实现类的同签名方法继续展开
         List<String> implTargets = callees.isEmpty()
@@ -209,57 +240,106 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                     .collect(Collectors.toList())
                 : List.of();
 
-        // 获取边界点
-        List<BoundaryDTO> boundaries = boundaryRepo.findByRepoIdAndFullMethod(repoId, fullMethod)
+        // 获取边界点 —— 只保留真正的外部 I/O 边界（HTTP/RPC/DB/CACHE/MQ）。
+        // EXCEPTION 由干净的 exceptions 字段展示；SERIALIZATION/TRANSACTION 不属于外部调用，避免污染计数与 AI 判断。
+        Set<String> ioBoundaryTypes = Set.of("HTTP", "RPC", "GRPC", "DB", "CACHE", "REDIS", "MQ");
+        List<BoundaryDTO> boundaries = new ArrayList<>((cache != null
+                ? cache.getBoundaries(fullMethod)
+                : boundaryRepo.findByRepoIdAndFullMethod(repoId, fullMethod))
                 .stream()
+                .filter(b -> b.getBoundaryType() != null && ioBoundaryTypes.contains(b.getBoundaryType()))
                 .map(b -> new BoundaryDTO(b.getBoundaryType(), b.getLineNumber(), b.getContext()))
-                .collect(Collectors.toList());
+                .collect(Collectors.toList()));
 
-        // 超过懒加载深度 → 只返回当前节点，子节点标记懒加载
-        if (depth >= LAZY_LOAD_DEFAULT_DEPTH && nodeCount[0] > LAZY_LOAD_DEFAULT_DEPTH * 10) {
+        // 获取干净的结构化数据（常量/异常/解析后的URL）—— 来自 chunks 表的专用列，而非污染的 call_summary 搜索索引
+        String constants = null;
+        String exceptions = null;
+        try {
+            ChunkEntity chunk = (cache != null
+                    ? cache.getChunk(fullMethod)
+                    : chunkRepo.findByRepoIdAndFullMethod(repoId, fullMethod).stream().findFirst().orElse(null));
+            if (chunk != null) {
+                constants = chunk.getConstants();   // 干净的字符串常量（换行分隔）
+                exceptions = chunk.getErrorCodes();  // 异常区改为展示业务错误码+消息（code+msg）
+
+                // 解析出的外部调用 URL（JSON: [{url,configKey,field}]）→ 合成 HTTP 边界
+                String resolvedUrls = chunk.getResolvedUrls();
+                if (resolvedUrls != null && !resolvedUrls.isBlank()) {
+                    Set<String> existingHttpCtx = boundaries.stream()
+                            .filter(b -> "HTTP".equals(b.boundaryType()) && b.context() != null)
+                            .map(BoundaryDTO::context)
+                            .collect(Collectors.toSet());
+                    try {
+                        com.fasterxml.jackson.databind.JsonNode arr = jsonMapper.readTree(resolvedUrls);
+                        if (arr.isArray()) {
+                            for (com.fasterxml.jackson.databind.JsonNode u : arr) {
+                                String url = u.path("url").asText("");
+                                if (url.isBlank()) continue;
+                                String cfgKey = u.path("configKey").asText(null);
+                                String ctx = "📌 URL: " + url + (cfgKey != null ? "  (${" + cfgKey + "})" : "");
+                                if (existingHttpCtx.stream().noneMatch(c -> c.contains(url))) {
+                                    boundaries.add(new BoundaryDTO("HTTP", null, ctx));
+                                }
+                            }
+                        }
+                    } catch (Exception ex) {
+                        logger.debug("[URL解析] JSON 解析失败: {}", fullMethod);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.debug("[结构化数据加载] 失败: {}", fullMethod);
+        }
+        
+        // 调试日志
+        if (!boundaries.isEmpty()) {
+            logger.debug("[边界加载] {} 有 {} 个边界: {}", fullMethod, boundaries.size(), 
+                boundaries.stream().map(BoundaryDTO::boundaryType).collect(Collectors.joining(", ")));
+        }
+
+        // 超过懒加载深度 → 只返回当前节点，子节点标记懒加载（全展开模式下禁用，确保深层/异步调用完整）
+        if (!fullExpand && depth >= LAZY_LOAD_DEFAULT_DEPTH && nodeCount[0] > LAZY_LOAD_DEFAULT_DEPTH * 10) {
             List<CallTreeNodeDTO> lazyChildren = new ArrayList<>(callees.stream()
-                    .map(c -> {
-                        boolean childAmbiguous = ambiguousMethods.contains(c.getCalleeMethod());
-                        return new CallTreeNodeDTO(c.getCalleeMethod(), extractClassName(c.getCalleeMethod()),
+                    .map(c -> new CallTreeNodeDTO(c.getCalleeMethod(), extractClassName(c.getCalleeMethod()),
                                 extractMethodName(c.getCalleeMethod()), c.getCallType(), c.getLineNumber(),
-                                List.of(), List.of(), false, true, childAmbiguous);
-                    })
+                                List.of(), List.of(), false, true, false, null, null))
                     .collect(Collectors.toList()));
             for (String impl : implTargets) {
-                boolean implAmbiguous = ambiguousMethods.contains(impl);
                 lazyChildren.add(new CallTreeNodeDTO(impl, extractClassName(impl), extractMethodName(impl),
-                        "IMPL", null, List.of(), List.of(), false, true, implAmbiguous));
+                        "IMPL", null, List.of(), List.of(), false, true, false, null, null));
             }
             visited.remove(fullMethod);
             expanded.add(fullMethod);
             return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                     extractMethodName(fullMethod), null, null,
-                    boundaries, lazyChildren, false, false, isAmbiguous);
+                    boundaries, lazyChildren, false, false, false, constants, exceptions);
         }
 
         // 递归展开子节点（visited 共享，进入子节点前已 add 当前节点，返回后统一 remove）
         List<CallTreeNodeDTO> children = new ArrayList<>();
         for (CallGraphEntity callee : callees) {
             CallTreeNodeDTO child = buildNodeLazy(repoId, callee.getCalleeMethod(), packagePrefixes,
-                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, ambiguousMethods);
+                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, fullExpand, cache);
             children.add(new CallTreeNodeDTO(child.fullMethod(), child.className(), child.methodName(),
                     callee.getCallType(), callee.getLineNumber(),
-                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad(), child.ambiguous()));
+                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad(), child.ambiguous(),
+                    child.constants(), child.exceptions()));
         }
         // 桥接的实现方法以合成 IMPL 边接入，递归展开其方法体
         for (String impl : implTargets) {
             CallTreeNodeDTO child = buildNodeLazy(repoId, impl, packagePrefixes,
-                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, ambiguousMethods);
+                    visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, fullExpand, cache);
             children.add(new CallTreeNodeDTO(child.fullMethod(), child.className(), child.methodName(),
                     "IMPL", null,
-                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad(), child.ambiguous()));
+                    child.boundaries(), child.children(), child.isRecursive(), child.isLazyLoad(), child.ambiguous(),
+                    child.constants(), child.exceptions()));
         }
 
         visited.remove(fullMethod);  // 离开当前路径，允许其它分支再次经过（环检测仍由 expanded 兜底防重复展开）
         expanded.add(fullMethod);
         return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                 extractMethodName(fullMethod), null, null,
-                boundaries, children, false, false, isAmbiguous);
+                boundaries, children, false, false, false, constants, exceptions);
     }
 
     /** 过滤构造方法、setter/getter 等非业务方法 */
@@ -431,7 +511,19 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                         break;
                     }
                 }
-                int end = Math.min(lines.size(), endLine);
+                // endLine 是字节码最后行号，不一定是方法体 } 行；向后扫描花括号找到真正的方法结束
+                int end = endLine;
+                int braceDepth = 0;
+                boolean entered = false;
+                for (int i = start; i < lines.size() && i < endLine + 50; i++) {
+                    String l = lines.get(i);
+                    for (char ch : l.toCharArray()) {
+                        if (ch == '{') { braceDepth++; entered = true; }
+                        else if (ch == '}') { braceDepth--; }
+                    }
+                    if (entered && braceDepth <= 0) { end = i + 1; break; }
+                }
+                end = Math.min(lines.size(), end);
                 return new SourceResult(String.join("\n", lines.subList(start, end)), start + 1, sigLine);
             }
 
@@ -1180,4 +1272,51 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
     /** 跨库 BFS 帧 */
     private record CrossRepoFrame(String method, int depth) {}
+
+    // ── 批量预加载缓存：全展开模式时一次性加载整个仓库数据到内存 ──────────────────
+
+    /**
+     * 仓库级数据缓存：将调用图、边界、chunk 数据一次性加载到内存。
+     * 将 N×3 次逐节点 DB 查询优化为 3 次全量查询 + O(1) HashMap 查找。
+     */
+    private class RepoDataCache {
+        final Map<String, List<CallGraphEntity>> callGraphMap;  // callerMethod -> callees
+        final Map<String, List<BoundaryEntity>> boundaryMap;    // fullMethod -> boundaries
+        final Map<String, ChunkEntity> chunkMap;                // fullMethod -> chunk
+
+        RepoDataCache(Long repoId) {
+            // 1. 加载全部调用边，按 callerMethod 分组
+            List<CallGraphEntity> allEdges = callGraphRepo.findByRepoId(repoId);
+            this.callGraphMap = new HashMap<>(allEdges.size());
+            for (CallGraphEntity edge : allEdges) {
+                callGraphMap.computeIfAbsent(edge.getCallerMethod(), k -> new ArrayList<>()).add(edge);
+            }
+
+            // 2. 加载全部边界，按 fullMethod 分组
+            List<BoundaryEntity> allBoundaries = boundaryRepo.findByRepoId(repoId);
+            this.boundaryMap = new HashMap<>(allBoundaries.size());
+            for (BoundaryEntity b : allBoundaries) {
+                boundaryMap.computeIfAbsent(b.getFullMethod(), k -> new ArrayList<>()).add(b);
+            }
+
+            // 3. 加载全部 chunk，按 fullMethod 索引
+            List<ChunkEntity> allChunks = chunkRepo.findByRepoId(repoId);
+            this.chunkMap = new HashMap<>(allChunks.size());
+            for (ChunkEntity c : allChunks) {
+                chunkMap.putIfAbsent(c.getFullMethod(), c);  // 同方法取第一个
+            }
+        }
+
+        List<CallGraphEntity> getCallees(String callerMethod) {
+            return callGraphMap.getOrDefault(callerMethod, List.of());
+        }
+
+        List<BoundaryEntity> getBoundaries(String fullMethod) {
+            return boundaryMap.getOrDefault(fullMethod, List.of());
+        }
+
+        ChunkEntity getChunk(String fullMethod) {
+            return chunkMap.get(fullMethod);
+        }
+    }
 }

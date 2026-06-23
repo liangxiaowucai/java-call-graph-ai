@@ -4,13 +4,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   SearchOutlined, SendOutlined, RobotOutlined, UserOutlined,
-  ThunderboltOutlined, WarningOutlined, DatabaseOutlined, ApiOutlined,
   SettingOutlined, LinkOutlined, CodeOutlined, EditOutlined,
 } from '@ant-design/icons';
 import JavaCodeViewer from '../components/JavaCodeViewer';
 import ThinkingPanel from '../components/ThinkingPanel';
 import {
-  fetchRepos, fetchQAStatus, searchQAEndpoints, fetchPresetAnswer,
+  fetchRepos, fetchQAStatus, searchQAEndpoints,
   smartAskSSE, askSSE,
   fetchCallTree, fetchMethodSourceDetail,
   type RepoEntity, type EndpointSearchResult, type MatchedEndpoint,
@@ -55,7 +54,6 @@ export default function QAChat() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [asking, setAsking] = useState(false);
-  const [presetLoading, setPresetLoading] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
   const [detailDrawerOpen, setDetailDrawerOpen] = useState(false);
   const [detailMethod, setDetailMethod] = useState('');
@@ -108,24 +106,6 @@ export default function QAChat() {
       prev.includes(method) ? prev.filter(m => m !== method) : [...prev, method]
     );
   };
-
-  const handlePreset = useCallback(async (type: string) => {
-    if (!selectedRepoId || selectedMethods.length === 0) {
-      message.warning('请先选择接口');
-      return;
-    }
-    setPresetLoading(type);
-    try {
-      const answer = await fetchPresetAnswer(selectedRepoId, selectedMethods[0], type);
-      setChatMessages(prev => [
-        ...prev,
-        { role: 'user', content: type === 'what' ? '这个接口做了什么？' : type === 'risk' ? '有什么风险？' : type === 'db' ? '数据库操作有哪些？' : '调了哪些外部服务？' },
-        { role: 'assistant', content: answer },
-      ]);
-    } catch (err: unknown) {
-      if (err instanceof Error) message.error(err.message);
-    } finally { setPresetLoading(''); }
-  }, [selectedRepoId, selectedMethods]);
 
   const handleAsk = useCallback(async () => {
     if (!inputValue.trim()) { message.warning('请输入问题'); return; }
@@ -553,16 +533,7 @@ export default function QAChat() {
 
       {/* 右侧：对话区 */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: '#fafafa' }}>
-        {/* 预设问题按钮 */}
-        {selectedMethods.length > 0 && (
-          <div style={{ padding: '8px 16px', borderBottom: '1px solid #f0f0f0', background: '#fff', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 12, color: '#999', lineHeight: '28px' }}>快捷问题:</span>
-            <Button size="small" icon={<ThunderboltOutlined />} onClick={() => handlePreset('what')} loading={presetLoading === 'what'}>这个接口做了什么</Button>
-            <Button size="small" icon={<WarningOutlined />} onClick={() => handlePreset('risk')} loading={presetLoading === 'risk'}>风险分析</Button>
-            <Button size="small" icon={<DatabaseOutlined />} onClick={() => handlePreset('db')} loading={presetLoading === 'db'}>数据库操作</Button>
-            <Button size="small" icon={<ApiOutlined />} onClick={() => handlePreset('external')} loading={presetLoading === 'external'}>外部调用</Button>
-          </div>
-        )}
+        {/* 预设问题按钮 - 已移除，改用智能问答直接提问 */}
 
         {/* 消息列表 */}
         <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>

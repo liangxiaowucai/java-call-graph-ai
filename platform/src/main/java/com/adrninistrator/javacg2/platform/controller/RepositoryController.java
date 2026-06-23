@@ -2,6 +2,8 @@ package com.adrninistrator.javacg2.platform.controller;
 
 import com.adrninistrator.javacg2.platform.dto.ApiResponse;
 import com.adrninistrator.javacg2.platform.dto.CloneRequest;
+import com.adrninistrator.javacg2.platform.dto.RepositoryDetailDTO;
+import com.adrninistrator.javacg2.platform.dto.RepositoryListDTO;
 import com.adrninistrator.javacg2.platform.entity.RepositoryEntity;
 import com.adrninistrator.javacg2.platform.repository.RepositoryRepo;
 import com.adrninistrator.javacg2.platform.service.BytecodeAnalyzer;
@@ -26,6 +28,7 @@ import java.util.stream.Stream;
 
 @RestController
 @RequestMapping("/api/repos")
+@CrossOrigin(originPatterns = "*", methods = {RequestMethod.GET, RequestMethod.POST, RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.PUT})
 public class RepositoryController {
 
     private static final Logger logger = LoggerFactory.getLogger(RepositoryController.class);
@@ -56,8 +59,21 @@ public class RepositoryController {
     }
 
     @GetMapping
-    public ApiResponse<List<RepositoryEntity>> list() {
-        return ApiResponse.ok(repositoryRepo.findAll());
+    public ApiResponse<List<RepositoryListDTO>> list() {
+        List<RepositoryEntity> entities = repositoryRepo.findAll();
+        List<RepositoryListDTO> dtos = entities.stream()
+                .map(RepositoryListDTO::fromEntity)
+                .toList();
+        return ApiResponse.ok(dtos);
+    }
+
+    @GetMapping("/{id}")
+    public ApiResponse<RepositoryDetailDTO> getDetail(@PathVariable Long id) {
+        RepositoryEntity entity = repositoryRepo.findById(id).orElse(null);
+        if (entity == null) {
+            return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
+        }
+        return ApiResponse.ok(RepositoryDetailDTO.fromEntity(entity));
     }
 
     @PostMapping("/branches")
@@ -77,18 +93,29 @@ public class RepositoryController {
         RepositoryManager.RepoResult result = repositoryManager.cloneRepository(
                 request.gitUrl(), request.token(), request.repoType(), request.branch());
 
-        // 保存包前缀到 repo_config
-        if (result.success() && result.repoId() != null && request.packagePrefix() != null && !request.packagePrefix().isBlank()) {
-            var entity = repoConfigRepo.findByRepoIdAndConfigKey(result.repoId(), "analyze.package.prefix").orElseGet(() -> {
-                var e = new com.adrninistrator.javacg2.platform.entity.RepoConfigEntity();
-                e.setRepoId(result.repoId());
-                e.setConfigKey("analyze.package.prefix");
-                return e;
-            });
-            entity.setConfigValue(request.packagePrefix());
-            entity.setSource("USER");
-            entity.setUpdatedAt(java.time.LocalDateTime.now());
-            repoConfigRepo.save(entity);
+        if (result.success() && result.repoId() != null) {
+            // 保存包前缀到 repo_config
+            if (request.packagePrefix() != null && !request.packagePrefix().isBlank()) {
+                var entity = repoConfigRepo.findByRepoIdAndConfigKey(result.repoId(), "analyze.package.prefix").orElseGet(() -> {
+                    var e = new com.adrninistrator.javacg2.platform.entity.RepoConfigEntity();
+                    e.setRepoId(result.repoId());
+                    e.setConfigKey("analyze.package.prefix");
+                    return e;
+                });
+                entity.setConfigValue(request.packagePrefix());
+                entity.setSource("USER");
+                entity.setUpdatedAt(java.time.LocalDateTime.now());
+                repoConfigRepo.save(entity);
+            }
+            
+            // 保存 URL 路径标识符到 repository 表
+            if (request.urlPathIdentifier() != null && !request.urlPathIdentifier().isBlank()) {
+                var repo = repositoryRepo.findById(result.repoId()).orElse(null);
+                if (repo != null) {
+                    repo.setUrlPathIdentifier(request.urlPathIdentifier());
+                    repositoryRepo.save(repo);
+                }
+            }
         }
 
         return ApiResponse.ok(result);
@@ -239,6 +266,69 @@ public class RepositoryController {
         }).start();
 
         return ApiResponse.ok("概览文档正在后台生成，请稍后刷新查看");
+    }
+
+    @PatchMapping("/{id}")
+    public ApiResponse<RepositoryListDTO> updateRepository(@PathVariable Long id, @RequestBody Map<String, String> updates) {
+        RepositoryEntity repo = repositoryRepo.findById(id).orElse(null);
+        if (repo == null) {
+            return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
+        }
+
+        // 更新仓库名称
+        if (updates.containsKey("name")) {
+            String name = updates.get("name");
+            if (name != null && !name.trim().isEmpty()) {
+                repo.setName(name.trim());
+                logger.info("[仓库更新] 仓库 {} 的名称已更新", repo.getName());
+            }
+        }
+
+        // 更新 Git URL
+        if (updates.containsKey("gitUrl")) {
+            String gitUrl = updates.get("gitUrl");
+            if (gitUrl != null && !gitUrl.trim().isEmpty()) {
+                repo.setGitUrl(gitUrl.trim());
+                logger.info("[仓库更新] 仓库 {} 的 Git URL 已更新", repo.getName());
+            }
+        }
+
+        // 更新分支
+        if (updates.containsKey("branch")) {
+            String branch = updates.get("branch");
+            if (branch != null && !branch.trim().isEmpty()) {
+                repo.setBranch(branch.trim());
+                logger.info("[仓库更新] 仓库 {} 的分支已更新为: {}", repo.getName(), repo.getBranch());
+            }
+        }
+
+        // 更新包前缀配置
+        if (updates.containsKey("packagePrefix")) {
+            String packagePrefix = updates.get("packagePrefix");
+            if (packagePrefix != null && !packagePrefix.trim().isEmpty()) {
+                var entity = repoConfigRepo.findByRepoIdAndConfigKey(id, "analyze.package.prefix").orElseGet(() -> {
+                    var e = new com.adrninistrator.javacg2.platform.entity.RepoConfigEntity();
+                    e.setRepoId(id);
+                    e.setConfigKey("analyze.package.prefix");
+                    return e;
+                });
+                entity.setConfigValue(packagePrefix.trim());
+                entity.setSource("USER");
+                entity.setUpdatedAt(java.time.LocalDateTime.now());
+                repoConfigRepo.save(entity);
+                logger.info("[仓库更新] 仓库 {} 的包前缀已更新为: {}", repo.getName(), packagePrefix.trim());
+            }
+        }
+
+        // 更新 URL 路径标识符（支持多个，逗号分隔）
+        if (updates.containsKey("urlPathIdentifier")) {
+            String urlPathIdentifier = updates.get("urlPathIdentifier");
+            repo.setUrlPathIdentifier(urlPathIdentifier == null || urlPathIdentifier.trim().isEmpty() ? null : urlPathIdentifier.trim());
+            logger.info("[仓库更新] 仓库 {} 的 URL 路径标识符已更新为: {}", repo.getName(), repo.getUrlPathIdentifier());
+        }
+
+        repositoryRepo.save(repo);
+        return ApiResponse.ok(RepositoryListDTO.fromEntity(repo));
     }
 
     @DeleteMapping("/{id}")
