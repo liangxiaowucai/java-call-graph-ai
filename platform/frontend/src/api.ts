@@ -237,6 +237,15 @@ export async function fetchMethodSourceDetail(repoId: number, method: string, en
   return res.data.data;
 }
 
+/** 按短引用（类名.方法名）解析完整方法签名候选 */
+export async function resolveMethod(repoId: number, shortRef: string): Promise<string[]> {
+  const res = await api.get<ApiResponse<string[]>>(`/repos/${repoId}/resolve-method`, {
+    params: { shortRef },
+  });
+  if (!res.data.success) return [];
+  return res.data.data ?? [];
+}
+
 // ─── Config API ──────────────────────────────────────────────────────────────
 
 export interface MavenConfig {
@@ -690,13 +699,23 @@ export interface ToolCallStep {
   content: string;   // 展示文本，如 "🔍 正在分析 QAController.smartAsk()..."
   round: number;     // 第几轮
   toolName: string;  // getMethodSource | getCallees | getCallers | getBoundaries
+  detail?: string;   // 读取结果摘要 / 阶段推理文本（可选）
+}
+
+/** 问题理解（SSE intent 事件） */
+export interface QAIntent {
+  intentLabel: string;
+  summary: string;
+  focus: string[];
 }
 
 /** SSE 回调集合 */
 export interface QASseCallbacks {
   onThinking?: (step: ToolCallStep) => void;
+  onIntent?: (intent: QAIntent) => void;
   onMatched?: (data: { keywords: string[]; matchedEndpoints: MatchedEndpoint[] }) => void;
   onConfirmation?: (data: SmartQAResponseData) => void;
+  onAnswerDelta?: (delta: string) => void;
   onAnswer?: (content: string) => void;
   onDone?: (data: { references: string[]; cached?: boolean; matchedEndpoints?: MatchedEndpoint[] }) => void;
   onError?: (message: string) => void;
@@ -731,6 +750,8 @@ export function askSSE(
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let lastEventType = '';
+    let gotTerminal = false; // 是否收到 answer/done/error 终止事件
 
     const processStream = async () => {
       while (true) {
@@ -740,18 +761,23 @@ export function askSSE(
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
         for (const line of lines) {
-          if (line.startsWith('event:')) continue;
-          if (line.startsWith('data:')) {
+          if (line.startsWith('event:')) {
+            lastEventType = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
             const raw = line.slice(5).trim();
+            if (!raw) continue;
             try {
               const parsed = JSON.parse(raw);
-              // 找到事件类型（前一行 event:xxx）
-              const eventLine = lines[lines.indexOf(line) - 1] ?? '';
-              const eventType = eventLine.startsWith('event:') ? eventLine.slice(6).trim() : '';
-              dispatchSseEvent(eventType || 'data', parsed, callbacks);
+              if (['answer', 'done', 'error'].includes(lastEventType)) gotTerminal = true;
+              dispatchSseEvent(lastEventType || 'data', parsed, callbacks);
+              lastEventType = '';
             } catch { /* ignore malformed */ }
           }
         }
+      }
+      // 流结束但从未收到答案/完成事件 → 兜底提示，避免前端无限转圈
+      if (!gotTerminal) {
+        callbacks.onError?.('分析已结束，但未收到答案（可能是网络中断或服务端异常），请重试。');
       }
     };
     processStream().catch(e => {
@@ -827,11 +853,17 @@ function dispatchSseEvent(eventType: string, data: unknown, callbacks: QASseCall
     case 'thinking':
       callbacks.onThinking?.(d as unknown as ToolCallStep);
       break;
+    case 'intent':
+      callbacks.onIntent?.(d as unknown as QAIntent);
+      break;
     case 'matched':
       callbacks.onMatched?.(d as { keywords: string[]; matchedEndpoints: MatchedEndpoint[] });
       break;
     case 'confirmation':
       callbacks.onConfirmation?.(d as unknown as SmartQAResponseData);
+      break;
+    case 'answer_delta':
+      callbacks.onAnswerDelta?.(String(d.delta ?? ''));
       break;
     case 'answer':
       callbacks.onAnswer?.(String(d.content ?? ''));
@@ -842,6 +874,8 @@ function dispatchSseEvent(eventType: string, data: unknown, callbacks: QASseCall
     case 'error':
       callbacks.onError?.(String(d.content ?? '未知错误'));
       break;
+    default:
+      console.warn('[SSE] 未处理的事件类型:', eventType, d);
   }
 }
 

@@ -22,6 +22,7 @@ public class CodeAnalysisToolExecutor {
 
     private static final Logger logger = LoggerFactory.getLogger(CodeAnalysisToolExecutor.class);
     private static final String SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND";
+    private static final com.fasterxml.jackson.databind.ObjectMapper objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
     // 噪点方法前缀/关键词：getter/setter/toString/hashCode/equals 等样板代码
     private static final Set<String> BOILERPLATE_METHODS = Set.of(
@@ -39,11 +40,16 @@ public class CodeAnalysisToolExecutor {
     private final CallGraphEngine callGraphEngine;
     private final BoundaryRepo boundaryRepo;
     private final ChunkRepo chunkRepo;
+    private final ChainOutlineService chainOutlineService;
+    private final ExternalCallFormatter externalCallFormatter;
 
-    public CodeAnalysisToolExecutor(CallGraphEngine callGraphEngine, BoundaryRepo boundaryRepo, ChunkRepo chunkRepo) {
+    public CodeAnalysisToolExecutor(CallGraphEngine callGraphEngine, BoundaryRepo boundaryRepo, ChunkRepo chunkRepo,
+                                    ChainOutlineService chainOutlineService, ExternalCallFormatter externalCallFormatter) {
         this.callGraphEngine = callGraphEngine;
         this.boundaryRepo = boundaryRepo;
         this.chunkRepo = chunkRepo;
+        this.chainOutlineService = chainOutlineService;
+        this.externalCallFormatter = externalCallFormatter;
     }
 
     /**
@@ -52,6 +58,7 @@ public class CodeAnalysisToolExecutor {
     public String execute(Long repoId, String toolName, JsonNode input) {
         try {
             return switch (toolName) {
+                case "getChainOutline"    -> executeGetChainOutline(repoId, input);
                 case "getMethodSource"    -> executeGetMethodSource(repoId, input);
                 case "getCallees"         -> executeGetCallees(repoId, input);
                 case "getCallers"         -> executeGetCallers(repoId, input);
@@ -69,6 +76,15 @@ public class CodeAnalysisToolExecutor {
     }
 
     // ── 工具实现 ─────────────────────────────────────────────────────────────
+
+    private String executeGetChainOutline(Long repoId, JsonNode input) {
+        String fullMethod = input.path("fullMethod").asText(null);
+        if (fullMethod == null || fullMethod.isBlank()) {
+            return "INVALID_INPUT: fullMethod is required";
+        }
+        int maxNodes = input.path("maxNodes").asInt(300);
+        return chainOutlineService.buildChainOutline(repoId, fullMethod, maxNodes);
+    }
 
     private String executeGetMethodSource(Long repoId, JsonNode input) {
         String fullMethod = input.path("fullMethod").asText(null);
@@ -158,6 +174,15 @@ public class CodeAnalysisToolExecutor {
             if (b.getCalleeMethod() != null) sb.append("\n  → ").append(b.getCalleeMethod());
             sb.append("\n");
         }
+        // 装配外部 HTTP 调用的完整信息（系统名 + 完整URL + 用途），保证 AI 能直接给出可读的外部调用清单
+        boolean hasHttp = boundaries.stream().anyMatch(b -> "HTTP".equals(b.getBoundaryType()) || "GRPC".equals(b.getBoundaryType()));
+        if (hasHttp) {
+            ChunkEntity chunk = chunkRepo.findByRepoIdAndFullMethod(repoId, fullMethod).orElse(null);
+            String external = externalCallFormatter.render(chunk);
+            if (!external.isBlank()) {
+                sb.append("\n## 外部调用（已装配 系统名+完整URL+用途，请按此格式全部列出）:\n").append(external);
+            }
+        }
         return sb.toString();
     }
 
@@ -178,18 +203,43 @@ public class CodeAnalysisToolExecutor {
         StringBuilder sb = new StringBuilder();
         sb.append("// ").append(extractShortRef(fullMethod)).append(" 的业务数据:\n");
 
-        // 常量值
+        // 常量值（constants 为 JSON [{value, resolvedValue, line, code, file}]）。
+        // 跳过接口 path 字面量（以 / 开头）：它们归外部调用区，由 ExternalCallFormatter 统一展示。
         String constants = chunk.getConstants();
         if (constants != null && !constants.isBlank()) {
-            sb.append("\n## 字符串常量:\n");
-            for (String line : constants.split("\n")) {
-                if (!line.isBlank()) sb.append("  ").append(line.trim()).append("\n");
+            StringBuilder constLines = new StringBuilder();
+            try {
+                com.fasterxml.jackson.databind.JsonNode arr = objectMapper.readTree(constants);
+                if (arr.isArray()) {
+                    for (com.fasterxml.jackson.databind.JsonNode c : arr) {
+                        String value = c.path("value").asText("");
+                        if (value.isEmpty() || value.charAt(0) == '/') continue;
+                        constLines.append("  ").append(value);
+                        String resolved = c.path("resolvedValue").asText(null);
+                        if (resolved != null && !resolved.isBlank()) constLines.append(" = ").append(resolved);
+                        String file = c.path("file").asText(null);
+                        int line = c.path("line").asInt(0);
+                        if (file != null && line > 0) constLines.append(" @ ").append(file).append(":").append(line);
+                        constLines.append("\n");
+                    }
+                }
+            } catch (Exception e) {
+                // 解析失败回退到原始展示
+                for (String line : constants.split("\n")) {
+                    if (!line.isBlank()) constLines.append("  ").append(line.trim()).append("\n");
+                }
+            }
+            if (constLines.length() > 0) {
+                sb.append("\n## 字符串常量:\n").append(constLines);
             }
         }
 
-        // 解析后的外部 URL（含配置 key）
+        // 解析后的外部 URL：装配成「系统名 + 完整URL + 用途」，而非半截 base URL
         String resolvedUrls = chunk.getResolvedUrls();
-        if (resolvedUrls != null && !resolvedUrls.isBlank()) {
+        String external = externalCallFormatter.render(chunk);
+        if (!external.isBlank()) {
+            sb.append("\n## 外部调用（系统名 + 完整URL + 用途，请按此格式全部列出）:\n").append(external);
+        } else if (resolvedUrls != null && !resolvedUrls.isBlank()) {
             sb.append("\n## 外部调用 URL（已解析配置值）:\n");
             sb.append("  ").append(resolvedUrls.replace("\n", "\n  ")).append("\n");
         }
@@ -389,6 +439,22 @@ public class CodeAnalysisToolExecutor {
 
     public static List<ClaudeApiClient.ToolDefinition> buildToolDefinitions() {
         return List.of(
+            new ClaudeApiClient.ToolDefinition(
+                "getChainOutline",
+                "【优先调用】获取入口方法的调用链『地图』：一份轻量的缩进大纲，列出整条链上的业务方法，" +
+                "并对每个方法标注外部边界/数据 flag（HTTP/DB/CACHE/MQ/常量/异常）。不含源码、体量小。" +
+                "用法：先用它定位哪些节点有外部调用/关键数据，再用 getBoundaries/getConstants/getMethodSource 对这些节点读取明细，" +
+                "避免遗漏下游 HTTP/Redis/MQ 细节。truncated=true 表示节点过多被截断。",
+                List.of(
+                    new ClaudeApiClient.ToolParam(
+                        "fullMethod", "string",
+                        "入口方法的完整签名，格式：类全限定名:方法名(参数类型列表)",
+                        true),
+                    new ClaudeApiClient.ToolParam(
+                        "maxNodes", "integer",
+                        "地图节点上限，默认 300，一般无需指定",
+                        false))
+            ),
             new ClaudeApiClient.ToolDefinition(
                 "getMethodSource",
                 "获取指定方法的完整源码。当你需要深入了解某个方法的实现逻辑时调用。" +

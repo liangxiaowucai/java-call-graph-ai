@@ -6,6 +6,7 @@ import com.adrninistrator.javacg2.platform.dto.RequestChainDTO;
 import com.adrninistrator.javacg2.platform.entity.ApiEndpointEntity;
 import com.adrninistrator.javacg2.platform.entity.RepositoryEntity;
 import com.adrninistrator.javacg2.platform.repository.ApiEndpointRepo;
+import com.adrninistrator.javacg2.platform.repository.ChunkRepo;
 import com.adrninistrator.javacg2.platform.repository.RepositoryRepo;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
 import com.adrninistrator.javacg2.platform.service.RequestChainAnalyzer;
@@ -40,7 +41,9 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
     private final ObjectMapper mapper;
     private final RepositoryRepo repositoryRepo;
     private final ClaudeApiClient claudeClient;
-    
+    private final ChunkRepo chunkRepo;
+    private final ExternalCallFormatter externalCallFormatter;
+
     // 配置缓存
     private final Map<Long, Map<String, String>> configCache = new HashMap<>();
 
@@ -49,12 +52,16 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
             CallGraphEngine callGraphEngine,
             ObjectMapper mapper,
             RepositoryRepo repositoryRepo,
-            ClaudeApiClient claudeClient) {
+            ClaudeApiClient claudeClient,
+            ChunkRepo chunkRepo,
+            ExternalCallFormatter externalCallFormatter) {
         this.apiEndpointRepo = apiEndpointRepo;
         this.callGraphEngine = callGraphEngine;
         this.mapper = mapper;
         this.repositoryRepo = repositoryRepo;
         this.claudeClient = claudeClient;
+        this.chunkRepo = chunkRepo;
+        this.externalCallFormatter = externalCallFormatter;
     }
 
     @Override
@@ -325,7 +332,8 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
                 
                 // 外部调用详情（Task #3）
                 if (call.getCallTree() != null) {
-                    sb.append(analyzeBoundaries(call.getCallTree()));
+                    Long callRepoId = call.getRecommendedRepo() != null ? call.getRecommendedRepo().getRepoId() : null;
+                    sb.append(analyzeBoundaries(call.getCallTree(), callRepoId));
                 }
             } else {
                 sb.append("⚠️ **未匹配到后端方法**\n");
@@ -410,7 +418,7 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
      * Task #3: 分析边界调用（SQL展示、N+1检测）
      * Task #6: 添加常量和异常展示
      */
-    private String analyzeBoundaries(Object callTree) {
+    private String analyzeBoundaries(Object callTree, Long repoId) {
         StringBuilder sb = new StringBuilder();
         
         if (!(callTree instanceof CallGraphEngine.CallTreeDTO)) {
@@ -467,13 +475,28 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
         if (grouped.containsKey("HTTP")) {
             List<BoundaryDetail> httpCalls = grouped.get("HTTP");
             sb.append(String.format("**🌐 HTTP调用** (%d次)\n\n", httpCalls.size()));
-            
-            // 显示所有 HTTP 调用的 URL
+
+            // 走统一的 ExternalCallFormatter 装配「【系统名】HTTP调用 `完整URL` — 用途」，与 AI 文档/调用链地图格式一致。
+            // 按 fullMethod 取 chunk → formatter 拼 base+path 完整 URL；无 chunk 数据时回退到 boundary 原始 URL。
+            Set<String> shownHttp = new LinkedHashSet<>();
             for (BoundaryDetail http : httpCalls) {
-                String urlMatch = http.context != null && http.context.contains("📌 URL:") 
-                    ? http.context.substring(http.context.indexOf("📌 URL:") + 7).trim()
-                    : http.context;
-                sb.append(String.format("- `%s`\n", urlMatch != null ? urlMatch : "HTTP请求"));
+                List<String> rendered = new ArrayList<>();
+                if (repoId != null && http.location != null) {
+                    var chunk = chunkRepo.findByRepoIdAndFullMethod(repoId, http.location).orElse(null);
+                    if (chunk != null) {
+                        for (var ec : externalCallFormatter.extract(chunk)) rendered.add(ec.render());
+                    }
+                }
+                if (rendered.isEmpty()) {
+                    // 回退：boundary context 里的 base URL（拼不出完整 path 时至少展示已知信息）
+                    String urlMatch = http.context != null && http.context.contains("📌 URL:")
+                        ? http.context.substring(http.context.indexOf("📌 URL:") + 7).trim()
+                        : http.context;
+                    rendered.add("HTTP调用 `" + (urlMatch != null ? urlMatch : "HTTP请求") + "`");
+                }
+                for (String line : rendered) {
+                    if (shownHttp.add(line)) sb.append("- ").append(line).append("\n");
+                }
             }
             sb.append("\n");
         }
@@ -684,6 +707,8 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
                     for (com.fasterxml.jackson.databind.JsonNode c : arr) {
                         String value = c.path("value").asText("");
                         if (value.isEmpty()) continue;
+                        // 跳过接口 path 字面量（以 / 开头）：它们归外部调用区，由 ExternalCallFormatter 统一展示，不在常量区重复
+                        if (value.charAt(0) == '/') continue;
                         StringBuilder sb = new StringBuilder("`").append(value);
                         String resolved = c.path("resolvedValue").asText(null);
                         if (resolved != null && !resolved.isBlank()) {

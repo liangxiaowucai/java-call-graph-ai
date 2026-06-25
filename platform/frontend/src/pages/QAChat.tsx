@@ -11,10 +11,10 @@ import ThinkingPanel from '../components/ThinkingPanel';
 import {
   fetchRepos, fetchQAStatus, searchQAEndpoints,
   smartAskSSE, askSSE,
-  fetchCallTree, fetchMethodSourceDetail,
+  fetchCallTree, fetchMethodSourceDetail, resolveMethod,
   type RepoEntity, type EndpointSearchResult, type MatchedEndpoint,
   type CallTree, type MethodSourceDetail, type IntentResult, type IntentConfirmation,
-  type ToolCallStep,
+  type ToolCallStep, type QAIntent,
 } from '../api';
 
 const ENDPOINT_COLORS: Record<string, string> = {
@@ -35,12 +35,15 @@ interface ChatMessage {
   pendingRepoIds?: number[];      // 待确认时保存仓库列表
   intentResult?: IntentResult;    // AI提取的意图，等待用户确认
   needsIntentConfirmation?: boolean; // 意图置信度不足，等待用户确认意图
+  intent?: QAIntent;              // 问题理解（SSE intent 事件），展示在思考面板顶部
 }
 
 interface ThinkingStep {
   label: string;
   content: string;
   status: 'pending' | 'done';
+  round?: number;
+  detail?: string;
 }
 
 export default function QAChat() {
@@ -246,19 +249,37 @@ export default function QAChat() {
       .map(m => ({ role: m.role, content: m.content }));
 
     askSSE(selectedRepoId, selectedMethods, question, history, {
+      onIntent: (intent: QAIntent) => {
+        setChatMessages(prev => prev.map((m, i) =>
+          i === prev.length - 1 ? { ...m, intent } : m
+        ));
+      },
       onThinking: (step: ToolCallStep) => {
         setChatMessages(prev => prev.map((m, i) => {
           if (i !== prev.length - 1) return m;
           const existing = m.thinkingSteps ?? [];
-          if (existing.some(s => s.label === step.content)) return m;
+          // 仅与上一条比较去重，允许连续的不同步骤（含结果摘要/推理）逐条展示
+          const last = existing[existing.length - 1];
+          if (last && last.label === step.content && last.detail === (step.detail || undefined)) return m;
           return {
             ...m,
             thinkingSteps: [
               ...existing.filter(s => s.status === 'done'),
-              { label: step.content, content: `Round ${step.round}`, status: 'pending' as const },
+              { label: step.content, content: `第${step.round}轮`, round: step.round, detail: step.detail || undefined, status: 'pending' as const },
             ],
           };
         }));
+      },
+      onAnswerDelta: (delta) => {
+        // 打字机：逐段追加 token，并把思考步骤标记完成
+        setChatMessages(prev => prev.map((m, i) =>
+          i === prev.length - 1 ? {
+            ...m,
+            content: (m.content ?? '') + delta,
+            typing: true,
+            thinkingSteps: m.thinkingSteps?.map(s => ({ ...s, status: 'done' as const })),
+          } : m
+        ));
       },
       onAnswer: (content) => {
         setChatMessages(prev => prev.map((m, i) =>
@@ -569,6 +590,7 @@ export default function QAChat() {
                     <ThinkingPanel
                       steps={msg.thinkingSteps}
                       isDone={!msg.typing && msg.content.length > 0 && !msg.needsConfirmation && !msg.needsIntentConfirmation}
+                      intent={msg.intent}
                     />
                   )}
 
@@ -697,14 +719,27 @@ export default function QAChat() {
                               return (
                                 <code
                                   style={{ cursor: 'pointer', color: '#1890ff', textDecoration: 'underline' }}
-                                  onClick={() => {
+                                  onClick={async () => {
+                                    if (!selectedRepoId) return;
                                     const match = selectedMethods.find(m => {
                                       const short = m.split(':').pop()?.split('(')[0] ?? '';
                                       const cls = m.split(':')[0]?.split('.').pop() ?? '';
                                       return text === cls + '.' + short;
                                     });
-                                    if (match && selectedRepoId) {
+                                    if (match) {
                                       openMethodDetail(match);
+                                      return;
+                                    }
+                                    // 非已选接口：解析 shortRef → fullMethod，再打开源码
+                                    try {
+                                      const candidates = await resolveMethod(selectedRepoId, text);
+                                      if (candidates.length > 0) {
+                                        openMethodDetail(candidates[0]);
+                                      } else {
+                                        message.info('未定位到该方法的源码：' + text);
+                                      }
+                                    } catch {
+                                      message.error('解析方法失败：' + text);
                                     }
                                   }}
                                 >{text}</code>

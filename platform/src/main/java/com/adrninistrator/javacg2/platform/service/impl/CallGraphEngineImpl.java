@@ -75,18 +75,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         else if (maxDepth <= 0) maxDepth = DEFAULT_MAX_DEPTH;
 
         // 从仓库级配置读包前缀（支持多个，逗号分隔）
-        String packagePrefixRaw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
-                .map(c -> c.getConfigValue())
-                .filter(s -> s != null && !s.isBlank())
-                .orElse(null);
-        // 解析为前缀列表
-        List<String> packagePrefixes = new ArrayList<>();
-        if (packagePrefixRaw != null) {
-            for (String p : packagePrefixRaw.split("[,;\\s]+")) {
-                String trimmed = p.trim();
-                if (!trimmed.isEmpty()) packagePrefixes.add(trimmed);
-            }
-        }
+        List<String> packagePrefixes = loadPackagePrefixes(repoId);
 
         Set<String> visited = new HashSet<>();
         Set<String> expanded = new HashSet<>();
@@ -240,18 +229,10 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                     .collect(Collectors.toList())
                 : List.of();
 
-        // 获取边界点 —— 只保留真正的外部 I/O 边界（HTTP/RPC/DB/CACHE/MQ）。
-        // EXCEPTION 由干净的 exceptions 字段展示；SERIALIZATION/TRANSACTION 不属于外部调用，避免污染计数与 AI 判断。
-        Set<String> ioBoundaryTypes = Set.of("HTTP", "RPC", "GRPC", "DB", "CACHE", "REDIS", "MQ");
-        List<BoundaryDTO> boundaries = new ArrayList<>((cache != null
-                ? cache.getBoundaries(fullMethod)
-                : boundaryRepo.findByRepoIdAndFullMethod(repoId, fullMethod))
-                .stream()
-                .filter(b -> b.getBoundaryType() != null && ioBoundaryTypes.contains(b.getBoundaryType()))
-                .map(b -> new BoundaryDTO(b.getBoundaryType(), b.getLineNumber(), b.getContext()))
-                .collect(Collectors.toList()));
+        // 获取边界点（含 resolvedUrls 合成的 HTTP 边界）
+        List<BoundaryDTO> boundaries = loadBoundaries(repoId, fullMethod, cache);
 
-        // 获取干净的结构化数据（常量/异常/解析后的URL）—— 来自 chunks 表的专用列，而非污染的 call_summary 搜索索引
+        // 获取干净的结构化数据（常量/异常）—— 来自 chunks 表的专用列，而非污染的 call_summary 搜索索引
         String constants = null;
         String exceptions = null;
         try {
@@ -261,36 +242,11 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             if (chunk != null) {
                 constants = chunk.getConstants();   // 干净的字符串常量（换行分隔）
                 exceptions = chunk.getErrorCodes();  // 异常区改为展示业务错误码+消息（code+msg）
-
-                // 解析出的外部调用 URL（JSON: [{url,configKey,field}]）→ 合成 HTTP 边界
-                String resolvedUrls = chunk.getResolvedUrls();
-                if (resolvedUrls != null && !resolvedUrls.isBlank()) {
-                    Set<String> existingHttpCtx = boundaries.stream()
-                            .filter(b -> "HTTP".equals(b.boundaryType()) && b.context() != null)
-                            .map(BoundaryDTO::context)
-                            .collect(Collectors.toSet());
-                    try {
-                        com.fasterxml.jackson.databind.JsonNode arr = jsonMapper.readTree(resolvedUrls);
-                        if (arr.isArray()) {
-                            for (com.fasterxml.jackson.databind.JsonNode u : arr) {
-                                String url = u.path("url").asText("");
-                                if (url.isBlank()) continue;
-                                String cfgKey = u.path("configKey").asText(null);
-                                String ctx = "📌 URL: " + url + (cfgKey != null ? "  (${" + cfgKey + "})" : "");
-                                if (existingHttpCtx.stream().noneMatch(c -> c.contains(url))) {
-                                    boundaries.add(new BoundaryDTO("HTTP", null, ctx));
-                                }
-                            }
-                        }
-                    } catch (Exception ex) {
-                        logger.debug("[URL解析] JSON 解析失败: {}", fullMethod);
-                    }
-                }
             }
         } catch (Exception e) {
             logger.debug("[结构化数据加载] 失败: {}", fullMethod);
         }
-        
+
         // 调试日志
         if (!boundaries.isEmpty()) {
             logger.debug("[边界加载] {} 有 {} 个边界: {}", fullMethod, boundaries.size(), 
@@ -340,6 +296,118 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return new CallTreeNodeDTO(fullMethod, extractClassName(fullMethod),
                 extractMethodName(fullMethod), null, null,
                 boundaries, children, false, false, false, constants, exceptions);
+    }
+
+    /**
+     * 加载某方法的外部 I/O 边界（HTTP/RPC/DB/CACHE/MQ），并把 chunk.resolvedUrls 里解析出的 URL
+     * 合成为 HTTP 边界（去重）。供调用树构建与外部依赖汇总复用。
+     */
+    private List<BoundaryDTO> loadBoundaries(Long repoId, String fullMethod, RepoDataCache cache) {
+        Set<String> ioBoundaryTypes = Set.of("HTTP", "RPC", "GRPC", "DB", "CACHE", "REDIS", "MQ");
+        List<BoundaryDTO> boundaries = new ArrayList<>((cache != null
+                ? cache.getBoundaries(fullMethod)
+                : boundaryRepo.findByRepoIdAndFullMethod(repoId, fullMethod))
+                .stream()
+                .filter(b -> b.getBoundaryType() != null && ioBoundaryTypes.contains(b.getBoundaryType()))
+                .map(b -> new BoundaryDTO(b.getBoundaryType(), b.getLineNumber(), b.getContext()))
+                .collect(Collectors.toList()));
+
+        // 解析出的外部调用 URL（JSON: [{url,configKey,field}]）→ 合成 HTTP 边界
+        ChunkEntity chunk = (cache != null
+                ? cache.getChunk(fullMethod)
+                : chunkRepo.findByRepoIdAndFullMethod(repoId, fullMethod).stream().findFirst().orElse(null));
+        if (chunk != null && chunk.getResolvedUrls() != null && !chunk.getResolvedUrls().isBlank()) {
+            Set<String> existingHttpCtx = boundaries.stream()
+                    .filter(b -> "HTTP".equals(b.boundaryType()) && b.context() != null)
+                    .map(BoundaryDTO::context)
+                    .collect(Collectors.toSet());
+            try {
+                com.fasterxml.jackson.databind.JsonNode arr = jsonMapper.readTree(chunk.getResolvedUrls());
+                if (arr.isArray()) {
+                    for (com.fasterxml.jackson.databind.JsonNode u : arr) {
+                        String url = u.path("url").asText("");
+                        if (url.isBlank()) continue;
+                        String cfgKey = u.path("configKey").asText(null);
+                        String ctx = "📌 URL: " + url + (cfgKey != null ? "  (${" + cfgKey + "})" : "");
+                        if (existingHttpCtx.stream().noneMatch(c -> c.contains(url))) {
+                            boundaries.add(new BoundaryDTO("HTTP", null, ctx));
+                        }
+                    }
+                }
+            } catch (Exception ex) {
+                logger.debug("[URL解析] JSON 解析失败: {}", fullMethod);
+            }
+        }
+        return boundaries;
+    }
+
+    /**
+     * 收集入口方法可达范围内「所有带外部 I/O 边界的方法」，按方法全局去重（每个方法只访问一次）。
+     *
+     * <p>与 {@link #expandCallTree} 的区别：调用树为了「显示」会把菱形汇聚/重复子树折叠成空节点，
+     * 导致折叠子树里的 HTTP/DB/缓存边界在树上丢失。外部依赖汇总需要的是「去重后的完整边界集合」，
+     * 这里用一次纯粹的按方法去重 DFS（不折叠子树、每方法访问一次）保证全部外部调用都被收集到，
+     * 不会因显示层折叠而漏掉。接口/抽象方法自身无下游时桥接到实现类继续遍历。
+     *
+     * @return 有外部边界的方法 → 其边界列表（保持发现顺序）
+     */
+    public Map<String, List<BoundaryDTO>> collectExternalCalls(Long repoId, String entryMethod) {
+        Map<String, List<BoundaryDTO>> result = new LinkedHashMap<>();
+        if (entryMethod == null || entryMethod.isBlank()) return result;
+
+        List<String> packagePrefixes = loadPackagePrefixes(repoId);
+        RepoDataCache cache = new RepoDataCache(repoId);
+        Set<String> seen = new HashSet<>();
+        Deque<String> stack = new ArrayDeque<>();
+        stack.push(entryMethod);
+        int guard = 0;
+        while (!stack.isEmpty() && guard++ < 100_000) {
+            String fullMethod = stack.pop();
+            if (!seen.add(fullMethod)) continue;
+
+            // 收集当前方法的外部边界
+            List<BoundaryDTO> boundaries = loadBoundaries(repoId, fullMethod, cache);
+            if (!boundaries.isEmpty()) {
+                result.put(fullMethod, boundaries);
+            }
+
+            // 下游：直接调用边（过滤继承/实现关系边与样板/包前缀，与 buildNodeLazy 一致）
+            List<CallGraphEntity> callees = cache.getCallees(fullMethod).stream()
+                    .filter(c -> c.getEnabled() != null && c.getEnabled())
+                    .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                    .filter(c -> !isBoilerplate(c.getCalleeMethod()))
+                    .filter(c -> packagePrefixes.isEmpty() || packagePrefixes.stream().anyMatch(p -> c.getCalleeMethod().startsWith(p)))
+                    .collect(Collectors.toList());
+            for (CallGraphEntity c : callees) {
+                if (!seen.contains(c.getCalleeMethod())) stack.push(c.getCalleeMethod());
+            }
+            // 接口/抽象方法桥接：自身无下游调用边时，接到实现类的同签名方法继续遍历
+            if (callees.isEmpty()) {
+                for (String impl : resolveImplementations(repoId, fullMethod)) {
+                    if ((packagePrefixes.isEmpty() || packagePrefixes.stream().anyMatch(impl::startsWith))
+                            && !seen.contains(impl)) {
+                        stack.push(impl);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /** 读取仓库级包前缀配置（analyze.package.prefix，支持逗号/分号/空白分隔的多个前缀）。 */
+    private List<String> loadPackagePrefixes(Long repoId) {
+        String raw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
+                .map(c -> c.getConfigValue())
+                .filter(s -> s != null && !s.isBlank())
+                .orElse(null);
+        List<String> prefixes = new ArrayList<>();
+        if (raw != null) {
+            for (String p : raw.split("[,;\\s]+")) {
+                String trimmed = p.trim();
+                if (!trimmed.isEmpty()) prefixes.add(trimmed);
+            }
+        }
+        return prefixes;
     }
 
     /** 过滤构造方法、setter/getter 等非业务方法 */
@@ -452,6 +520,33 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return r == null ? null : r.source;
     }
 
+    @Override
+    public java.util.List<String> resolveMethodsByShortRef(Long repoId, String shortRef) {
+        if (shortRef == null || shortRef.isBlank()) return java.util.List.of();
+        // shortRef 形如 ClassName.method（无包名、无参数）
+        int dot = shortRef.lastIndexOf('.');
+        if (dot <= 0) return java.util.List.of();
+        String shortClass = shortRef.substring(0, dot);
+        String method = shortRef.substring(dot + 1);
+        // 匹配 fullMethod：以 .ClassName:method( 或 ClassName:method( 结尾前缀
+        return chunkRepo.findByRepoId(repoId).stream()
+                .map(ChunkEntity::getFullMethod)
+                .filter(java.util.Objects::nonNull)
+                .filter(fm -> {
+                    int colon = fm.lastIndexOf(':');
+                    if (colon <= 0) return false;
+                    String cls = fm.substring(0, colon);
+                    String m = fm.substring(colon + 1);
+                    int paren = m.indexOf('(');
+                    if (paren > 0) m = m.substring(0, paren);
+                    String sc = cls.contains(".") ? cls.substring(cls.lastIndexOf('.') + 1) : cls;
+                    return sc.equals(shortClass) && m.equals(method);
+                })
+                .distinct()
+                .limit(10)
+                .collect(java.util.stream.Collectors.toList());
+    }
+
     /** 源码片段 + 该片段在文件中的真实起始行号（1-based）+ 方法签名所在行号 */
     private static final class SourceResult {
         final String source;
@@ -499,23 +594,43 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         try {
             List<String> lines = Files.readAllLines(sourcePath);
             if (startLine != null && endLine != null && startLine > 0 && endLine > 0) {
-                // 有精确行号（通常是实现类方法）：向上多取几行，确保包含方法签名、注解、Javadoc
-                int sigLine = startLine;
-                int start = Math.max(0, startLine - 10);
-                // 从 start 向下找到方法签名或注解开始的位置
-                for (int i = start; i < startLine - 1 && i < lines.size(); i++) {
-                    String trimmed = lines.get(i).trim();
-                    if (trimmed.startsWith("/**") || trimmed.startsWith("@") || trimmed.startsWith("public ")
-                            || trimmed.startsWith("private ") || trimmed.startsWith("protected ")) {
-                        start = i;
+                // 有精确行号（通常是实现类方法）。字节码给的 startLine 多为方法体首行，
+                // 签名在其上方、注释/注解再上方。需向上吸收完整的注释块 + 注解，确保展示方法上方注释。
+                int startIdx = Math.min(startLine - 1, lines.size() - 1);  // chunk 起始行（0-based）
+
+                // ① 定位方法签名行：从 startIdx 向上小范围找“含 方法名( 且像声明”的行
+                String methodName = extractMethodName(fullMethod);
+                int sigIdx = -1;
+                for (int i = startIdx; i >= 0 && i >= startIdx - 5; i--) {
+                    String t = lines.get(i).trim();
+                    if (methodName != null && t.contains(methodName + "(")
+                            && (t.contains("public ") || t.contains("private ") || t.contains("protected ")
+                                || t.contains("static ") || t.endsWith("{"))) {
+                        sigIdx = i;
                         break;
                     }
                 }
-                // endLine 是字节码最后行号，不一定是方法体 } 行；向后扫描花括号找到真正的方法结束
+                if (sigIdx < 0) sigIdx = Math.max(0, startLine - 2);  // 退回：签名通常在方法体首行上一行
+
+                // ② 从签名行上一行起，向上吸收连续的：注解(@)、行注释(//)、块/Javadoc 注释(/* * */ /**)
+                //    跳过空行；遇到代码行（上一个方法的 } 或语句）即停
+                int start = sigIdx;
+                for (int i = sigIdx - 1; i >= 0; i--) {
+                    String t = lines.get(i).trim();
+                    if (t.isEmpty()) { continue; }              // 空行：继续向上看，不立即并入
+                    if (t.startsWith("@") || t.startsWith("//") || t.startsWith("*")
+                            || t.startsWith("/*") || t.endsWith("*/")) {
+                        start = i;                               // 注解/注释并入
+                    } else {
+                        break;                                   // 代码行，停止
+                    }
+                }
+
+                // ③ 从签名行开始做花括号配对，向后找到方法真正结束行（从签名行起算，避免注释里的 { 干扰）
                 int end = endLine;
                 int braceDepth = 0;
                 boolean entered = false;
-                for (int i = start; i < lines.size() && i < endLine + 50; i++) {
+                for (int i = sigIdx; i < lines.size() && i < endLine + 50; i++) {
                     String l = lines.get(i);
                     for (char ch : l.toCharArray()) {
                         if (ch == '{') { braceDepth++; entered = true; }
@@ -524,7 +639,8 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                     if (entered && braceDepth <= 0) { end = i + 1; break; }
                 }
                 end = Math.min(lines.size(), end);
-                return new SourceResult(String.join("\n", lines.subList(start, end)), start + 1, sigLine);
+                if (end <= start) end = Math.min(lines.size(), sigIdx + 1);
+                return new SourceResult(String.join("\n", lines.subList(start, end)), start + 1, sigIdx + 1);
             }
 
             // 无精确行号（接口/抽象方法）：不要返回整个文件。

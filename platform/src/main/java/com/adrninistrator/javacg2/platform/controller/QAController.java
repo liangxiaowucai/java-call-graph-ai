@@ -88,16 +88,25 @@ public class QAController {
                         step -> sendSseEvent(emitter, "thinking", Map.of(
                                 "content", step.label(),
                                 "round", step.round(),
-                                "toolName", step.toolName()
-                        ))
+                                "toolName", step.toolName(),
+                                "detail", step.detail() != null ? step.detail() : ""
+                        )),
+                        intent -> sendSseEvent(emitter, "intent", Map.of(
+                                "intentLabel", intent.intentLabel() != null ? intent.intentLabel() : "",
+                                "summary", intent.summary() != null ? intent.summary() : "",
+                                "focus", intent.focus() != null ? intent.focus() : List.of()
+                        )),
+                        token -> sendSseEvent(emitter, "answer_delta", Map.of("delta", token))
                 );
 
+                logger.info("[AI问答-SSE] 已发送答案, 长度={} 字符", result.answer() != null ? result.answer().length() : 0);
                 sendSseEvent(emitter, "answer", Map.of("content", result.answer()));
                 sendSseEvent(emitter, "done", Map.of(
                         "references", result.references(),
                         "matchedEndpoints", result.matchedEndpoints()
                 ));
                 emitter.complete();
+                logger.info("[AI问答-SSE] answer + done 已发送, SSE 完成 repoId={}", repoId);
 
             } catch (Exception e) {
                 logger.error("[AI问答-SSE] 失败", e);

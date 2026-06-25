@@ -32,3 +32,16 @@ node_modules/
 # IDE
 .vscode/
 *.iml
+
+# Kiro configuration (keep hooks and steering, ignore workspace)
+# .kiro/hooks/
+# .kiro/steering/
+.kiro/workspace/
+
+# UAI Kiro 运行时标记与轨迹（不入库）
+.kiro/.uai-gate-open
+.kiro/.uai-write-count
+openspec/changes/trace/*.log
+
+# macOS
+.DS_Store

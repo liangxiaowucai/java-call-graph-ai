@@ -28,6 +28,12 @@ public class CallGraphController {
         return ApiResponse.ok(callGraphEngine.getEntryPoints(repoId));
     }
 
+    /** 按短引用（类名.方法名）解析完整方法签名候选，供问答中点击方法名跳转源码 */
+    @GetMapping("/resolve-method")
+    public ApiResponse<List<String>> resolveMethod(@PathVariable Long repoId, @RequestParam String shortRef) {
+        return ApiResponse.ok(callGraphEngine.resolveMethodsByShortRef(repoId, shortRef));
+    }
+
     @GetMapping("/call-tree")
     public ApiResponse<CallGraphEngine.CallTreeDTO> getCallTree(
             @PathVariable Long repoId,

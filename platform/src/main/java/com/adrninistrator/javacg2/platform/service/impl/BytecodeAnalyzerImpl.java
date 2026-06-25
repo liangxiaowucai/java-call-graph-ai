@@ -999,6 +999,26 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                     .add(shortName(fieldClass) + "." + fieldName);
         }
 
+        // 1b. 接口 path 字面量：method_call_info（type=v, valueType=java.lang.String）中以 "/" 开头的字符串。
+        //     这些是 HTTP 调用时传入的接口路径（如 /api/order/detail），
+        //     base URL（resolved_urls，通常只到 host:port）需要与之拼接才能得到完整 URL。
+        //     与枚举/静态常量一起放入 constants，供 ExternalCallFormatter 拼出「base + path」完整 URL。
+        for (String line : readTsvFile(outputDir, "method_call_info")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 11) continue;
+            if (!"v".equals(cols[3])) continue;            // v=常量值
+            String valueType = cols[8];
+            String value = cols[9];
+            String caller = cols[10];
+            if (!"java.lang.String".equals(valueType) || value == null) continue;
+            String v = value.trim();
+            // 接口 path：以 / 开头、长度合理、无空格，排除纯 "/" 与明显非 path 的内容
+            if (v.length() >= 2 && v.length() <= 200 && v.charAt(0) == '/'
+                    && !v.contains(" ") && !v.contains("\t")) {
+                methodConstants.computeIfAbsent(caller, k -> new LinkedHashSet<>()).add(v);
+            }
+        }
+
         // 2. 抛出的异常：method_throw（[3]throw行号 [5]异常类型）
         for (String line : readTsvFile(outputDir, "method_throw")) {
             String[] cols = line.split("\t");

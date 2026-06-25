@@ -13,6 +13,17 @@ public interface CallGraphEngine {
     /** 从入口点展开调用树；fullExpand=true 时全展开（禁用懒加载、放大节点上限），用于分析/报告场景 */
     CallTreeDTO expandCallTree(Long repoId, String entryMethod, int maxDepth, boolean fullExpand);
 
+    /**
+     * 收集入口方法可达范围内「所有带外部 I/O 边界（HTTP/RPC/DB/CACHE/MQ）的方法」，按方法全局去重。
+     * 不受调用树显示折叠影响，保证外部依赖被完整收集，供外部依赖汇总使用。
+     *
+     * @return 有外部边界的方法签名 → 其边界列表（保持发现顺序）
+     */
+    java.util.Map<String, List<BoundaryDTO>> collectExternalCalls(Long repoId, String entryMethod);
+
+    /** 按短引用（类名.方法名，如 RemoteDbApiServiceImpl.querySummaryByUser）解析出完整方法签名候选 */
+    java.util.List<String> resolveMethodsByShortRef(Long repoId, String shortRef);
+
     /** 获取方法的上游调用方 */
     List<CallerDTO> getCallers(Long repoId, String fullMethod, int depth);
 

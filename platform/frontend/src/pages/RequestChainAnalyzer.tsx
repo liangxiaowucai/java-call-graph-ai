@@ -277,6 +277,14 @@ export default function RequestChainAnalyzer() {
   const [srcModal, setSrcModal] = useState<{ open: boolean; title: string; code: string; startLine: number; highlight: number[]; loading: boolean }>(
     { open: false, title: '', code: '', startLine: 1, highlight: [], loading: false });
 
+  // 让外壳内容容器在本页改为「窗口滚动」模式，便于 GoFullPage 等全页截图插件完整抓取
+  // （其它页面仍保持固定高度内滚布局，卸载时恢复）
+  useEffect(() => {
+    const el = document.querySelector('.site-layout-content');
+    el?.classList.add('page-scroll-natural');
+    return () => el?.classList.remove('page-scroll-natural');
+  }, []);
+
   // 打开源码弹窗并按需加载（引用跳转）
   const openSource = async (repoId: number, fullMethod: string, line?: number) => {
     if (!repoId || !fullMethod) return;
@@ -391,6 +399,47 @@ export default function RequestChainAnalyzer() {
     }
     
     return sectionLines.join('\n');
+  };
+
+  // 详细分析报告精简：去掉与上方卡片重复的章节
+  // （# 请求链分析报告 标题 / ## 请求详情 / #### 🔗 外部调用分析 / #### 📝 常量与异常 / ⚠️ 抛出/捕获的异常）
+  // 仅保留剩余内容（如 ## 📊 性能总览 等）
+  const filterDetailReport = (markdown?: string): string => {
+    if (!markdown) return '';
+    const blockedHeadings = ['请求详情', '外部调用分析', '常量与异常'];
+    const lines = markdown.split('\n');
+    const out: string[] = [];
+    let skipLevel = 0; // 0=不跳过；>0=正在跳过该层级标题及其所有子内容
+    for (const line of lines) {
+      const h = /^(#{1,6})\s+(.*)$/.exec(line);
+      if (h) {
+        const level = h[1].length;
+        const text = h[2];
+        // H1 主标题直接丢弃，但不进入跳过模式
+        if (level === 1) continue;
+        if (skipLevel > 0) {
+          if (level <= skipLevel) {
+            // 遇到同级或更高级标题：若仍是被屏蔽章节则继续跳过，否则结束跳过并保留本行
+            if (blockedHeadings.some((k) => text.includes(k))) {
+              skipLevel = level;
+              continue;
+            }
+            skipLevel = 0;
+          } else {
+            continue; // 子层级，继续跳过
+          }
+        }
+        if (blockedHeadings.some((k) => text.includes(k))) {
+          skipLevel = level;
+          continue;
+        }
+        out.push(line);
+        continue;
+      }
+      if (skipLevel > 0) continue;
+      out.push(line);
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   };
 
   const handleAnalyze = async () => {
@@ -951,20 +1000,7 @@ export default function RequestChainAnalyzer() {
               )}
             </Card>
 
-            {/* 完整调用链树 - 默认全部展开，方法名/边界/错误码可点击跳源码 */}
-            {call.callTree && call.callTree.root && (
-              <Card size="small" title="🌲 完整调用链（已全部展开，点方法名/标签查看源码）" style={{ marginBottom: 16 }}>
-                <div style={{ maxHeight: 600, overflow: 'auto' }}>
-                  <CallChainTreeView
-                    node={call.callTree.root}
-                    repoId={call.recommendedRepo?.repoId}
-                    onJump={(fm, line) => openSource(call.recommendedRepo?.repoId, fm, line)}
-                  />
-                </div>
-              </Card>
-            )}
-
-            {/* 外部依赖详情 */}
+            {/* 外部依赖详情（调用链树已移至页面底部统一展示） */}
             {call.callTree && (
               <Card size="small" title="🔗 外部依赖详情" style={{ marginBottom: 16 }}>
                 {renderDependencyCards(call)}
@@ -1308,7 +1344,7 @@ export default function RequestChainAnalyzer() {
               key: 'trace',
               label: `🧭 分析过程回放（${progressLogs.length} 步，点击展开查看每一步取到的数据）`,
               children: (
-                <div style={{ fontFamily: 'monospace', fontSize: 12, maxHeight: 300, overflowY: 'auto' }}>
+                <div style={{ fontFamily: 'monospace', fontSize: 12 }}>
                   {progressLogs.map((p, i) => (
                     <div key={i} style={{ marginBottom: 2 }}>{p.detail}</div>
                   ))}
@@ -1411,13 +1447,43 @@ export default function RequestChainAnalyzer() {
               } 
               key="1"
             >
-              <div className="markdown-body" style={{ background: '#fafafa', padding: 16, borderRadius: 4, maxHeight: 600, overflow: 'auto' }}>
+              <div className="markdown-body" style={{ background: '#fafafa', padding: 16, borderRadius: 4 }}>
                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ code: renderCodeBlock }}>
-                  {result.report}
+                  {filterDetailReport(result.report)}
                 </ReactMarkdown>
               </div>
             </Collapse.Panel>
           </Collapse>
+
+          {/* 完整调用链 - 移至最后统一展示，默认全部展开，方法名/边界/错误码可点击跳源码 */}
+          {result.apiCalls && result.apiCalls.some(c => c.callTree && c.callTree.root) && (
+            <Card title="🌲 完整调用链（已全部展开，点方法名/标签查看源码）" style={{ marginTop: 16 }}>
+              {result.apiCalls.map((call, index) => (
+                call.callTree && call.callTree.root ? (
+                  <Card
+                    key={index}
+                    size="small"
+                    title={
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <Tag color={call.status < 400 ? 'success' : 'error'}>{call.status}</Tag>
+                        <Text strong style={{ fontSize: 13 }}>{call.requestMethod || 'GET'}</Text>
+                        <Text style={{ fontSize: 13 }}>{call.url?.split('?')[0]}</Text>
+                      </div>
+                    }
+                    style={{ marginBottom: 16 }}
+                  >
+                    <div>
+                      <CallChainTreeView
+                        node={call.callTree.root}
+                        repoId={call.recommendedRepo?.repoId}
+                        onJump={(fm, line) => openSource(call.recommendedRepo?.repoId, fm, line)}
+                      />
+                    </div>
+                  </Card>
+                ) : null
+              ))}
+            </Card>
+          )}
         </div>
       )}
 

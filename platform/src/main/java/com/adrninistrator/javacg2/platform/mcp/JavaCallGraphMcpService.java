@@ -40,6 +40,7 @@ public class JavaCallGraphMcpService {
     private final CallGraphRepo callGraphRepo;
     private final EmbeddingService embeddingService;
     private final VectorStoreService vectorStoreService;
+    private final com.adrninistrator.javacg2.platform.service.impl.ChainOutlineService chainOutlineService;
 
     public JavaCallGraphMcpService(CallGraphEngine callGraphEngine,
                                     BoundaryRepo boundaryRepo,
@@ -47,7 +48,8 @@ public class JavaCallGraphMcpService {
                                     RepositoryRepo repositoryRepo,
                                     CallGraphRepo callGraphRepo,
                                     EmbeddingService embeddingService,
-                                    VectorStoreService vectorStoreService) {
+                                    VectorStoreService vectorStoreService,
+                                    com.adrninistrator.javacg2.platform.service.impl.ChainOutlineService chainOutlineService) {
         this.callGraphEngine = callGraphEngine;
         this.boundaryRepo = boundaryRepo;
         this.apiEndpointRepo = apiEndpointRepo;
@@ -55,6 +57,7 @@ public class JavaCallGraphMcpService {
         this.callGraphRepo = callGraphRepo;
         this.embeddingService = embeddingService;
         this.vectorStoreService = vectorStoreService;
+        this.chainOutlineService = chainOutlineService;
     }
 
     // ── 工具 1：列出所有已分析的仓库 ─────────────────────────────────────────
@@ -83,6 +86,32 @@ public class JavaCallGraphMcpService {
             return mapper.writeValueAsString(result);
         } catch (Exception e) {
             logger.error("[MCP] listRepositories 失败", e);
+            return "{\"error\": \"" + e.getMessage() + "\"}";
+        }
+    }
+
+    // ── 工具：调用链地图（轻量大纲，先看地图再下钻）──────────────────────────
+
+    @Tool(name = "getChainOutline",
+          description = "获取入口方法的调用链『地图』：一份轻量缩进大纲，列出整条链上的业务方法，并对每个方法标注" +
+                        "外部边界/数据 flag（HTTP/DB/CACHE/MQ/常量/异常）。不含源码、体量小。" +
+                        "适合作为分析起点：先用它定位哪些节点有外部调用/关键数据，再用 getBoundaries/getMethodSource 读明细，" +
+                        "避免遗漏下游 HTTP/Redis/MQ 细节。truncated=true 表示节点过多被截断。" +
+                        "fullMethod 格式：类全限定名:方法名(参数类型列表)。")
+    public String getChainOutline(
+            @ToolParam(description = "仓库 ID，从 listRepositories 获取") long repoId,
+            @ToolParam(description = "入口方法完整签名，格式：类全限定名:方法名(参数类型列表)") String fullMethod,
+            @ToolParam(description = "地图节点上限，默认 300") int maxNodes) {
+        try {
+            if (!repositoryExists(repoId)) {
+                return "{\"error\": \"仓库不存在或未分析完成: " + repoId + "\"}";
+            }
+            int limit = maxNodes > 0 ? maxNodes : 300;
+            String outline = chainOutlineService.buildChainOutline(repoId, fullMethod, limit);
+            logger.info("[MCP] getChainOutline repoId={} method={}", repoId, fullMethod);
+            return outline;
+        } catch (Exception e) {
+            logger.error("[MCP] getChainOutline 失败", e);
             return "{\"error\": \"" + e.getMessage() + "\"}";
         }
     }
@@ -445,7 +474,7 @@ public class JavaCallGraphMcpService {
                 ObjectNode bNode = mapper.createObjectNode();
                 bNode.put("type", b.getBoundaryType());
                 if (b.getLineNumber() != null) bNode.put("lineNumber", b.getLineNumber());
-                if (b.getContext() != null) bNode.put("context", b.getContext().split("\n")[0]);
+                if (b.getContext() != null) bNode.put("context", b.getContext());
                 if (b.getCalleeMethod() != null) bNode.put("calleeMethod", b.getCalleeMethod());
                 bArray.add(bNode);
             }

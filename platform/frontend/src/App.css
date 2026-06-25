@@ -45,6 +45,13 @@ html, body, #root {
   overflow: auto;
 }
 
+/* 页面级：让窗口（而非内层容器）滚动，便于 GoFullPage 等全页截图插件完整抓取 */
+.site-layout-content.page-scroll-natural {
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
+}
+
 /* ─── Repo Manager ────────────────────────────────────────────────────────── */
 .repo-manager {
   max-width: 100%;

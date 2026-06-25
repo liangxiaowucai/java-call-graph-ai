@@ -78,6 +78,11 @@ public class QAEngineImpl {
             + "2. 只列出源码中明确出现的数据库操作，标注表名和操作类型\n"
             + "3. 数据流向只描述源码中可以追踪的路径\n"
             + "4. 事务边界只标注源码中有 @Transactional 注解的方法\n\n"
+            + "### 外部调用展示格式（HTTP/gRPC）——必须严格遵守\n"
+            + "工具返回的「外部调用」条目已装配好 系统名+完整URL+用途，请逐条原样列出，不要只写方法名一笔带过，不要遗漏任何一条。\n"
+            + "格式：`**系统名**：HTTP调用 \\`完整URL\\` 用途说明`，例如：\n"
+            + "- **订单系统**：HTTP调用 `http://order-service.example.com/api/order/detail` 获取订单详情\n"
+            + "URL 必须是 base+path 拼好的完整地址（不能只有 host）；系统名结合工具给的候选名与方法/类注释润色成「XX系统」，实在无依据时用配置 key 或 host；用途取自方法注释/摘要，没有就省略。\n\n"
             + "### 注意事项类\n"
             + "只报告源码中有代码依据的风险点，找不到就跳过该项，不输出\"未发现\"的逐条列举：\n"
             + "- 空指针：无 null 检查直接调用的具体代码行\n"
@@ -933,10 +938,34 @@ public class QAEngineImpl {
     public SmartQAResponse generateAnswerWithLoop(List<ScoredEndpoint> allResults, String question,
                                                    List<String> keywords, List<MatchedEndpoint> matchedEndpoints,
                                                    java.util.function.Consumer<ToolCallStep> stepCallback) {
+        return generateAnswerWithLoop(allResults, question, keywords, matchedEndpoints, stepCallback, null);
+    }
+
+    /**
+     * 同上，额外支持「问题理解」回调：进入工具循环前先做一次意图分析并回调（用于 SSE 展示）。
+     * @param intentCallback 问题理解回调（可为 null）
+     */
+    public SmartQAResponse generateAnswerWithLoop(List<ScoredEndpoint> allResults, String question,
+                                                   List<String> keywords, List<MatchedEndpoint> matchedEndpoints,
+                                                   java.util.function.Consumer<ToolCallStep> stepCallback,
+                                                   java.util.function.Consumer<IntentUnderstanding> intentCallback) {
+        return generateAnswerWithLoop(allResults, question, keywords, matchedEndpoints, stepCallback, intentCallback, null);
+    }
+
+    /**
+     * 同上，额外支持「最终答案流式」回调：判定要出答案时改用流式生成，逐 token 回调（用于打字机效果）。
+     * @param tokenCallback 最终答案 token 回调（可为 null，为 null 时保持一次性返回）
+     */
+    public SmartQAResponse generateAnswerWithLoop(List<ScoredEndpoint> allResults, String question,
+                                                   List<String> keywords, List<MatchedEndpoint> matchedEndpoints,
+                                                   java.util.function.Consumer<ToolCallStep> stepCallback,
+                                                   java.util.function.Consumer<IntentUnderstanding> intentCallback,
+                                                   java.util.function.Consumer<String> tokenCallback) {
         // 安全阀：最多访问 50 个不同方法节点，防止超大项目无限展开
         final int MAX_NODES = 50;
         final int MAX_ROUNDS = 25; // 最大轮数限制，新增工具后需要更多轮次收集完整业务信息
         Set<String> visitedMethods = new HashSet<>();
+        Set<String> calledTools = new HashSet<>();  // 非 getMethodSource 工具去重：toolName|fullMethod
         List<String> references = new ArrayList<>();
         List<ToolCallStep> steps = new ArrayList<>();
 
@@ -970,7 +999,14 @@ public class QAEngineImpl {
                 + "3. **入参分析**：入口方法必须调 getParamClassDef 获取字段定义和校验注解\n"
                 + "4. **聚焦业务逻辑**：优先分析 if/switch 分支、数据转换、外部调用、异常抛出等关键代码\n"
                 + "5. **忽略样板代码**：跳过 getter/setter、日志打印、toString 等无业务含义的代码\n"
-                + "6. **结构化输出**：用表格展示字段、用代码块展示关键逻辑、用列表展示调用链\n";
+                + "6. **结构化输出**：用表格展示字段、用代码块展示关键逻辑、用列表展示调用链\n"
+                + "7. **下游必读实现**：入口方法的下游外部调用（HTTP/RPC/DB/缓存）涉及的 Service/Remote 方法，必须先 getImplementations + getMethodSource 读到实现类源码后，才能对其行为/风险下结论；未读到就如实说明\n"
+                + "8. **先看地图再下钻**：优先调用 getChainOutline 获取调用链地图，据此定位带 [HTTP/DB/CACHE/MQ/常量/异常] 标记的节点；对这些节点逐个用 getBoundaries/getConstants/getMethodSource 读取明细（如具体 URL、SQL、缓存 key、MQ topic、配置值），再下结论。不要只凭方法名一笔带过外部调用。地图 truncated=true 时，回答中如实说明哪些未覆盖\n"
+                + "9. **外部调用必须完整列出**：getBoundaries/getConstants/getChainOutline 返回的「外部调用」条目（已装配 系统名+完整URL+用途）必须在答案里逐条列出，按 `**系统名**：HTTP调用 \\`完整URL\\` 用途` 的格式，一条都不能漏，URL 必须是 base+path 拼好的完整地址\n"
+                + "\n## 收尾铁律\n"
+                + "答案末尾必须追加一节 `**分析覆盖**`，分两行列出：\n"
+                + "- `已分析`：本次实际读取了源码的关键方法（`类名.方法名`）\n"
+                + "- `未覆盖/不确定`：想分析但源码未读取到或无法确定的部分；没有则写「无」\n";
 
         // 构建初始入参：接口摘要列表
         StringBuilder initialContext = new StringBuilder();
@@ -986,10 +1022,32 @@ public class QAEngineImpl {
             references.add(se.endpoint.getFullMethod());
         }
 
+        // ── 问题理解（语义转换）：进循环前先做一次意图分析，回调给前端展示，并注入循环上下文 ──
+        String understandingBlock = "";
+        try {
+            IntentResult intent = extractIntent(question);
+            if (intentCallback != null) {
+                intentCallback.accept(new IntentUnderstanding(
+                        intent.intentLabel(), intent.summary(), intent.focusOn()));
+            }
+            StringBuilder ub = new StringBuilder();
+            ub.append("\n\n## 对用户问题的理解（请据此组织回答）\n");
+            ub.append("- 意图类型: ").append(intent.intentLabel()).append("\n");
+            if (intent.summary() != null && !intent.summary().isBlank()) {
+                ub.append("- 用户真正想知道: ").append(intent.summary()).append("\n");
+            }
+            if (intent.focusOn() != null && !intent.focusOn().isEmpty()) {
+                ub.append("- 必须覆盖的角度: ").append(String.join("、", intent.focusOn())).append("\n");
+            }
+            understandingBlock = ub.toString();
+        } catch (Exception e) {
+            logger.warn("[ToolLoop] 问题理解失败，跳过该步", e);
+        }
+
         // messages history（含 tool_result）
         List<Map<String, Object>> messages = new ArrayList<>();
         messages.add(Map.of("role", "user", "content",
-                question + "\n\n" + initialContext));
+                question + understandingBlock + "\n\n" + initialContext));
 
         // 工具定义
         List<ClaudeApiClient.ToolDefinition> tools = CodeAnalysisToolExecutor.buildToolDefinitions();
@@ -1023,8 +1081,27 @@ public class QAEngineImpl {
 
             // 判断是否结束
             if (!response.hasToolUse()) {
-                finalAnswer = response.text();
+                if (tokenCallback != null) {
+                    // 流式重新生成最终答案（打字机）：保留 assistant 文本块，追加“输出最终答案”指令后流式生成
+                    messages.add(Map.of("role", "user", "content",
+                            "请基于以上分析，输出面向开发者的最终答案（遵循 system prompt 的格式与收尾铁律），不要再调用工具。"));
+                    logger.info("[ToolLoop] 最终答案流式生成开始");
+                    try {
+                        finalAnswer = claudeClient.chatStream(systemPrompt, toPlainMessages(messages), tokenCallback);
+                    } catch (Exception e) {
+                        logger.error("[ToolLoop] 流式生成失败，回退一次性文本: {}", e.getMessage());
+                        finalAnswer = response.text();
+                    }
+                } else {
+                    finalAnswer = response.text();
+                }
                 break;
+            }
+
+            // 阶段性推理：模型本轮在调用工具前给出的思考文本，展示“得出了哪些结论/下一步打算”
+            if (stepCallback != null && response.text() != null && !response.text().isBlank()) {
+                stepCallback.accept(new ToolCallStep("reasoning", null,
+                        "💭 推理", round, truncate(response.text(), 300)));
             }
 
             // 安全阀检查：轮数上限
@@ -1070,11 +1147,23 @@ public class QAEngineImpl {
                         ));
                         continue;
                     }
+                } else if (!"getMethodSource".equals(toolUse.name())) {
+                    // 其它工具（getCallees/getExceptions/getConstants/getBoundaries...）按 toolName|fullMethod 去重，避免空转
+                    String toolKey = toolUse.name() + "|" + (fullMethod != null ? fullMethod : "");
+                    if (!calledTools.add(toolKey)) {
+                        logger.debug("[ToolLoop] 跳过重复工具调用: {}", toolKey);
+                        toolResults.add(Map.of(
+                                "type", "tool_result",
+                                "tool_use_id", toolUse.id(),
+                                "content", "ALREADY_CALLED: 该工具已对此方法调用过，结果见之前轮次，请勿重复调用"
+                        ));
+                        continue;
+                    }
                 }
 
                 // 推送 SSE 步骤
                 String stepLabel = buildStepLabel(toolUse.name(), fullMethod);
-                ToolCallStep step = new ToolCallStep(toolUse.name(), fullMethod, stepLabel, round);
+                ToolCallStep step = new ToolCallStep(toolUse.name(), fullMethod, stepLabel, round, null);
                 steps.add(step);
                 if (stepCallback != null) stepCallback.accept(step);
                 logger.info("[ToolLoop] 执行工具: {} fullMethod={}", toolUse.name(), fullMethod);
@@ -1082,6 +1171,12 @@ public class QAEngineImpl {
                 String result = (repoId != null)
                         ? toolExecutor.execute(repoId, toolUse.name(), toolUse.input())
                         : "REPO_NOT_FOUND";
+
+                // 执行后推送“读到了什么”的结果摘要，让用户看到具体读取内容
+                if (stepCallback != null) {
+                    String readLabel = "↳ 已读取 " + (fullMethod != null ? shortMethod(fullMethod) : toolUse.name());
+                    stepCallback.accept(new ToolCallStep(toolUse.name(), fullMethod, readLabel, round, previewResult(result)));
+                }
 
                 toolResults.add(Map.of(
                         "type", "tool_result",
@@ -1114,8 +1209,57 @@ public class QAEngineImpl {
         };
     }
 
-    /** 工具调用步骤，用于 SSE 推送 */
-    public record ToolCallStep(String toolName, String fullMethod, String label, int round) {}
+    /** 工具调用步骤，用于 SSE 推送（detail=读取结果摘要/阶段推理，可为 null） */
+    public record ToolCallStep(String toolName, String fullMethod, String label, int round, String detail) {}
+
+    /** 把工具结果压成一行摘要，便于在思考面板展示“读到了什么”（≤200 字） */
+    private String previewResult(String result) {
+        if (result == null || result.isBlank()) return "";
+        String oneLine = result.replaceAll("\\s+", " ").trim();
+        return oneLine.length() > 200 ? oneLine.substring(0, 200) + "…" : oneLine;
+    }
+
+    /** 截断文本到指定长度 */
+    private String truncate(String text, int max) {
+        if (text == null) return "";
+        String t = text.trim();
+        return t.length() > max ? t.substring(0, max) + "…" : t;
+    }
+
+    /** 问题理解（语义转换结果），用于 SSE 展示在思考面板顶部 */
+    public record IntentUnderstanding(String intentLabel, String summary, List<String> focus) {}
+
+    /** 把工具循环的富消息（content 可能是 String 或 block 数组）拍平成 chatStream 需要的 {role, content(String)} 形式 */
+    @SuppressWarnings("unchecked")
+    private List<Map<String, String>> toPlainMessages(List<Map<String, Object>> messages) {
+        List<Map<String, String>> out = new ArrayList<>();
+        for (Map<String, Object> msg : messages) {
+            String role = String.valueOf(msg.get("role"));
+            Object content = msg.get("content");
+            StringBuilder sb = new StringBuilder();
+            if (content instanceof String s) {
+                sb.append(s);
+            } else if (content instanceof List<?> blocks) {
+                for (Object b : blocks) {
+                    if (!(b instanceof Map)) { sb.append(String.valueOf(b)).append("\n"); continue; }
+                    Map<String, Object> block = (Map<String, Object>) b;
+                    String type = String.valueOf(block.get("type"));
+                    switch (type) {
+                        case "text" -> sb.append(String.valueOf(block.getOrDefault("text", "")));
+                        case "tool_use" -> sb.append("[调用工具 ").append(block.get("name"))
+                                .append(" 参数=").append(block.get("input")).append("]");
+                        case "tool_result" -> sb.append(String.valueOf(block.getOrDefault("content", "")));
+                        default -> { /* 忽略未知块 */ }
+                    }
+                    sb.append("\n");
+                }
+            }
+            String text = sb.toString().trim();
+            if (text.isEmpty()) text = "(无内容)";
+            out.add(Map.of("role", role, "content", text));
+        }
+        return out;
+    }
 
     private static final com.fasterxml.jackson.databind.ObjectMapper mapper =
             new com.fasterxml.jackson.databind.ObjectMapper();
