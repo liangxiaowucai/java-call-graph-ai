@@ -18,10 +18,13 @@ platform/data/
 data/
 platform/.jqwik-database
 
-# AI 工具内部配置
+# AI 工具内部配置（敏感，禁止入库）
+.uai/
 .harness/
 .claude/
 .kiro/
+CLAUDE.md
+AGENTS.md
 
 # Chrome 插件私钥
 *.pem
@@ -38,10 +41,10 @@ node_modules/
 # .kiro/steering/
 .kiro/workspace/
 
-# UAI Kiro 运行时标记与轨迹（不入库）
-.kiro/.uai-gate-open
-.kiro/.uai-write-count
-openspec/changes/trace/*.log
+# 内部规范与 CI 配置（禁止入库）
+openspec/
+.gitlab-ci.yml
+scripts/
 
 # macOS
 .DS_Store
