@@ -60,7 +60,8 @@ public interface CallGraphEngine {
         Long calleeRepoId,
         int callCount,                  // 调用边总数
         int methodCount,                // 被调用的不同方法数
-        List<HotMethod> hotMethods      // 热点方法（Top 5）
+        List<HotMethod> hotMethods,     // 热点方法（Top 5）
+        String callType                 // 调用类型聚合：RPC/HTTP/MQ/MIXED
     ) {}
 
     /** 热点被调用方法摘要 */

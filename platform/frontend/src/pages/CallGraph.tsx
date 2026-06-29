@@ -322,13 +322,68 @@ function registerAnimatedEdge() {
       },
 
       setState(name, value, item) {
-        if (!item || name !== 'active') return;
+        if (!item) return;
         const group = item.getContainer();
         if (!group) return;
         const keyShape = group.get('children')[0];
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const dot = group.find((el: any) => el.get('name') === 'flow-dot');
 
+        if (name === 'active-out' || name === 'active-in') {
+          if (value) {
+            const isOut = name === 'active-out';
+            const color = isOut ? '#1890ff' : '#52c41a';
+            keyShape?.attr({
+              stroke: color,
+              lineWidth: 2.5,
+              opacity: 1,
+              endArrow: { path: G6.Arrow.triangle(8, 8, 0), fill: color },
+            });
+            if (dot) {
+              dot.stopAnimate();
+              dot.attr({ r: 5, fill: color, opacity: 1 });
+              const ks = keyShape;
+              dot.animate(
+                (ratio: number) => {
+                  try {
+                    const p = ks.getPoint(isOut ? ratio : 1 - ratio);
+                    return p ? { x: p.x, y: p.y } : {};
+                  } catch {
+                    return {};
+                  }
+                },
+                { repeat: true, duration: 600 },
+              );
+            }
+          } else {
+            // restore default idle state
+            keyShape?.attr({
+              stroke: '#c0c0c0',
+              lineWidth: 1,
+              opacity: 1,
+              endArrow: { path: G6.Arrow.triangle(6, 6, 0), fill: '#c0c0c0' },
+            });
+            if (dot) {
+              dot.stopAnimate();
+              dot.attr({ r: 2.5, fill: '#adb5bd', opacity: 0.28 });
+              const ks = keyShape;
+              dot.animate(
+                (ratio: number) => {
+                  try {
+                    const p = ks.getPoint(ratio);
+                    return p ? { x: p.x, y: p.y } : {};
+                  } catch {
+                    return {};
+                  }
+                },
+                { repeat: true, duration: 2400 },
+              );
+            }
+          }
+          return;
+        }
+
+        if (name !== 'active') return;
         if (value) {
           keyShape?.attr({
             stroke: '#1890ff',
@@ -750,14 +805,17 @@ export default function CallGraph() {
       }
     });
 
-    // Node hover → highlight adjacent edges
+    // Node hover → highlight adjacent edges with directional animation
     graph.on('node:mouseenter', (evt) => {
       const item = evt.item;
       if (!item) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const edges = (item as any).getEdges?.() ?? [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      edges.forEach((edge: any) => graph.setItemState(edge, 'active', true));
+      edges.forEach((edge: any) => {
+        const isSource = edge.getSource() === item;
+        graph.setItemState(edge, isSource ? 'active-out' : 'active-in', true);
+      });
       graph.setItemState(item, 'active', true);
     });
     graph.on('node:mouseleave', (evt) => {
@@ -766,7 +824,10 @@ export default function CallGraph() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const edges = (item as any).getEdges?.() ?? [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      edges.forEach((edge: any) => graph.setItemState(edge, 'active', false));
+      edges.forEach((edge: any) => {
+        graph.setItemState(edge, 'active-out', false);
+        graph.setItemState(edge, 'active-in', false);
+      });
       graph.setItemState(item, 'active', false);
     });
 

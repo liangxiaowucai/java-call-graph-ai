@@ -401,10 +401,15 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
         // 2. 统计每个 repo 的方法总数（chunk 表）
         Map<Long, Integer> repoMethodCount = new HashMap<>();
-        chunkRepo.findAll().forEach(c -> repoMethodCount.merge(c.getRepoId(), 1, Integer::sum));
+        // chunk 全量索引：fullMethod -> repoId（用于 fallback 跨库检测）
+        Map<String, Long> chunkMethodToRepo = new HashMap<>();
+        chunkRepo.findAll().forEach(c -> {
+            repoMethodCount.merge(c.getRepoId(), 1, Integer::sum);
+            // 仅记录唯一归属的方法（同名方法存在于多库时不能用于 fallback）
+            chunkMethodToRepo.merge(c.getFullMethod(), c.getRepoId(), (a, b) -> a.equals(b) ? a : -1L);
+        });
 
         // 3. 入口点双重索引：fullMethod -> Map<repoId, ApiEndpointEntity>
-        // 用于精确判断「callee 是哪个仓库的入口点」，彻底避免同名方法误连无关仓库
         Map<String, Map<Long, ApiEndpointEntity>> epByMethodAndRepo = new HashMap<>();
         Map<Long, Integer> repoEntryCount = new HashMap<>();
         apiEndpointRepo.findAll().forEach(ep -> {
@@ -413,8 +418,9 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             repoEntryCount.merge(ep.getRepoId(), 1, Integer::sum);
         });
 
-        // 4. 扫描调用图：只在「callee 是另一个仓库的入口点」时才计入跨库关系
-        //    这保证：① 热点方法一定是 Controller/RPC/MQ 等真实入口  ② 无同名误判
+        // 4. 扫描调用图，识别跨库调用：
+        //    优先路径：callee 是另一个库的 apiEndpoint 入口点（精确）
+        //    Fallback：callee 在 chunk 表中唯一归属另一个库（用于 GRPC/RPC 方法未注册为入口点的情况）
         Map<String, long[]> repoPairCount = new LinkedHashMap<>();
         Map<String, Map<String, long[]>> repoPairMethodMap = new LinkedHashMap<>();
 
@@ -423,21 +429,32 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
                 .forEach(c -> {
                     Long fromRepo = c.getRepoId();
-                    Map<Long, ApiEndpointEntity> targetEps = epByMethodAndRepo.get(c.getCalleeMethod());
-                    if (targetEps == null) return; // callee 不是任何仓库的入口点
+                    String callee = c.getCalleeMethod();
 
-                    for (Map.Entry<Long, ApiEndpointEntity> epEntry : targetEps.entrySet()) {
-                        Long toRepo = epEntry.getKey();
-                        if (toRepo.equals(fromRepo)) continue; // 调用同仓库自己的入口点，跳过
-
-                        String pairKey = fromRepo + "|" + toRepo;
-                        repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
-                        repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
-                                .computeIfAbsent(c.getCalleeMethod(), k -> new long[]{0})[0]++;
+                    // 优先：callee 是另一个库注册的入口点
+                    Map<Long, ApiEndpointEntity> targetEps = epByMethodAndRepo.get(callee);
+                    if (targetEps != null) {
+                        for (Map.Entry<Long, ApiEndpointEntity> epEntry : targetEps.entrySet()) {
+                            Long toRepo = epEntry.getKey();
+                            if (toRepo.equals(fromRepo)) continue;
+                            String pairKey = fromRepo + "|" + toRepo;
+                            repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
+                            repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
+                                    .computeIfAbsent(callee, k -> new long[]{0})[0]++;
+                        }
+                        return; // 已走入口点路径，不再 fallback
                     }
+
+                    // Fallback：callee 在 chunk 表中唯一归属另一个库
+                    Long toRepo = chunkMethodToRepo.get(callee);
+                    if (toRepo == null || toRepo == -1L || toRepo.equals(fromRepo)) return;
+                    String pairKey = fromRepo + "|" + toRepo;
+                    repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
+                    repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
+                            .computeIfAbsent(callee, k -> new long[]{0})[0]++;
                 });
 
-        // 5. 统计每个 repo 被其他仓库调用的入口点数（exposed）
+        // 5. 统计每个 repo 被其他仓库调用的方法数（exposed）
         Map<Long, Set<String>> exposedMethodSets = new HashMap<>();
         repoPairMethodMap.forEach((pairKey, methodMap) -> {
             Long toRepoId = Long.parseLong(pairKey.split("\\|")[1]);
@@ -452,7 +469,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             return new RepoNodeDTO(r.getId(), r.getName(), r.getStatus(), totalMethods, exposedMethods, entryPoints);
         }).collect(Collectors.toList());
 
-        // 7. 构建 RepoEdgeDTO，热点方法取 calleeRepo 对应的入口点信息
+        // 7. 构建 RepoEdgeDTO，推断 callType
         List<RepoEdgeDTO> edges = repoPairCount.entrySet().stream().map(e -> {
             String[] parts = e.getKey().split("\\|", 2);
             Long callerRepo = Long.parseLong(parts[0]);
@@ -479,13 +496,35 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                     })
                     .collect(Collectors.toList());
 
-            return new RepoEdgeDTO(callerRepo, calleeRepo, totalCount, methodCount, hotMethods);
+            // 聚合推断 callType
+            String callType = inferCallType(hotMethods, methodMap.keySet(), epByMethodAndRepo, calleeRepo);
+
+            return new RepoEdgeDTO(callerRepo, calleeRepo, totalCount, methodCount, hotMethods, callType);
         }).collect(Collectors.toList());
 
-        logger.info("[拓扑图] 仓库={} 仓库间调用边={} 跨库入口点方法数={}",
+        logger.info("[拓扑图] 仓库={} 仓库间调用边={} 跨库方法数={}",
                 repoNodes.size(), edges.size(),
                 repoPairMethodMap.values().stream().mapToInt(Map::size).sum());
         return new TopologyDTO(repoNodes, edges);
+    }
+
+    /** 根据热点方法的 endpointType 聚合推断边的调用类型标签 */
+    private String inferCallType(List<HotMethod> hotMethods, Set<String> allCallees,
+                                  Map<String, Map<Long, ApiEndpointEntity>> epByMethodAndRepo, Long calleeRepo) {
+        Set<String> types = new HashSet<>();
+        for (HotMethod hm : hotMethods) {
+            if (hm.endpointType() != null) {
+                String t = hm.endpointType();
+                if ("CONTROLLER".equals(t)) types.add("HTTP");
+                else if ("GRPC".equals(t)) types.add("RPC");
+                else if (t.contains("KAFKA") || t.contains("RABBIT") || t.contains("ROCKET") || "MQ".equals(t)) types.add("MQ");
+                else types.add("RPC");
+            }
+        }
+        // fallback：没有 endpoint 信息但有 callee，标记为 RPC
+        if (types.isEmpty() && !allCallees.isEmpty()) types.add("RPC");
+        if (types.size() > 1) return "MIXED";
+        return types.isEmpty() ? "RPC" : types.iterator().next();
     }
 
     /** 读取仓库级包前缀配置（analyze.package.prefix，支持逗号/分号/空白分隔的多个前缀）。 */

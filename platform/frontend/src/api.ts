@@ -923,6 +923,7 @@ export interface RepoEdgeDTO {
   callCount: number;
   methodCount: number;
   hotMethods: HotMethod[];
+  callType: string | null;  // RPC / HTTP / MQ / MIXED
 }
 
 export interface TopologyDTO {
