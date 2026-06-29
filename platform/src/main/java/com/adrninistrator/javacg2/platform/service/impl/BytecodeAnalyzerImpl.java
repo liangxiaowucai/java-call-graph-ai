@@ -2869,7 +2869,8 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             for (ChunkEntity chunk : chunkRepo.findByRepoId(repoId)) {
                 if (chunk.getClassName() != null && grpcServiceClasses.contains(chunk.getClassName())) {
                     if (chunk.getAccessFlags() != null && chunk.getAccessFlags().contains("public")
-                            && !seen.contains(chunk.getFullMethod())) {
+                            && !seen.contains(chunk.getFullMethod())
+                            && chunk.getMethodName() != null && !chunk.getMethodName().startsWith("<")) {
                         ApiEndpointEntity endpoint = new ApiEndpointEntity();
                         endpoint.setRepoId(repoId);
                         endpoint.setEndpointType("GRPC");
@@ -2988,6 +2989,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             // gRPC 服务
             if (grpcClasses.contains(chunk.getClassName())) {
                 if (chunk.getAccessFlags() != null && chunk.getAccessFlags().contains("public")
+                        && !methodName.startsWith("<")
                         && !methodName.startsWith("get") && !methodName.startsWith("set")) {
                     ApiEndpointEntity endpoint = new ApiEndpointEntity();
                     endpoint.setRepoId(repoId);

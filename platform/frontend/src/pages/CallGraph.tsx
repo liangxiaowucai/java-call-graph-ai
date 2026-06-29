@@ -280,8 +280,8 @@ function registerCustomNode() {
       },
       getAnchorPoints() {
         return [
-          [0, 0.5],
-          [1, 0.5],
+          [0.5, 0],
+          [0.5, 1],
         ];
       },
     },
@@ -290,6 +290,97 @@ function registerCustomNode() {
 }
 
 let customNodeRegistered = false;
+let customEdgeRegistered = false;
+
+// ─── Animated edge with flowing dot ──────────────────────────────────────────
+
+function registerAnimatedEdge() {
+  G6.registerEdge(
+    'animated-edge',
+    {
+      afterDraw(_cfg, group) {
+        if (!group) return;
+        const keyShape = group.get('children')[0];
+        if (!keyShape) return;
+
+        const dot = group.addShape('circle', {
+          attrs: { x: 0, y: 0, r: 2.5, fill: '#adb5bd', opacity: 0.28 },
+          name: 'flow-dot',
+        });
+
+        dot.animate(
+          (ratio: number) => {
+            try {
+              const p = keyShape.getPoint(ratio);
+              return p ? { x: p.x, y: p.y } : {};
+            } catch {
+              return {};
+            }
+          },
+          { repeat: true, duration: 2400 },
+        );
+      },
+
+      setState(name, value, item) {
+        if (!item || name !== 'active') return;
+        const group = item.getContainer();
+        if (!group) return;
+        const keyShape = group.get('children')[0];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const dot = group.find((el: any) => el.get('name') === 'flow-dot');
+
+        if (value) {
+          keyShape?.attr({
+            stroke: '#1890ff',
+            lineWidth: 2.5,
+            opacity: 1,
+            endArrow: { path: G6.Arrow.triangle(8, 8, 0), fill: '#1890ff' },
+          });
+          if (dot) {
+            dot.stopAnimate();
+            dot.attr({ r: 5, fill: '#1890ff', opacity: 1 });
+            const ks = keyShape;
+            dot.animate(
+              (ratio: number) => {
+                try {
+                  const p = ks.getPoint(ratio);
+                  return p ? { x: p.x, y: p.y } : {};
+                } catch {
+                  return {};
+                }
+              },
+              { repeat: true, duration: 800 },
+            );
+          }
+        } else {
+          keyShape?.attr({
+            stroke: '#c0c0c0',
+            lineWidth: 1,
+            opacity: 1,
+            endArrow: { path: G6.Arrow.triangle(6, 6, 0), fill: '#c0c0c0' },
+          });
+          if (dot) {
+            dot.stopAnimate();
+            dot.attr({ r: 2.5, fill: '#adb5bd', opacity: 0.28 });
+            const ks = keyShape;
+            dot.animate(
+              (ratio: number) => {
+                try {
+                  const p = ks.getPoint(ratio);
+                  return p ? { x: p.x, y: p.y } : {};
+                } catch {
+                  return {};
+                }
+              },
+              { repeat: true, duration: 2400 },
+            );
+          }
+        }
+      },
+    },
+    'cubic-vertical',
+  );
+}
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -383,6 +474,16 @@ export default function CallGraph() {
       setLoadingTree(false);
     }
   }, [selectedRepoId]);
+
+  // 切换调用链入口时清空已缓存的文档内容，避免展示旧入口的文档
+  const prevEntryRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevEntryRef.current !== selectedEntry) {
+      prevEntryRef.current = selectedEntry;
+      setDocContent('');
+      setDocDiagrams({});
+    }
+  }, [selectedEntry]);
 
   // 从 URL 参数自动加载调用树
   useEffect(() => {
@@ -505,21 +606,22 @@ export default function CallGraph() {
   const handleGenerateDoc = useCallback(async (type: 'product' | 'dev') => {
     if (!selectedRepoId || !selectedEntry) return;
     setDocType(type);
-    setDocLoading(true);
     setDocDrawerOpen(true);
+
+    // 同一入口、同类型文档已有内容则直接打开，不重复请求（后端已做缓存，但避免前端无意义的网络往返）
+    if (docContent && docType === type) return;
+
+    setDocLoading(true);
     try {
       if (type === 'product') {
-        // 只获取文档内容，图表按需加载
         const doc = await generateProductDoc(selectedRepoId, selectedEntry);
         setDocContent(doc);
-        setDocDiagrams({}); // 清空之前的图表
-        setSelectedDiagramType('sequence'); // 默认时序图
-        // 立即加载默认图表（时序图）
+        setSelectedDiagramType('sequence');
         loadDiagram('sequence');
       } else {
         const doc = await generateDevDoc(selectedRepoId, selectedEntry);
         setDocContent(doc);
-        setDocDiagrams({}); // 研发文档不需要图表切换
+        setDocDiagrams({});
       }
     } catch (err: unknown) {
       if (err instanceof Error) message.error(err.message);
@@ -527,7 +629,7 @@ export default function CallGraph() {
     } finally {
       setDocLoading(false);
     }
-  }, [selectedRepoId, selectedEntry]);
+  }, [selectedRepoId, selectedEntry, docContent, docType]);
 
   // 按需加载图表
   const loadDiagram = useCallback(async (diagramType: 'flowchart' | 'sequence' | 'swimlane') => {
@@ -564,6 +666,10 @@ export default function CallGraph() {
       registerCustomNode();
       customNodeRegistered = true;
     }
+    if (!customEdgeRegistered) {
+      registerAnimatedEdge();
+      customEdgeRegistered = true;
+    }
 
     // Reset counter and transform data
     nodeIdCounter = 0;
@@ -579,23 +685,38 @@ export default function CallGraph() {
     const width = container.clientWidth || 800;
     const height = container.clientHeight || 600;
 
+    // 节点数超过阈值时不 fitView，避免整图缩到看不清；Minimap 始终开启供全局导航
+    const isLargeGraph = (callTree?.totalNodes ?? 0) > 60;
+    const minimap = new G6.Minimap({
+      size: [180, 120],
+      type: 'keyShape',
+    });
+
     const graph = new G6.TreeGraph({
       container,
       width,
       height,
-      fitView: true,
+      fitView: !isLargeGraph,
       fitViewPadding: [40, 40, 40, 40],
       animate: true,
       animateCfg: { duration: 300 },
       modes: {
         default: ['drag-canvas', 'zoom-canvas', 'drag-node'],
       },
-      plugins: [],
+      plugins: [minimap],
+      nodeStateStyles: {
+        active: {
+          shadowColor: 'rgba(24,144,255,0.35)',
+          shadowBlur: 10,
+          stroke: '#1890ff',
+          lineWidth: 2,
+        },
+      },
       defaultNode: {
         type: 'call-node',
       },
       defaultEdge: {
-        type: 'cubic-horizontal',
+        type: 'animated-edge',
         style: {
           stroke: '#c0c0c0',
           lineWidth: 1,
@@ -607,7 +728,7 @@ export default function CallGraph() {
       },
       layout: {
         type: 'compactBox',
-        direction: 'LR',
+        direction: 'TB',
         getId: (d: G6Node) => d.id,
         getHeight: () => NODE_HEIGHT,
         getWidth: (d: G6Node) => {
@@ -615,8 +736,8 @@ export default function CallGraph() {
           const bw = (d.boundaries?.length ?? 0) * 12;
           return Math.max(NODE_MIN_WIDTH, textW + bw + 40);
         },
-        getVGap: () => 12,
-        getHGap: () => 60,
+        getVGap: () => 40,
+        getHGap: () => 20,
       },
     });
 
@@ -627,6 +748,26 @@ export default function CallGraph() {
         setDetailNode(model);
         setDetailDrawerOpen(true);
       }
+    });
+
+    // Node hover → highlight adjacent edges
+    graph.on('node:mouseenter', (evt) => {
+      const item = evt.item;
+      if (!item) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const edges = (item as any).getEdges?.() ?? [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      edges.forEach((edge: any) => graph.setItemState(edge, 'active', true));
+      graph.setItemState(item, 'active', true);
+    });
+    graph.on('node:mouseleave', (evt) => {
+      const item = evt.item;
+      if (!item) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const edges = (item as any).getEdges?.() ?? [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      edges.forEach((edge: any) => graph.setItemState(edge, 'active', false));
+      graph.setItemState(item, 'active', false);
     });
 
     // Collapse / expand on dblclick
@@ -642,7 +783,17 @@ export default function CallGraph() {
 
     graph.data(treeData);
     graph.render();
-    graph.fitView();
+    if (isLargeGraph) {
+      // 大图：定位到根节点并显示在顶部，不缩放到全图
+      const rootNode = graph.findById(treeData.id);
+      if (rootNode) {
+        graph.focusItem(rootNode);
+        // focusItem 把根节点居中，再上移让它出现在顶部附近
+        graph.translate(0, -(height / 2 - 80));
+      }
+    } else {
+      graph.fitView();
+    }
 
     graphRef.current = graph;
 

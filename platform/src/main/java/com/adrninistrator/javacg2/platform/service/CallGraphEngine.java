@@ -36,6 +36,43 @@ public interface CallGraphEngine {
     /** 获取方法源码 + 枚举解析 + 入参信息（含调用链上下文） */
     MethodSourceDTO getMethodSourceDetail(Long repoId, String fullMethod, String entryMethod);
 
+    // ── 仓库拓扑图 ────────────────────────────────────────────────────────────
+
+    /** 构建所有仓库间的调用拓扑图（聚合视图）：每个仓库为节点，边为仓库间调用聚合 */
+    TopologyDTO getTopology();
+
+    /** 聚合拓扑：仓库节点 + 仓库间聚合边 */
+    record TopologyDTO(List<RepoNodeDTO> repos, List<RepoEdgeDTO> edges) {}
+
+    /** 仓库节点 */
+    record RepoNodeDTO(
+        Long repoId,
+        String name,
+        String status,
+        int totalMethods,      // chunk 表中的方法总数
+        int exposedMethods,    // 被其他仓库调用的方法数
+        int entryPoints        // 入口点数量
+    ) {}
+
+    /** 仓库间聚合调用边 */
+    record RepoEdgeDTO(
+        Long callerRepoId,
+        Long calleeRepoId,
+        int callCount,                  // 调用边总数
+        int methodCount,                // 被调用的不同方法数
+        List<HotMethod> hotMethods      // 热点方法（Top 5）
+    ) {}
+
+    /** 热点被调用方法摘要 */
+    record HotMethod(
+        String fullMethod,
+        String shortName,
+        String endpointType,
+        String httpMethod,
+        String urlPath,
+        int callCount
+    ) {}
+
     // ── 跨库追踪 ──────────────────────────────────────────────────────────────
 
     /** 跨库影响分析：向上追踪所有仓库中调用该方法的链路，找出受影响的入口点 */

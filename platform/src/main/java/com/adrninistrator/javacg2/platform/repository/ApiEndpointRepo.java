@@ -9,6 +9,7 @@ public interface ApiEndpointRepo extends JpaRepository<ApiEndpointEntity, Long> 
     List<ApiEndpointEntity> findByRepoId(Long repoId);
     List<ApiEndpointEntity> findByRepoIdAndEndpointType(Long repoId, String endpointType);
     Optional<ApiEndpointEntity> findByRepoIdAndUrlPath(Long repoId, String urlPath);
-    Optional<ApiEndpointEntity> findByRepoIdAndFullMethod(Long repoId, String fullMethod);
+    Optional<ApiEndpointEntity> findFirstByRepoIdAndFullMethod(Long repoId, String fullMethod);
+    List<ApiEndpointEntity> findByFullMethod(String fullMethod);
     void deleteByRepoId(Long repoId);
 }

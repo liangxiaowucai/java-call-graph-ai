@@ -7,12 +7,14 @@ import {
   RobotOutlined,
   SettingOutlined,
   BugOutlined,
+  ShareAltOutlined,
 } from '@ant-design/icons';
 import RepoManager from './pages/RepoManager';
 import CallGraph from './pages/CallGraph';
 import QAChat from './pages/QAChat';
 import Settings from './pages/Settings';
 import RequestChainAnalyzer from './pages/RequestChainAnalyzer';
+import RepoTopology from './pages/RepoTopology';
 import OperationLogPanel from './components/OperationLogPanel';
 import { useOperationLog, type LogEntry } from './hooks/useOperationLog';
 
@@ -21,6 +23,7 @@ const { Sider, Content } = Layout;
 const menuItems = [
   { key: '/repos', icon: <DatabaseOutlined />, label: '仓库管理' },
   { key: '/callgraph', icon: <ApartmentOutlined />, label: '调用链分析' },
+  { key: '/topology', icon: <ShareAltOutlined />, label: '仓库拓扑' },
   { key: '/request-analyzer', icon: <BugOutlined />, label: '调用链追踪' },
   { key: '/qa', icon: <RobotOutlined />, label: 'AI 问答' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统配置' },
@@ -60,6 +63,7 @@ function AppLayout() {
             <Routes>
               <Route path="/repos" element={<RepoManager />} />
               <Route path="/callgraph" element={<CallGraph />} />
+              <Route path="/topology" element={<RepoTopology />} />
               <Route path="/request-analyzer" element={<RequestChainAnalyzer />} />
               <Route path="/qa" element={<QAChat />} />
               <Route path="/settings" element={<Settings />} />

@@ -28,13 +28,26 @@ public class DocGenerator {
     private final RepoConfigRepo repoConfigRepo;
     private final BuildLogService buildLogService;
     private final AnalysisDataExtractor analysisDataExtractor;
+    private final ExternalCallFormatter externalCallFormatter;
+
+    /** 产品文档缓存：key=repoId|entryMethod，TTL 10min，LRU 上限 100 */
+    private static final long PRODUCT_DOC_CACHE_TTL_MS = 10 * 60 * 1000L;
+    private record CachedDoc(String content, long ts) {}
+    private final Map<String, CachedDoc> productDocCache = Collections.synchronizedMap(
+            new LinkedHashMap<>() {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CachedDoc> eldest) {
+                    return size() > 100;
+                }
+            });
 
     public DocGenerator(CallGraphEngine callGraphEngine, BoundaryRepo boundaryRepo,
                          CallChainCodeGenerator codeGenerator, ClaudeApiClient claudeClient,
                          ApiEndpointRepo apiEndpointRepo, ChunkRepo chunkRepo,
                          RepositoryRepo repositoryRepo, ProjectInfoExtractor projectInfoExtractor,
                          RepoConfigRepo repoConfigRepo, BuildLogService buildLogService,
-                         AnalysisDataExtractor analysisDataExtractor) {
+                         AnalysisDataExtractor analysisDataExtractor,
+                         ExternalCallFormatter externalCallFormatter) {
         this.callGraphEngine = callGraphEngine;
         this.boundaryRepo = boundaryRepo;
         this.codeGenerator = codeGenerator;
@@ -46,6 +59,7 @@ public class DocGenerator {
         this.repoConfigRepo = repoConfigRepo;
         this.buildLogService = buildLogService;
         this.analysisDataExtractor = analysisDataExtractor;
+        this.externalCallFormatter = externalCallFormatter;
     }
 
     // AI 文档生成的 system prompt
@@ -1735,35 +1749,121 @@ public class DocGenerator {
      * 生成产品视角文档（业务流程图 + 业务逻辑说明）
      */
     public String generateProductDoc(Long repoId, String entryMethod) {
+        // 1. 缓存命中：调用链不变文档不变，直接返回
+        String cacheKey = repoId + "|" + entryMethod;
+        CachedDoc cached = productDocCache.get(cacheKey);
+        if (cached != null && System.currentTimeMillis() - cached.ts() < PRODUCT_DOC_CACHE_TTL_MS) {
+            logger.debug("[产品文档] 缓存命中 method={}", entryMethod);
+            return cached.content();
+        }
+
         CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, entryMethod, 15);
         if (tree.root() == null) return "接口未找到";
 
-        // 1. 获取入口点信息
-        var endpoint = apiEndpointRepo.findByRepoIdAndFullMethod(repoId, entryMethod).orElse(null);
+        // 2. 获取入口点信息
+        var endpoint = apiEndpointRepo.findFirstByRepoIdAndFullMethod(repoId, entryMethod).orElse(null);
         String entryDesc = buildEntryDescription(endpoint, entryMethod);
 
-        // 2. 提取业务节点和边界点
+        // 3. 提取业务节点和边界点
         List<BoundaryEntity> boundaries = collectBoundaries(repoId, tree.root());
         List<BusinessNode> businessNodes = extractBusinessNodesWithBoundaries(tree.root(), boundaries);
 
-        // 3. 收集调用链中的所有方法
+        // 4. 收集调用链中的所有方法
         List<String> allMethods = new ArrayList<>();
         collectAllMethods(tree.root(), new HashSet<>(), allMethods);
 
-        // 4. 分析数据流转
+        // 5. 分析数据流转
         DataFlowSummary dataFlow = analyzeDataFlow(boundaries);
 
-        // 5. 尝试用 AI 生成（如果配置了）
+        // 6. 用 collectExternalCalls + ExternalCallFormatter 生成完整外部依赖汇总
+        String depSummary = buildExternalDepSummary(repoId, entryMethod);
+
+        String result;
+        // 7. 尝试用 AI 生成（如果配置了）
         if (claudeClient.isConfigured()) {
             try {
-                return generateProductDocWithAI(repoId, tree.root(), entryDesc, businessNodes, dataFlow, boundaries, allMethods);
+                result = generateProductDocWithAI(repoId, tree.root(), entryDesc, businessNodes, dataFlow, boundaries, allMethods, depSummary);
             } catch (Exception e) {
                 logger.warn("AI 生成产品文档失败，使用模板生成", e);
+                result = generateProductDocTemplateWithBoundaries(repoId, entryDesc, businessNodes, dataFlow, boundaries, allMethods, depSummary);
+            }
+        } else {
+            // 8. Fallback: 模板生成
+            result = generateProductDocTemplateWithBoundaries(repoId, entryDesc, businessNodes, dataFlow, boundaries, allMethods, depSummary);
+        }
+
+        productDocCache.put(cacheKey, new CachedDoc(result, System.currentTimeMillis()));
+        return result;
+    }
+
+    /**
+     * 用 collectExternalCalls + ExternalCallFormatter 构建外部依赖汇总文本，
+     * 复用 ChainOutlineService 的相同逻辑，保证 HTTP/MQ/CACHE/GRPC/DB 全部列出且含 context 详情。
+     */
+    private String buildExternalDepSummary(Long repoId, String entryMethod) {
+        Map<String, List<CallGraphEngine.BoundaryDTO>> external;
+        try {
+            external = callGraphEngine.collectExternalCalls(repoId, entryMethod);
+        } catch (Exception e) {
+            logger.warn("[产品文档] collectExternalCalls 失败 method={}: {}", entryMethod, e.getMessage());
+            return "";
+        }
+        if (external.isEmpty()) return "";
+
+        // type -> 去重条目（方法简称 + 明细）
+        Map<String, LinkedHashSet<String>> depAgg = new LinkedHashMap<>();
+        for (var entry : external.entrySet()) {
+            String fullMethod = entry.getKey();
+            String ref = shortMethod(fullMethod);
+            List<CallGraphEngine.BoundaryDTO> bdList = entry.getValue();
+
+            // HTTP/GRPC：优先用 ExternalCallFormatter 装配完整 URL（含系统名+用途）
+            boolean hasHttp = bdList.stream()
+                    .anyMatch(b -> "HTTP".equals(b.boundaryType()) || "GRPC".equals(b.boundaryType()));
+            Set<String> httpRendered = new LinkedHashSet<>();
+            if (hasHttp) {
+                ChunkEntity chunk = chunkRepo.findByRepoIdAndFullMethod(repoId, fullMethod).orElse(null);
+                if (chunk != null) {
+                    for (var call : externalCallFormatter.extract(chunk)) {
+                        httpRendered.add(call.render());
+                    }
+                }
+            }
+
+            for (var b : bdList) {
+                String type = b.boundaryType();
+                if (type == null || type.isBlank()) continue;
+                if (("HTTP".equals(type) || "GRPC".equals(type)) && !httpRendered.isEmpty()) continue;
+                String ctx = b.context() != null ? b.context().replaceAll("\\s+", " ").trim() : "";
+                if (ctx.length() > 300) ctx = ctx.substring(0, 300) + "…";
+                depAgg.computeIfAbsent(type, k -> new LinkedHashSet<>())
+                      .add(ref + (ctx.isEmpty() ? "" : " — " + ctx));
+            }
+            for (String rendered : httpRendered) {
+                depAgg.computeIfAbsent("HTTP", k -> new LinkedHashSet<>()).add(ref + " — " + rendered);
             }
         }
 
-        // 6. Fallback: 模板生成
-        return generateProductDocTemplateWithBoundaries(repoId, entryDesc, businessNodes, dataFlow, boundaries, allMethods);
+        if (depAgg.isEmpty()) return "";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# 外部依赖详情（从调用链静态分析提取）\n\n");
+        for (var entry : depAgg.entrySet()) {
+            String label = switch (entry.getKey()) {
+                case "HTTP"  -> "HTTP 外部调用";
+                case "GRPC"  -> "gRPC / RPC 调用";
+                case "MQ"    -> "消息队列（MQ）";
+                case "CACHE" -> "缓存（Redis）";
+                case "DB"    -> "数据库操作";
+                default      -> entry.getKey();
+            };
+            sb.append("## ").append(label).append("\n\n");
+            for (String line : entry.getValue()) {
+                sb.append("- ").append(line).append("\n");
+            }
+            sb.append("\n");
+        }
+        return sb.toString();
     }
     
     private void collectAllMethods(CallGraphEngine.CallTreeNodeDTO node, Set<String> visited, List<String> result) {
@@ -1779,49 +1879,35 @@ public class DocGenerator {
     /**
      * AI 生成产品文档（增强版：Mermaid 图代码生成 + 业务描述 AI 生成）
      */
-    private String generateProductDocWithAI(Long repoId, CallGraphEngine.CallTreeNodeDTO root, String entryDesc, 
-                                             List<BusinessNode> nodes, DataFlowSummary dataFlow, 
-                                             List<BoundaryEntity> boundaries, List<String> allMethods) {
+    private String generateProductDocWithAI(Long repoId, CallGraphEngine.CallTreeNodeDTO root, String entryDesc,
+                                             List<BusinessNode> nodes, DataFlowSummary dataFlow,
+                                             List<BoundaryEntity> boundaries, List<String> allMethods,
+                                             String depSummary) {
         // 1. 代码生成 Mermaid 时序图（稳定可靠，基于调用链树）
         logger.info("[产品文档] 开始生成 Mermaid 时序图，节点数: {}", nodes.size());
         String sequenceDiagram = generateTechnicalSequenceDiagram(root, repoId);
         logger.info("[产品文档] Mermaid 图生成完成，长度: {}", sequenceDiagram.length());
         logger.debug("[产品文档] Mermaid 图内容:\n{}", sequenceDiagram);
-        
+
         // 2. AI 生成业务描述（不包含图表）
         logger.info("[产品文档] 开始调用 AI 生成业务描述");
-        String prompt = buildProductDocPromptWithoutDiagram(repoId, entryDesc, nodes, dataFlow, boundaries, allMethods);
+        String prompt = buildProductDocPromptWithBoundaries(repoId, entryDesc, nodes, dataFlow, boundaries, allMethods, depSummary);
         String aiContent = claudeClient.chat(PRODUCT_DOC_SYSTEM_PROMPT_WITHOUT_DIAGRAM, List.of(
             Map.of("role", "user", "content", prompt)
         ));
         logger.info("[产品文档] AI 生成完成，内容长度: {}", aiContent.length());
         logger.debug("[产品文档] AI 返回内容:\n{}", aiContent);
-        
+
         // 3. 直接在开头插入 Mermaid 图，然后追加 AI 内容
         StringBuilder result = new StringBuilder();
-        
-        // 添加标题和业务流程图
         result.append("## 业务流程图\n\n");
         result.append(sequenceDiagram).append("\n\n");
-        
-        // 追加 AI 生成的业务描述
         result.append(aiContent);
-        
-        String finalDoc = result.toString();
-        logger.info("[产品文档] 最终文档生成完成，总长度: {}, 是否包含mermaid: {}", 
-                    finalDoc.length(), finalDoc.contains("```mermaid"));
-        
-        return finalDoc;
-    }
 
-    /**
-     * 构建不包含图表生成要求的 AI Prompt
-     */
-    private String buildProductDocPromptWithoutDiagram(Long repoId, String entryDesc, List<BusinessNode> nodes,
-                                                        DataFlowSummary dataFlow, List<BoundaryEntity> boundaries,
-                                                        List<String> allMethods) {
-        // 复用原有的 prompt 构建逻辑，但移除图表生成要求
-        return buildProductDocPromptWithBoundaries(repoId, entryDesc, nodes, dataFlow, boundaries, allMethods);
+        String finalDoc = result.toString();
+        logger.info("[产品文档] 最终文档生成完成，总长度: {}, 是否包含mermaid: {}",
+                    finalDoc.length(), finalDoc.contains("```mermaid"));
+        return finalDoc;
     }
 
     // Product doc system prompt (不要求 AI 生成图表)
@@ -1953,16 +2039,16 @@ public class DocGenerator {
         """;
 
     /**
-     * 构建产品文档 AI prompt - 增强版，包含边界点异常详情和真实常量数据
+     * 构建产品文档 AI prompt - 增强版，包含外部依赖详情、边界点异常详情和真实常量数据
      */
-    private String buildProductDocPromptWithBoundaries(Long repoId, String entryDesc, List<BusinessNode> nodes, 
+    private String buildProductDocPromptWithBoundaries(Long repoId, String entryDesc, List<BusinessNode> nodes,
                                                         DataFlowSummary dataFlow, List<BoundaryEntity> boundaries,
-                                                        List<String> allMethods) {
+                                                        List<String> allMethods, String depSummary) {
         StringBuilder prompt = new StringBuilder();
-        
+
         prompt.append("# 接口信息\n\n");
         prompt.append(entryDesc).append("\n\n");
-        
+
         prompt.append("# 业务处理步骤\n\n");
         prompt.append("以下是代码中的关键业务逻辑节点（已去除纯技术组件）：\n\n");
         for (int i = 0; i < nodes.size(); i++) {
@@ -1974,24 +2060,32 @@ public class DocGenerator {
             prompt.append("\n");
         }
         prompt.append("\n");
-        
+
+        // 外部依赖详情（HTTP URL / MQ Topic / Redis key / gRPC 服务）
+        if (depSummary != null && !depSummary.isBlank()) {
+            prompt.append(depSummary).append("\n");
+        }
+
         // 添加枚举常量信息（从静态分析提取）
         List<AnalysisDataExtractor.EnumConstant> enums = analysisDataExtractor.extractEnumConstantsFromChain(repoId, allMethods);
         if (!enums.isEmpty()) {
             prompt.append("# 枚举常量（从源码静态分析提取）\n\n");
             prompt.append("调用链中使用了以下枚举常量：\n\n");
-            
+
             Map<String, List<AnalysisDataExtractor.EnumConstant>> byClass = new LinkedHashMap<>();
             for (var e : enums) {
-                String shortClass = e.enumClass().contains(".") ? 
+                String shortClass = e.enumClass().contains(".") ?
                     e.enumClass().substring(e.enumClass().lastIndexOf('.') + 1) : e.enumClass();
                 byClass.computeIfAbsent(shortClass, k -> new ArrayList<>()).add(e);
             }
-            
+
             for (Map.Entry<String, List<AnalysisDataExtractor.EnumConstant>> entry : byClass.entrySet()) {
                 prompt.append("**").append(entry.getKey()).append("**：\n");
                 for (var e : entry.getValue()) {
                     prompt.append("- `").append(e.constName()).append("`");
+                    if (!e.code().isEmpty()) {
+                        prompt.append("（code=").append(e.code()).append("）");
+                    }
                     if (!e.description().isEmpty()) {
                         prompt.append("：").append(e.description());
                     }
@@ -2000,22 +2094,22 @@ public class DocGenerator {
                 prompt.append("\n");
             }
         }
-        
+
         // 添加方法中使用的常量
         List<AnalysisDataExtractor.MethodConstantUsage> constants = analysisDataExtractor.extractMethodConstantsFromChain(repoId, allMethods);
         if (!constants.isEmpty()) {
             prompt.append("# 使用的常量（从源码静态分析提取）\n\n");
             for (var c : constants) {
-                String shortMethod = shortMethod(c.fullMethod());
+                String shortMd = shortMethod(c.fullMethod());
                 prompt.append("- **").append(c.constantName()).append("**");
                 if (!c.constantValue().isEmpty()) {
                     prompt.append(" = `").append(c.constantValue()).append("`");
                 }
-                prompt.append(" (见 `").append(shortMethod).append("`)\n");
+                prompt.append(" (见 `").append(shortMd).append("`)\n");
             }
             prompt.append("\n");
         }
-        
+
         prompt.append("# 数据操作\n\n");
         if (!dataFlow.inserts().isEmpty()) {
             prompt.append("**新增数据：** ").append(String.join("、", dataFlow.inserts())).append("\n\n");
@@ -2035,7 +2129,7 @@ public class DocGenerator {
         if (!dataFlow.messages().isEmpty()) {
             prompt.append("**发送消息：** ").append(String.join("、", dataFlow.messages())).append("\n\n");
         }
-        
+
         // 添加异常信息（从边界点提取）
         List<ExceptionInfo> exceptions = extractExceptionsFromBoundaries(boundaries);
         if (!exceptions.isEmpty()) {
@@ -2052,7 +2146,7 @@ public class DocGenerator {
             }
             prompt.append("\n");
         }
-        
+
         prompt.append("---\n\n");
         prompt.append("## ⚠️ 重要提示\n\n");
         prompt.append("上面已经提供了从源码静态分析提取的枚举常量和使用的常量，请在文档中使用这些**真实数据**：\n\n");
@@ -2060,10 +2154,11 @@ public class DocGenerator {
         prompt.append("2. **常量定义** - 使用上面提供的常量列表\n");
         prompt.append("3. **错误码** - 使用上面提供的异常场景列表\n");
         prompt.append("4. **业务阈值** - 如果源码中有数字常量，在上面的常量列表中会显示\n");
-        prompt.append("5. **枚举说明** - 直接使用上面枚举常量后面的中文描述\n\n");
-        prompt.append("**禁止编造任何不在上述列表中的枚举值、常量或错误码！**\n\n");
+        prompt.append("5. **枚举说明** - 直接使用上面枚举常量后面的中文描述\n");
+        prompt.append("6. **外部依赖** - 使用上面[外部依赖详情]章节中的真实 URL、Topic、Redis key，不要编造\n\n");
+        prompt.append("**禁止编造任何不在上述列表中的枚举值、常量、错误码或外部依赖！**\n\n");
         prompt.append("请基于以上信息，生成产品需求文档，必须包含带主题配置的 Mermaid 流程图、业务逻辑说明、判断条件详情表（使用真实枚举值）、错误码表。\n");
-        
+
         return prompt.toString();
     }
     
@@ -2072,19 +2167,19 @@ public class DocGenerator {
      */
     private String generateProductDocTemplateWithBoundaries(Long repoId, String entryDesc, List<BusinessNode> nodes,
                                                             DataFlowSummary dataFlow, List<BoundaryEntity> boundaries,
-                                                            List<String> allMethods) {
+                                                            List<String> allMethods, String depSummary) {
         StringBuilder sb = new StringBuilder();
-        
+
         // 1. 功能概述
         sb.append("# 产品文档\n\n");
         sb.append("## 功能概述\n\n");
         sb.append(entryDesc).append("\n\n");
-        
+
         // 2. 业务流程图
         sb.append("## 业务流程\n\n");
         sb.append(generateMermaidFlowchart(nodes, dataFlow));
         sb.append("\n\n");
-        
+
         // 3. 主要业务逻辑
         sb.append("## 主要业务逻辑\n\n");
         for (int i = 0; i < nodes.size(); i++) {
@@ -2096,12 +2191,12 @@ public class DocGenerator {
             sb.append("\n");
         }
         sb.append("\n");
-        
+
         // 4. 业务规则详情（从源码提取真实数据）
         sb.append("## 业务规则与判断条件\n\n");
         sb.append(extractBusinessRulesWithRealData(repoId, nodes, allMethods));
         sb.append("\n");
-        
+
         // 5. 数据变更
         sb.append("## 数据变更\n\n");
         boolean hasDataChanges = false;
@@ -2125,14 +2220,18 @@ public class DocGenerator {
             sb.append("未检测到数据库操作\n");
         }
         sb.append("\n");
-        
+
         // 6. 异常与错误码（从边界点提取）
         sb.append("## 异常场景与错误码\n\n");
         sb.append(extractExceptionInfoFromBoundaries(boundaries));
         sb.append("\n");
-        
-        // 7. 外部依赖
-        if (!dataFlow.externalCalls().isEmpty() || !dataFlow.messages().isEmpty()) {
+
+        // 7. 外部依赖（优先展示完整依赖详情，无则退回 dataFlow 摘要）
+        if (depSummary != null && !depSummary.isBlank()) {
+            sb.append("## 外部交互\n\n");
+            sb.append(depSummary);
+            sb.append("\n");
+        } else if (!dataFlow.externalCalls().isEmpty() || !dataFlow.messages().isEmpty()) {
             sb.append("## 外部交互\n\n");
             if (!dataFlow.externalCalls().isEmpty()) {
                 sb.append("- **调用外部服务：** ").append(String.join("、", dataFlow.externalCalls())).append("\n");
@@ -2142,9 +2241,9 @@ public class DocGenerator {
             }
             sb.append("\n");
         }
-        
+
         sb.append("> 💡 提示：配置 Claude API 可获得更详细的业务逻辑说明和异常场景分析\n");
-        
+
         return sb.toString();
     }
     
@@ -2169,20 +2268,21 @@ public class DocGenerator {
         // 枚举常量表
         if (!enums.isEmpty()) {
             sb.append("### 使用的枚举常量\n\n");
-            sb.append("| 枚举类 | 常量名 | 说明 |\n");
-            sb.append("|--------|--------|------|\n");
-            
+            sb.append("| 枚举类 | 常量名 | code | 说明 |\n");
+            sb.append("|--------|--------|------|------|\n");
+
             Map<String, List<AnalysisDataExtractor.EnumConstant>> byClass = new LinkedHashMap<>();
             for (var e : enums) {
-                String shortClass = e.enumClass().contains(".") ? 
+                String shortClass = e.enumClass().contains(".") ?
                     e.enumClass().substring(e.enumClass().lastIndexOf('.') + 1) : e.enumClass();
                 byClass.computeIfAbsent(shortClass, k -> new ArrayList<>()).add(e);
             }
-            
+
             for (Map.Entry<String, List<AnalysisDataExtractor.EnumConstant>> entry : byClass.entrySet()) {
                 for (var e : entry.getValue()) {
                     sb.append("| `").append(entry.getKey()).append("` | ");
                     sb.append("`").append(e.constName()).append("` | ");
+                    sb.append(e.code().isEmpty() ? "-" : "`" + e.code() + "`").append(" | ");
                     sb.append(e.description().isEmpty() ? "-" : e.description()).append(" |\n");
                 }
             }
@@ -2454,28 +2554,34 @@ public class DocGenerator {
      */
     private List<ExceptionInfo> extractExceptionsFromBoundaries(List<BoundaryEntity> boundaries) {
         List<ExceptionInfo> exceptions = new ArrayList<>();
-        
+
         for (BoundaryEntity b : boundaries) {
-            if ("EXCEPTION".equals(b.getBoundaryType()) && b.getContext() != null) {
-                String[] lines = b.getContext().split("\n");
-                String exceptionType = lines[0].trim();
-                String message = "";
-                String trigger = "";
-                
-                // 尝试从 context 中提取异常信息
-                for (String line : lines) {
-                    if (line.trim().startsWith("Message:") || line.trim().startsWith("message:")) {
-                        message = line.substring(line.indexOf(':') + 1).trim();
-                    } else if (line.trim().startsWith("Condition:") || line.trim().startsWith("condition:")) {
-                        trigger = line.substring(line.indexOf(':') + 1).trim();
-                    }
+            if (!"EXCEPTION".equals(b.getBoundaryType()) || b.getContext() == null) continue;
+
+            String[] lines = b.getContext().split("\n");
+            // 第一行格式：「throw 行号」或「catch 行号」，取第一个 token 作为类型
+            String firstLine = lines[0].trim();
+            String kind = firstLine.contains(" ") ? firstLine.substring(0, firstLine.indexOf(' ')) : firstLine;
+            String exceptionType = kind; // throw / catch
+
+            String message = "";  // 📝 行：源码内容（含错误码调用）
+            String trigger = "";  // → 行：已解析的枚举值 e.g. (4004, "商品不存在")
+
+            for (String line : lines) {
+                String t = line.trim();
+                if (t.startsWith("📝")) {
+                    String src = t.substring("📝".length()).trim();
+                    if (!src.isEmpty() && src.length() < 200) message = src;
+                } else if (t.startsWith("→")) {
+                    String resolved = t.substring("→".length()).trim();
+                    if (!resolved.isEmpty() && resolved.length() < 200) trigger = resolved;
                 }
-                
-                String location = shortMethod(b.getFullMethod());
-                exceptions.add(new ExceptionInfo(exceptionType, message, trigger, location));
             }
+
+            String location = shortMethod(b.getFullMethod());
+            exceptions.add(new ExceptionInfo(exceptionType, message, trigger, location));
         }
-        
+
         return exceptions;
     }
     

@@ -35,60 +35,66 @@ public class AnalysisDataExtractorImpl implements AnalysisDataExtractor {
     public List<EnumConstant> extractEnumConstantsFromChain(Long repoId, List<String> methods) {
         Path outputDir = getAnalysisOutputDir(repoId);
         if (outputDir == null) return List.of();
-        
+
         Set<String> methodSet = new HashSet<>(methods);
-        Map<String, EnumConstant> enumMap = new LinkedHashMap<>();
-        
+
         // 1. 读取枚举定义：enum_init_assign_info.txt
         //    格式: enumClass:constructor | constName | ordinal | argSeq | valueType | arrayDim | value
-        Map<String, Map<String, String>> enumDefinitions = new HashMap<>(); // enumClass -> (constName -> description)
+        //    同一枚举常量有多行（每个构造参数一行），需要按 (enumClass, constName) 合并：
+        //    - Integer/int 类型参数 → code 值
+        //    - String 类型且长度>=2 → description
+        // key: "enumClass|constName"  value: [code, description]
+        Map<String, String[]> enumRaw = new LinkedHashMap<>(); // value: [ordinal, code, description]
+
         for (String line : readTsvFile(outputDir, "enum_init_assign_info")) {
             String[] cols = line.split("\t");
             if (cols.length < 7) continue;
-            
+
             String enumMethod = cols[0];
             String constName = cols[1];
             String ordinal = cols[2];
-            String argSeq = cols[3];
+            String valueType = cols[4];
             String value = cols[6];
-            
-            String enumClass = enumMethod.contains(":") ? enumMethod.substring(0, enumMethod.lastIndexOf(':')) : enumMethod;
-            
-            // 只提取字符串类型的描述值（中文说明）
-            if (value != null && !value.isBlank() && value.length() >= 2) {
-                enumDefinitions.computeIfAbsent(enumClass, k -> new LinkedHashMap<>()).put(constName, value);
-            }
-        }
-        
-        // 2. 读取方法中使用的静态字段（枚举常量）：method_call_static_field.txt
-        //    格式: callId | ? | ? | fieldClass | fieldName | fieldType | callerMethod | returnType | lineNum
-        for (String line : readTsvFile(outputDir, "method_call_static_field")) {
-            String[] cols = line.split("\t");
-            if (cols.length < 7) continue;
-            
-            String fieldClass = cols[3];
-            String fieldName = cols[4];
-            String callerMethod = cols[6];
-            
-            // 只处理调用链中的方法
-            if (!methodSet.contains(callerMethod)) continue;
-            
-            // 检查是否是枚举类
-            Map<String, String> enumDef = enumDefinitions.get(fieldClass);
-            if (enumDef != null) {
-                String description = enumDef.getOrDefault(fieldName, "");
-                String key = fieldClass + "." + fieldName;
-                if (!enumMap.containsKey(key)) {
-                    enumMap.put(key, new EnumConstant(fieldClass, fieldName, "", description));
+
+            String enumClass = enumMethod.contains(":")
+                ? enumMethod.substring(0, enumMethod.lastIndexOf(':')) : enumMethod;
+            String key = enumClass + "|" + constName;
+
+            String[] entry = enumRaw.computeIfAbsent(key, k -> new String[]{ordinal, "", ""});
+            // entry[0]=ordinal, entry[1]=code, entry[2]=description
+            if (value != null && !value.isBlank()) {
+                if ("java.lang.Integer".equals(valueType) || "int".equals(valueType)
+                        || "java.lang.Long".equals(valueType) || "long".equals(valueType)) {
+                    if (entry[1].isEmpty()) entry[1] = value; // 取第一个整型参数作为 code
+                } else if (valueType != null && valueType.contains("String") && value.length() >= 2) {
+                    if (entry[2].isEmpty()) entry[2] = value; // 取第一个字符串参数作为 description
                 }
             }
         }
-        
-        // 3. 读取枚举常量的 code 值（如果有）：field_info.txt
-        //    格式: className | fieldName | fieldType | ... 
-        // 注意：这里无法直接获取 code 值，需要从枚举定义中推断
-        // 暂时使用 ordinal 作为 code，如果有更准确的code定义需要额外解析
-        
+
+        // 2. 读取方法中使用的静态字段（枚举常量）：method_call_static_field.txt
+        Map<String, EnumConstant> enumMap = new LinkedHashMap<>();
+        for (String line : readTsvFile(outputDir, "method_call_static_field")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 7) continue;
+
+            String fieldClass = cols[3];
+            String fieldName = cols[4];
+            String callerMethod = cols[6];
+
+            if (!methodSet.contains(callerMethod)) continue;
+
+            String key = fieldClass + "|" + fieldName;
+            String[] raw = enumRaw.get(key);
+            if (raw != null) {
+                String code = raw[1].isEmpty() ? raw[0] : raw[1]; // 有整型 code 用 code，否则用 ordinal
+                String description = raw[2];
+                if (!enumMap.containsKey(key)) {
+                    enumMap.put(key, new EnumConstant(fieldClass, fieldName, code, description));
+                }
+            }
+        }
+
         return new ArrayList<>(enumMap.values());
     }
     
@@ -163,36 +169,47 @@ public class AnalysisDataExtractorImpl implements AnalysisDataExtractor {
     public Map<String, List<EnumConstant>> extractAllEnums(Long repoId) {
         Path outputDir = getAnalysisOutputDir(repoId);
         if (outputDir == null) return Map.of();
-        
-        Map<String, List<EnumConstant>> result = new LinkedHashMap<>();
-        
-        // 读取枚举定义：enum_init_assign_info.txt
-        //    格式: enumClass:constructor | constName | ordinal | argSeq | valueType | arrayDim | value
+
+        // key: "enumClass|constName"  value: [ordinal, code, description]
+        Map<String, String[]> enumRaw = new LinkedHashMap<>();
+
         for (String line : readTsvFile(outputDir, "enum_init_assign_info")) {
             String[] cols = line.split("\t");
             if (cols.length < 7) continue;
-            
+
             String enumMethod = cols[0];
             String constName = cols[1];
             String ordinal = cols[2];
-            String argSeq = cols[3];
+            String valueType = cols[4];
             String value = cols[6];
-            
-            String enumClass = enumMethod.contains(":") ? enumMethod.substring(0, enumMethod.lastIndexOf(':')) : enumMethod;
-            
-            // 提取描述值
-            String description = "";
-            if (value != null && !value.isBlank() && value.length() >= 2) {
-                description = value;
+
+            String enumClass = enumMethod.contains(":")
+                ? enumMethod.substring(0, enumMethod.lastIndexOf(':')) : enumMethod;
+            String key = enumClass + "|" + constName;
+
+            String[] entry = enumRaw.computeIfAbsent(key, k -> new String[]{ordinal, "", ""});
+            if (value != null && !value.isBlank()) {
+                if ("java.lang.Integer".equals(valueType) || "int".equals(valueType)
+                        || "java.lang.Long".equals(valueType) || "long".equals(valueType)) {
+                    if (entry[1].isEmpty()) entry[1] = value;
+                } else if (valueType != null && valueType.contains("String") && value.length() >= 2) {
+                    if (entry[2].isEmpty()) entry[2] = value;
+                }
             }
-            
-            // 使用 ordinal 作为 code（因为真正的 code 值需要更复杂的解析）
-            String code = ordinal;
-            
+        }
+
+        Map<String, List<EnumConstant>> result = new LinkedHashMap<>();
+        for (Map.Entry<String, String[]> e : enumRaw.entrySet()) {
+            String[] parts = e.getKey().split("\\|", 2);
+            String enumClass = parts[0];
+            String constName = parts[1];
+            String[] raw = e.getValue();
+            String code = raw[1].isEmpty() ? raw[0] : raw[1];
+            String description = raw[2];
             result.computeIfAbsent(enumClass, k -> new ArrayList<>())
                   .add(new EnumConstant(enumClass, constName, code, description));
         }
-        
+
         return result;
     }
     

@@ -394,6 +394,100 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return result;
     }
 
+    @Override
+    public TopologyDTO getTopology() {
+        // 1. 所有仓库基本信息
+        List<RepositoryEntity> repos = repositoryRepo.findAll();
+
+        // 2. 统计每个 repo 的方法总数（chunk 表）
+        Map<Long, Integer> repoMethodCount = new HashMap<>();
+        chunkRepo.findAll().forEach(c -> repoMethodCount.merge(c.getRepoId(), 1, Integer::sum));
+
+        // 3. 入口点双重索引：fullMethod -> Map<repoId, ApiEndpointEntity>
+        // 用于精确判断「callee 是哪个仓库的入口点」，彻底避免同名方法误连无关仓库
+        Map<String, Map<Long, ApiEndpointEntity>> epByMethodAndRepo = new HashMap<>();
+        Map<Long, Integer> repoEntryCount = new HashMap<>();
+        apiEndpointRepo.findAll().forEach(ep -> {
+            epByMethodAndRepo.computeIfAbsent(ep.getFullMethod(), k -> new HashMap<>())
+                    .put(ep.getRepoId(), ep);
+            repoEntryCount.merge(ep.getRepoId(), 1, Integer::sum);
+        });
+
+        // 4. 扫描调用图：只在「callee 是另一个仓库的入口点」时才计入跨库关系
+        //    这保证：① 热点方法一定是 Controller/RPC/MQ 等真实入口  ② 无同名误判
+        Map<String, long[]> repoPairCount = new LinkedHashMap<>();
+        Map<String, Map<String, long[]>> repoPairMethodMap = new LinkedHashMap<>();
+
+        callGraphRepo.findAll().stream()
+                .filter(c -> c.getEnabled() != null && c.getEnabled())
+                .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                .forEach(c -> {
+                    Long fromRepo = c.getRepoId();
+                    Map<Long, ApiEndpointEntity> targetEps = epByMethodAndRepo.get(c.getCalleeMethod());
+                    if (targetEps == null) return; // callee 不是任何仓库的入口点
+
+                    for (Map.Entry<Long, ApiEndpointEntity> epEntry : targetEps.entrySet()) {
+                        Long toRepo = epEntry.getKey();
+                        if (toRepo.equals(fromRepo)) continue; // 调用同仓库自己的入口点，跳过
+
+                        String pairKey = fromRepo + "|" + toRepo;
+                        repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
+                        repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
+                                .computeIfAbsent(c.getCalleeMethod(), k -> new long[]{0})[0]++;
+                    }
+                });
+
+        // 5. 统计每个 repo 被其他仓库调用的入口点数（exposed）
+        Map<Long, Set<String>> exposedMethodSets = new HashMap<>();
+        repoPairMethodMap.forEach((pairKey, methodMap) -> {
+            Long toRepoId = Long.parseLong(pairKey.split("\\|")[1]);
+            exposedMethodSets.computeIfAbsent(toRepoId, k -> new HashSet<>()).addAll(methodMap.keySet());
+        });
+
+        // 6. 构建 RepoNodeDTO
+        List<RepoNodeDTO> repoNodes = repos.stream().map(r -> {
+            int totalMethods = repoMethodCount.getOrDefault(r.getId(), 0);
+            int exposedMethods = exposedMethodSets.getOrDefault(r.getId(), Set.of()).size();
+            int entryPoints = repoEntryCount.getOrDefault(r.getId(), 0);
+            return new RepoNodeDTO(r.getId(), r.getName(), r.getStatus(), totalMethods, exposedMethods, entryPoints);
+        }).collect(Collectors.toList());
+
+        // 7. 构建 RepoEdgeDTO，热点方法取 calleeRepo 对应的入口点信息
+        List<RepoEdgeDTO> edges = repoPairCount.entrySet().stream().map(e -> {
+            String[] parts = e.getKey().split("\\|", 2);
+            Long callerRepo = Long.parseLong(parts[0]);
+            Long calleeRepo = Long.parseLong(parts[1]);
+            int totalCount = (int) e.getValue()[0];
+
+            Map<String, long[]> methodMap = repoPairMethodMap.getOrDefault(e.getKey(), Map.of());
+            int methodCount = methodMap.size();
+
+            List<HotMethod> hotMethods = methodMap.entrySet().stream()
+                    .sorted(Comparator.comparingLong((Map.Entry<String, long[]> me) -> me.getValue()[0]).reversed())
+                    .limit(5)
+                    .map(me -> {
+                        String callee = me.getKey();
+                        int cnt = (int) me.getValue()[0];
+                        ApiEndpointEntity ep = epByMethodAndRepo
+                                .getOrDefault(callee, Map.of()).get(calleeRepo);
+                        return new HotMethod(
+                                callee, shortRef(callee),
+                                ep != null ? ep.getEndpointType() : null,
+                                ep != null ? ep.getHttpMethod() : null,
+                                ep != null ? ep.getUrlPath() : null,
+                                cnt);
+                    })
+                    .collect(Collectors.toList());
+
+            return new RepoEdgeDTO(callerRepo, calleeRepo, totalCount, methodCount, hotMethods);
+        }).collect(Collectors.toList());
+
+        logger.info("[拓扑图] 仓库={} 仓库间调用边={} 跨库入口点方法数={}",
+                repoNodes.size(), edges.size(),
+                repoPairMethodMap.values().stream().mapToInt(Map::size).sum());
+        return new TopologyDTO(repoNodes, edges);
+    }
+
     /** 读取仓库级包前缀配置（analyze.package.prefix，支持逗号/分号/空白分隔的多个前缀）。 */
     private List<String> loadPackagePrefixes(Long repoId) {
         String raw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
@@ -651,6 +745,17 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             }
             // 2) 没有可用实现：在接口文件里定位该方法的声明，截取其 Javadoc + 声明，而非整个文件
             SourceResult decl = extractDeclaration(lines, fullMethod);
+            // 2a) Mapper 接口：追加对应 XML 里的 SQL 片段
+            if (className != null && (className.endsWith("Mapper") || className.endsWith("mapper"))) {
+                String methodName = extractMethodName(fullMethod);
+                String xmlSql = findMapperXmlSql(Path.of(repo.getLocalPath()), className, methodName);
+                if (xmlSql != null) {
+                    String declSource = decl != null ? decl.source : "// " + fullMethod;
+                    int declStart = decl != null ? decl.startLine : 1;
+                    int declSig = decl != null ? decl.signatureLine : 1;
+                    return new SourceResult(declSource + "\n\n// MyBatis XML SQL:\n" + xmlSql, declStart, declSig);
+                }
+            }
             if (decl != null) return decl;
             // 3) 兜底：返回整个文件（极少数情况）
             return new SourceResult(String.join("\n", lines), 1, 1);
@@ -984,6 +1089,92 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return found;
     }
 
+    /**
+     * 在仓库中查找 MyBatis Mapper XML，返回 namespace=className、id=methodName 对应的 SQL 元素文本。
+     * 优先搜 src/main/resources，找不到再搜 target/classes（编译产物也能用）。
+     */
+    private String findMapperXmlSql(Path repoRoot, String className, String methodName) {
+        if (methodName == null || methodName.isBlank()) return null;
+        // XML 文件名通常与接口短类名一致，e.g. StatSchoolMapper.xml
+        String shortName = className.contains(".") ? className.substring(className.lastIndexOf('.') + 1) : className;
+        String xmlFileName = shortName + ".xml";
+
+        // 候选搜索根：优先 src/**，再 target/classes/**
+        List<Path> searchRoots = new ArrayList<>();
+        try (var walk = Files.walk(repoRoot, 10)) {
+            walk.filter(p -> p.getFileName() != null
+                          && "resources".equals(p.getFileName().toString())
+                          && Files.isDirectory(p)
+                          && p.toString().contains("/src/"))
+                .forEach(searchRoots::add);
+        } catch (IOException ignored) {}
+        try (var walk = Files.walk(repoRoot, 10)) {
+            walk.filter(p -> p.getFileName() != null
+                          && "classes".equals(p.getFileName().toString())
+                          && Files.isDirectory(p)
+                          && p.toString().contains("/target/"))
+                .forEach(searchRoots::add);
+        } catch (IOException ignored) {}
+
+        for (Path root : searchRoots) {
+            try (var walk = Files.walk(root, 6)) {
+                Optional<Path> xmlPath = walk
+                    .filter(p -> p.getFileName() != null
+                              && xmlFileName.equals(p.getFileName().toString()))
+                    .findFirst();
+                if (xmlPath.isEmpty()) continue;
+
+                String xml = Files.readString(xmlPath.get());
+                // 验证 namespace 匹配
+                if (!xml.contains("namespace=\"" + className + "\"")
+                        && !xml.contains("namespace='" + className + "'")) continue;
+
+                // 提取 id="methodName" 对应的元素（select/insert/update/delete/sql）
+                String snippet = extractXmlElement(xml, methodName);
+                if (snippet != null) return snippet;
+            } catch (IOException ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * 从 MyBatis XML 文本中提取 id="methodName" 的第一个元素（含子标签，做简单括号匹配）。
+     */
+    private String extractXmlElement(String xml, String methodName) {
+        // 匹配 <tagName ... id="methodName" ... > 或 id='methodName'
+        java.util.regex.Pattern openPat = java.util.regex.Pattern.compile(
+            "<(select|insert|update|delete|sql)(\\s[^>]*)?\\s+id=[\"']" + java.util.regex.Pattern.quote(methodName) + "[\"']([^>]*)(/?>)",
+            java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+        java.util.regex.Matcher m = openPat.matcher(xml);
+        if (!m.find()) return null;
+
+        String tag = m.group(1);
+        int start = m.start();
+
+        // 自闭合标签（/>）
+        if (m.group(4).equals("/>")) return xml.substring(start, m.end()).trim();
+
+        // 找对应的结束标签，简单计数嵌套
+        String closeTag = "</" + tag + ">";
+        String openTag  = "<" + tag;
+        int depth = 1;
+        int pos = m.end();
+        while (pos < xml.length() && depth > 0) {
+            int nextClose = xml.indexOf(closeTag, pos);
+            int nextOpen  = xml.indexOf(openTag, pos);
+            if (nextClose < 0) break;
+            if (nextOpen >= 0 && nextOpen < nextClose) {
+                depth++;
+                pos = nextOpen + openTag.length();
+            } else {
+                depth--;
+                pos = nextClose + closeTag.length();
+            }
+        }
+        return xml.substring(start, pos).trim();
+    }
+
+
     private Path findSourceFileUncached(Path repoRoot, String relativePath) {
         // 1. 标准路径: src/main/java
         Path direct = repoRoot.resolve("src/main/java").resolve(relativePath);
@@ -1103,7 +1294,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                 // 检测该 caller 签名是否在多个库重复定义
                 addAmbiguityIfAny(caller, repoNames, ambiguities);
 
-                boolean isEndpoint = apiEndpointRepo.findByRepoIdAndFullMethod(repoId, caller).isPresent();
+                boolean isEndpoint = apiEndpointRepo.findFirstByRepoIdAndFullMethod(repoId, caller).isPresent();
 
                 callersByRepo.computeIfAbsent(repoId, k -> new LinkedHashMap<>())
                         .put(caller, new ImpactCaller(caller, shortRef(caller),
@@ -1129,7 +1320,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             List<ImpactEndpoint> endpoints = new ArrayList<>();
             for (ImpactCaller c : callers) {
                 if (c.isEndpoint()) {
-                    apiEndpointRepo.findByRepoIdAndFullMethod(repoId, c.fullMethod()).ifPresent(ep ->
+                    apiEndpointRepo.findFirstByRepoIdAndFullMethod(repoId, c.fullMethod()).ifPresent(ep ->
                             endpoints.add(new ImpactEndpoint(ep.getEndpointType(), ep.getHttpMethod(),
                                     ep.getUrlPath(), ep.getFullMethod(), shortRef(ep.getFullMethod()))));
                 }
@@ -1187,7 +1378,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
                 addAmbiguityIfAny(caller, repoNames, ambiguities);
 
-                var epOpt = apiEndpointRepo.findByRepoIdAndFullMethod(repoId, caller);
+                var epOpt = apiEndpointRepo.findFirstByRepoIdAndFullMethod(repoId, caller);
                 boolean isEndpoint = epOpt.isPresent();
                 if (isEndpoint) affectedEndpoints++;
                 affectedRepos.add(repoId);
@@ -1370,16 +1561,26 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return true;
     }
 
-    /** 解析被调用方法归属的仓库：优先当前库（有边即在当前库可见），否则全局查定义所在库 */
+    /**
+     * 解析被调用方法归属的仓库。
+     * 优先级：① 当前库（call_graph 里有 caller 边）→ 当前库自己调用自己的内部方法；
+     *         ② apiEndpoint 表中另一个库注册了该方法 → 真实的跨库调用；
+     *         ③ 兜底：chunk 表全局查定义（同名多库时取第一个非当前库）。
+     * 用 apiEndpoint 优先代替 chunk 全局查，消除同包同名方法导致的误判。
+     */
     private Long resolveCalleeRepo(String callee, Long currentRepoId) {
-        // 当前库内若该方法本身也作为 caller 出现，说明当前库有它的实现/定义
+        // ① 当前库内若该方法本身也作为 caller 出现，说明当前库有它的实现/定义
         if (!callGraphRepo.findByRepoIdAndCallerMethod(currentRepoId, callee).isEmpty()) {
             return currentRepoId;
         }
-        // 否则查 chunk 表：哪个库定义了它
+        // ② 优先查 apiEndpoint：只有被其他库显式注册为入口点，才算真正的跨库调用
+        List<ApiEndpointEntity> eps = apiEndpointRepo.findByFullMethod(callee);
+        for (ApiEndpointEntity ep : eps) {
+            if (!ep.getRepoId().equals(currentRepoId)) return ep.getRepoId();
+        }
+        // ③ 兜底：chunk 表全局查定义（无 endpoint 注册时退化，如内部工具类跨库复用）
         List<ChunkEntity> defs = chunkRepo.findByFullMethod(callee);
         if (defs.isEmpty()) return null; // 第三方/外部
-        // 优先返回非当前库的定义（体现跨库续接）
         for (ChunkEntity d : defs) {
             if (!d.getRepoId().equals(currentRepoId)) return d.getRepoId();
         }

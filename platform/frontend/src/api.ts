@@ -896,3 +896,74 @@ export async function smartAsk(repoIds: number[], question: string, confirmedMet
   if (!res.data.success) throw new Error(res.data.error?.message ?? '问答失败');
   return res.data.data;
 }
+
+// ── 仓库拓扑图 ────────────────────────────────────────────────────────────────
+
+export interface HotMethod {
+  fullMethod: string;
+  shortName: string;
+  endpointType: string | null;
+  httpMethod: string | null;
+  urlPath: string | null;
+  callCount: number;
+}
+
+export interface RepoNodeDTO {
+  repoId: number;
+  name: string;
+  status: string;
+  totalMethods: number;
+  exposedMethods: number;
+  entryPoints: number;
+}
+
+export interface RepoEdgeDTO {
+  callerRepoId: number;
+  calleeRepoId: number;
+  callCount: number;
+  methodCount: number;
+  hotMethods: HotMethod[];
+}
+
+export interface TopologyDTO {
+  repos: RepoNodeDTO[];
+  edges: RepoEdgeDTO[];
+}
+
+export interface ImpactEndpoint {
+  endpointType: string;
+  httpMethod: string | null;
+  urlPath: string | null;
+  fullMethod: string;
+  shortRef: string;
+}
+
+export interface ImpactRepoGroup {
+  repoId: number;
+  repoName: string;
+  callers: { fullMethod: string; shortRef: string; depth: number; isEndpoint: boolean }[];
+  endpoints: ImpactEndpoint[];
+}
+
+export interface CrossRepoImpactDTO {
+  targetMethod: string;
+  totalCallers: number;
+  affectedRepoCount: number;
+  affectedEndpointCount: number;
+  truncated: boolean;
+  repoGroups: ImpactRepoGroup[];
+  warnings: { fullMethod: string; locations: { repoId: number; repoName: string }[] }[];
+}
+
+export async function fetchTopology(): Promise<TopologyDTO> {
+  const res = await api.get<ApiResponse<TopologyDTO>>('/topology');
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '拓扑图加载失败');
+  return res.data.data;
+}
+
+export async function fetchCrossRepoImpact(method: string, maxDepth = 10): Promise<CrossRepoImpactDTO> {
+  const res = await api.get<ApiResponse<CrossRepoImpactDTO>>('/cross-repo/impact', { params: { method, maxDepth } });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '影响分析失败');
+  return res.data.data;
+}
+

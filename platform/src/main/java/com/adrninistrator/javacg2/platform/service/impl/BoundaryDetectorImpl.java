@@ -222,6 +222,31 @@ public class BoundaryDetectorImpl {
                     }
                 }
             }
+
+            // MyBatis Mapper 接口调用检测：calleeClass 以 Mapper 结尾（动态代理，静态图里看不到 ibatis 框架调用边）
+            if (calleeClass.endsWith("Mapper") || calleeClass.endsWith("mapper")) {
+                String callerMethod = call.getCallerMethod();
+                String mapperMethodName = extractMethodName(call.getCalleeMethod());
+                String shortCallee = calleeClass.contains(".") ? calleeClass.substring(calleeClass.lastIndexOf('.') + 1) : calleeClass;
+                String ctx = "MyBatis: " + mapperMethodName + "\n📝 " + shortCallee + "." + mapperMethodName + "()";
+                String srcLine = readSrcLineCached(repoPath, callerMethod, call.getLineNumber(), sourceCache);
+                if (srcLine != null && !srcLine.isBlank()) {
+                    ctx = "MyBatis: " + mapperMethodName + "\n📝 " + (srcLine.length() > 200 ? srcLine.substring(0, 200) : srcLine);
+                }
+                String dedupKey3 = callerMethod + "|DB|" + call.getCalleeMethod();
+                if (dedup.add(dedupKey3)) {
+                    BoundaryEntity boundary = new BoundaryEntity();
+                    boundary.setRepoId(repoId);
+                    boundary.setFullMethod(callerMethod);
+                    boundary.setBoundaryType("DB");
+                    boundary.setLineNumber(call.getLineNumber());
+                    boundary.setCalleeMethod(call.getCalleeMethod());
+                    boundary.setContext(ctx);
+                    batchBoundaries.add(boundary);
+                    count++;
+                    methodBoundaryTypes.computeIfAbsent(callerMethod, k -> new HashSet<>()).add("DB");
+                }
+            }
         }
 
         // 第二轮：向上传播 — 如果方法 A 调用了方法 B，B 有 HTTP 边界，则 A 也标记（间接调用）

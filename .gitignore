@@ -45,3 +45,6 @@ openspec/changes/trace/*.log
 
 # macOS
 .DS_Store
+
+# OpenSpec 运行时产物
+.claude/settings.local.json

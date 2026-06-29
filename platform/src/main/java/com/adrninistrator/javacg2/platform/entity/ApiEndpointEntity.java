@@ -5,6 +5,8 @@ import jakarta.persistence.*;
 @Entity
 @Table(name = "api_endpoints", indexes = {
         @Index(name = "idx_ep_repo", columnList = "repo_id")
+}, uniqueConstraints = {
+        @UniqueConstraint(name = "uk_ep_repo_method", columnNames = {"repo_id", "full_method"})
 })
 public class ApiEndpointEntity {
 
