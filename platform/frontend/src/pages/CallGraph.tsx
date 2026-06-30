@@ -147,6 +147,7 @@ export default function CallGraph() {
   const graphContainerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null);
+  const fitIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── Load repos ──
   useEffect(() => {
@@ -407,6 +408,12 @@ export default function CallGraph() {
     });
 
     graph.render().catch(console.warn);
+
+    // Keep graph fitted during force simulation (nodes spread out over time)
+    const fitInterval = setInterval(() => { try { graph.fitView?.(); } catch { /* */ } }, 1500);
+    fitIntervalRef.current = fitInterval;
+    setTimeout(() => { clearInterval(fitInterval); fitIntervalRef.current = null; }, 8000);
+
     graphRef.current = graph;
 
     const ro = new ResizeObserver(() => {
@@ -565,6 +572,9 @@ export default function CallGraph() {
     const repoId = selectedRepoIds[0];
     if (!repoId) return;
 
+    // Stop fitView loop to prevent interference
+    if (fitIntervalRef.current) { clearInterval(fitIntervalRef.current); fitIntervalRef.current = null; }
+
     // Highlight in graph: set clicked node + neighbors to active/selected, rest to inactive
     const graph = graphRef.current;
     if (graph) {
@@ -603,8 +613,6 @@ export default function CallGraph() {
         });
         try { graph.setElementState?.(edgeStates); } catch { /* */ }
 
-        // Focus on node
-        try { graph.focusElement?.(className, { duration: 400 }); } catch { /* */ }
       } catch { /* graph API variation */ }
     }
 
@@ -905,7 +913,7 @@ export default function CallGraph() {
                 </div>
 
                 {/* Dagre graph (fills space) */}
-                <div style={{ flex: 1, minHeight: 0, position: 'relative', borderBottom: sourcePanelOpen ? '1px solid #f0f0f0' : 'none' }}>
+                <div style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden', borderBottom: sourcePanelOpen ? '1px solid #f0f0f0' : 'none' }}>
                   <div ref={graphContainerRef} style={{ width: '100%', height: '100%' }} />
                 </div>
 
