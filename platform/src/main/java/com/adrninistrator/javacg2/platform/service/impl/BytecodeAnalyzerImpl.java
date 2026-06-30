@@ -52,6 +52,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
     private final ProjectInfoExtractor projectInfoExtractor;
     private final CallGraphEngine callGraphEngine;
     private final RepoConfigRepo repoConfigRepo;
+    private final com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore;
     private final TransactionTemplate transactionTemplate;
     private final EmbeddingService embeddingService;
 
@@ -68,7 +69,8 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                                  ProjectInfoExtractor projectInfoExtractor,
                                  CallGraphEngine callGraphEngine,
                                  RepoConfigRepo repoConfigRepo,
-                                 EmbeddingService embeddingService) {
+                                 EmbeddingService embeddingService,
+                                 com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore) {
         this.repositoryRepo = repositoryRepo;
         this.chunkRepo = chunkRepo;
         this.callGraphRepo = callGraphRepo;
@@ -83,6 +85,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         this.callGraphEngine = callGraphEngine;
         this.repoConfigRepo = repoConfigRepo;
         this.embeddingService = embeddingService;
+        this.repoDataStore = repoDataStore;
     }
 
     @Override
@@ -94,6 +97,8 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         repositoryRepo.save(repo);
         buildLogService.clear(repoId);
         buildLogService.append(repoId, "🔍 开始分析仓库: " + repo.getName());
+        // 分析开始时清除旧缓存，防止本次分析期间读到过时数据
+        repoDataStore.invalidate(repoId);
 
         try {
             // 1. 查找编译产物（jar/class 文件），如果没有则先尝试编译
@@ -224,6 +229,8 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             logger.info("分析完成: repo={}, methods={}, calls={}", repo.getName(), methodCount, callCount);
             buildLogService.append(repoId, "\n📊 分析完成: 方法 " + methodCount + " 个, 调用关系 " + callCount + " 条");
             buildLogService.finish(repoId, true);
+            // 分析完成后异步 warmup 内存缓存，使后续调用链查询直接走内存
+            new Thread(() -> repoDataStore.warmup(repoId), "cache-warmup-" + repoId).start();
             return new AnalysisResult(true, "分析完成", methodCount, callCount);
 
         } catch (AnalysisException e) {
@@ -727,18 +734,34 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         for (String line : readTsvFile(outputDir, "method_info")) {
             String[] cols = line.split("\t");
             if (cols.length < 8) continue;
-            if (!seen.add(cols[0])) continue;
+            String fullMethod = cols[0];
+            if (!seen.add(fullMethod)) continue;
+
+            // ── 入库前过滤噪点，避免污染 chunks 表 ──
+            // 只过滤"100% 确定没有业务逻辑"的机器生成类，不过滤用户代码
+            // 1. gRPC/protobuf 生成类（工厂类、Stub、Builder、序列化方法等）
+            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoise(fullMethod)) continue;
+            // 2. .api.client.model / .api.client.service（proto 生成包）
+            int colonIdx = fullMethod.lastIndexOf(':');
+            String cls = colonIdx > 0 ? fullMethod.substring(0, colonIdx) : fullMethod;
+            if (cls.contains(".api.client.model") || cls.contains(".api.client.service")
+                    || cls.contains(".api.grpc.model") || cls.contains(".proto.")) continue;
+            // 3. $Builder / OrBuilder（protobuf Builder 内部类，不含业务逻辑）
+            String simpleClass = cls.contains(".") ? cls.substring(cls.lastIndexOf('.') + 1) : cls;
+            if (simpleClass.endsWith("$Builder") || simpleClass.endsWith("OrBuilder")) continue;
+            // 注意：匿名内部类 $1 $2 / lambda 不在此过滤——它们可能含有业务逻辑，
+            //       由显示层（目录结构 Tab）根据是否有 filePath 来决定是否展示。
 
             ChunkEntity chunk = new ChunkEntity();
             chunk.setRepoId(repoId);
-            chunk.setFullMethod(cols[0]);
+            chunk.setFullMethod(fullMethod);
             chunk.setAccessFlags(parseAccessFlags(cols[1]));
             chunk.setReturnType(cols[2]);
             chunk.setMethodHash(cols[6].isEmpty() ? null : cols[6]);
             chunk.setJarNum(parseIntSafe(cols[7]));
 
             // 从完整方法签名中提取类名、包名、方法名
-            parseMethodSignature(chunk, cols[0]);
+            parseMethodSignature(chunk, fullMethod);
 
             batch.add(chunk);
             count++;
@@ -2412,11 +2435,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             String[] cols = line.split("\t");
             if (cols.length < 12) continue;
 
-            CallGraphEntity cg = new CallGraphEntity();
-            cg.setRepoId(repoId);
-            cg.setCallId(parseIntSafe(cols[0]));
-            cg.setEnabled("1".equals(cols[1]));
-            cg.setCallerMethod(cols[2]);
+            String callerMethod = cols[2];
 
             // 解析 "(调用类型)被调用方法"
             String calleeWithType = cols[3];
@@ -2427,6 +2446,22 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                 callType = calleeWithType.substring(1, endParen);
                 calleeMethod = calleeWithType.substring(endParen + 1);
             }
+
+            // ── 入库前过滤噪点调用边 ──
+            // caller 是 gRPC/proto 生成类的调用边没有业务价值（这些类不含用户编写的逻辑）
+            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoise(callerMethod)) continue;
+            // 跳过 proto 生成包的 caller
+            int colonC = callerMethod.lastIndexOf(':');
+            String callerClass = colonC > 0 ? callerMethod.substring(0, colonC) : callerMethod;
+            if (callerClass.contains(".api.client.model") || callerClass.contains(".api.client.service")
+                    || callerClass.contains(".api.grpc.model") || callerClass.contains(".proto.")) continue;
+            // 注意：$\d+ 匿名内部类的调用边保留——其中可能有真实业务调用（如 new Runnable(){...} 内调用 service）
+
+            CallGraphEntity cg = new CallGraphEntity();
+            cg.setRepoId(repoId);
+            cg.setCallId(parseIntSafe(cols[0]));
+            cg.setEnabled("1".equals(cols[1]));
+            cg.setCallerMethod(callerMethod);
             cg.setCallType(callType);
             cg.setCalleeMethod(calleeMethod);
 
@@ -2878,6 +2913,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                         endpoint.setClassName(chunk.getClassName());
                         endpoint.setFullMethod(chunk.getFullMethod());
                         apiEndpointRepo.save(endpoint);
+                        seen.add(chunk.getFullMethod()); // 防止继承链扫描（Path 3）再次处理同一方法产生重复
                         count++;
                     }
                 }

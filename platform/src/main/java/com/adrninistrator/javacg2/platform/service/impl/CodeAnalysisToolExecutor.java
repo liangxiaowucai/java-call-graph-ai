@@ -5,6 +5,7 @@ import com.adrninistrator.javacg2.platform.entity.ChunkEntity;
 import com.adrninistrator.javacg2.platform.repository.BoundaryRepo;
 import com.adrninistrator.javacg2.platform.repository.ChunkRepo;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
+import com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -432,7 +433,8 @@ public class CodeAnalysisToolExecutor {
         if (isGetterOrSetter(methodName)) return true;
         // log 方法过滤
         if (fullMethod.contains("Logger:") || fullMethod.contains("LogFactory:")) return true;
-        return false;
+        // gRPC 噪点（工具类统一判断）
+        return GrpcNoiseFilter.isGrpcNoise(fullMethod);
     }
 
     // ── 工具定义（供 QAEngineImpl 引用）────────────────────────────────────────

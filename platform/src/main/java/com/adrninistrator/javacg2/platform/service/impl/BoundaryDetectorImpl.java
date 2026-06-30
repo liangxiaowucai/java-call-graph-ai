@@ -197,6 +197,53 @@ public class BoundaryDetectorImpl {
                 }
             }
 
+            // gRPC $BlockingStub / $FutureStub 业务 RPC 调用检测
+            // CALLEE_RULES 只匹配 io.grpc.* 框架层，无法捕获业务代码对 $BlockingStub 的直接调用。
+            // 这里补全：从 calleeMethod 签名里解析 proto 服务名、方法名、请求模型类型。
+            if (calleeClass.contains("$BlockingStub") || calleeClass.contains("$FutureStub")) {
+                String callerMethod = call.getCallerMethod();
+                String rpcMethod = extractMethodName(call.getCalleeMethod());
+                // 从 "XxxGrpc$BlockingStub" 还原 proto service 名：去掉 "Grpc$BlockingStub"/"Grpc$FutureStub"
+                String simpleClass = calleeClass.contains(".") ? calleeClass.substring(calleeClass.lastIndexOf('.') + 1) : calleeClass;
+                String serviceName = simpleClass
+                        .replaceAll("Grpc\\$BlockingStub$", "")
+                        .replaceAll("Grpc\\$FutureStub$", "")
+                        .replaceAll("Grpc\\$Stub$", "")
+                        .replaceAll("\\$BlockingStub$", "")
+                        .replaceAll("\\$FutureStub$", "");
+                // 从方法签名括号内提取第一个参数类型作为请求模型
+                String calleeMethodFull = call.getCalleeMethod();
+                String requestModel = "";
+                int parenOpen = calleeMethodFull.indexOf('(');
+                int parenClose = calleeMethodFull.lastIndexOf(')');
+                if (parenOpen >= 0 && parenClose > parenOpen) {
+                    String params = calleeMethodFull.substring(parenOpen + 1, parenClose).trim();
+                    if (!params.isEmpty()) {
+                        String firstParam = params.split(",")[0].trim();
+                        requestModel = firstParam.contains(".") ? firstParam.substring(firstParam.lastIndexOf('.') + 1) : firstParam;
+                    }
+                }
+                StringBuilder ctx = new StringBuilder();
+                ctx.append("📡 gRPC: ").append(serviceName).append(".").append(rpcMethod).append("()");
+                if (!requestModel.isEmpty()) {
+                    ctx.append("\n📦 请求: ").append(requestModel);
+                }
+                String dedupKeyGrpc = callerMethod + "|GRPC|" + calleeClass + ":" + rpcMethod;
+                if (dedup.add(dedupKeyGrpc)) {
+                    BoundaryEntity boundary = new BoundaryEntity();
+                    boundary.setRepoId(repoId);
+                    boundary.setFullMethod(callerMethod);
+                    boundary.setBoundaryType("GRPC");
+                    boundary.setLineNumber(call.getLineNumber());
+                    boundary.setCalleeMethod(call.getCalleeMethod());
+                    boundary.setContext(ctx.toString());
+                    batchBoundaries.add(boundary);
+                    count++;
+                    methodBoundaryTypes.computeIfAbsent(callerMethod, k -> new HashSet<>()).add("GRPC");
+                    methodBoundaryContexts.computeIfAbsent(callerMethod, k -> new ArrayList<>()).add(ctx.toString());
+                }
+            }
+
             // Feign Client 接口检测
             if (calleeClass.endsWith("Client") || calleeClass.endsWith("FeignClient")) {
                 String callerMethod = call.getCallerMethod();

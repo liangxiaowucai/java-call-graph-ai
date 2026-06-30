@@ -3,6 +3,7 @@ package com.adrninistrator.javacg2.platform.service.impl;
 import com.adrninistrator.javacg2.platform.entity.*;
 import com.adrninistrator.javacg2.platform.repository.*;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
+import com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -40,11 +41,13 @@ public class CallGraphEngineImpl implements CallGraphEngine {
     private final RepositoryRepo repositoryRepo;
     private final SystemConfigRepo systemConfigRepo;
     private final RepoConfigRepo repoConfigRepo;
+    private final com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore;
 
     public CallGraphEngineImpl(ApiEndpointRepo apiEndpointRepo, CallGraphRepo callGraphRepo,
                                 BoundaryRepo boundaryRepo, ChunkRepo chunkRepo,
                                 RepositoryRepo repositoryRepo, SystemConfigRepo systemConfigRepo,
-                                RepoConfigRepo repoConfigRepo) {
+                                RepoConfigRepo repoConfigRepo,
+                                com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore) {
         this.apiEndpointRepo = apiEndpointRepo;
         this.callGraphRepo = callGraphRepo;
         this.boundaryRepo = boundaryRepo;
@@ -52,6 +55,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         this.repositoryRepo = repositoryRepo;
         this.systemConfigRepo = systemConfigRepo;
         this.repoConfigRepo = repoConfigRepo;
+        this.repoDataStore = repoDataStore;
     }
 
     @Override
@@ -86,18 +90,13 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         Map<Long, String> repoNames = new HashMap<>();
         repositoryRepo.findAll().forEach(r -> repoNames.put(r.getId(), r.getName()));
 
-        // ── 性能优化：全展开模式下批量预加载整个仓库数据到内存 ──
-        // 将 N×3 次逐节点 DB 查询优化为 3 次全量查询 + 内存 HashMap 查找
-        RepoDataCache cache = null;
-        if (fullExpand) {
-            long t0 = System.currentTimeMillis();
-            cache = new RepoDataCache(repoId);
-            logger.info("[调用树] 批量预加载仓库数据 repoId={}, 耗时={}ms, 调用边={}, 边界={}, chunk={}",
-                    repoId, System.currentTimeMillis() - t0,
-                    cache.callGraphMap.values().stream().mapToInt(List::size).sum(),
-                    cache.boundaryMap.values().stream().mapToInt(List::size).sum(),
-                    cache.chunkMap.size());
-        }
+        // ── 性能优化：使用 RepoDataStore 全局内存缓存，避免每次调用重新全表扫描 ──
+        com.adrninistrator.javacg2.platform.service.RepoDataStore.RepoData cache = repoDataStore.get(repoId);
+        logger.info("[调用树] 使用内存缓存 repoId={}, 调用边={}, 边界={}, chunk={}",
+                repoId,
+                cache.callGraphMap.values().stream().mapToInt(List::size).sum(),
+                cache.boundaryMap.values().stream().mapToInt(List::size).sum(),
+                cache.chunkMap.size());
 
         // 先构建调用树（ambiguous 字段初始为 false）
         CallTreeNodeDTO root = buildNodeLazy(repoId, entryMethod, packagePrefixes,
@@ -177,7 +176,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
     private CallTreeNodeDTO buildNodeLazy(Long repoId, String fullMethod, List<String> packagePrefixes,
                                            Set<String> visited, Set<String> expanded, int depth, int maxDepth,
                                            int[] nodeCount, boolean[] hasCycle, boolean fullExpand,
-                                           RepoDataCache cache) {
+                                           com.adrninistrator.javacg2.platform.service.RepoDataStore.RepoData cache) {
         nodeCount[0]++;
         int maxNodes = fullExpand ? FULL_EXPAND_MAX_NODES : MAX_TOTAL_NODES;
 
@@ -205,10 +204,8 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
         visited.add(fullMethod);
 
-        // 查询当前方法的直接调用（优先使用缓存）
-        List<CallGraphEntity> callees = (cache != null
-                ? cache.getCallees(fullMethod)
-                : callGraphRepo.findByRepoIdAndCallerMethod(repoId, fullMethod))
+        // 查询当前方法的直接调用（使用内存缓存）
+        List<CallGraphEntity> callees = cache.getCallees(fullMethod)
                 .stream()
                 .filter(c -> c.getEnabled() != null && c.getEnabled())
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
@@ -236,9 +233,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         String constants = null;
         String exceptions = null;
         try {
-            ChunkEntity chunk = (cache != null
-                    ? cache.getChunk(fullMethod)
-                    : chunkRepo.findByRepoIdAndFullMethod(repoId, fullMethod).stream().findFirst().orElse(null));
+            ChunkEntity chunk = cache.getChunk(fullMethod);
             if (chunk != null) {
                 constants = chunk.getConstants();   // 干净的字符串常量（换行分隔）
                 exceptions = chunk.getErrorCodes();  // 异常区改为展示业务错误码+消息（code+msg）
@@ -255,12 +250,15 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
         // 超过懒加载深度 → 只返回当前节点，子节点标记懒加载（全展开模式下禁用，确保深层/异步调用完整）
         if (!fullExpand && depth >= LAZY_LOAD_DEFAULT_DEPTH && nodeCount[0] > LAZY_LOAD_DEFAULT_DEPTH * 10) {
+            // 已完整展开过的菱形汇聚方法不生成 lazy stub，避免重复
             List<CallTreeNodeDTO> lazyChildren = new ArrayList<>(callees.stream()
+                    .filter(c -> !expanded.contains(c.getCalleeMethod()))
                     .map(c -> new CallTreeNodeDTO(c.getCalleeMethod(), extractClassName(c.getCalleeMethod()),
                                 extractMethodName(c.getCalleeMethod()), c.getCallType(), c.getLineNumber(),
                                 List.of(), List.of(), false, true, false, null, null))
                     .collect(Collectors.toList()));
             for (String impl : implTargets) {
+                if (expanded.contains(impl)) continue;
                 lazyChildren.add(new CallTreeNodeDTO(impl, extractClassName(impl), extractMethodName(impl),
                         "IMPL", null, List.of(), List.of(), false, true, false, null, null));
             }
@@ -274,6 +272,9 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         // 递归展开子节点（visited 共享，进入子节点前已 add 当前节点，返回后统一 remove）
         List<CallTreeNodeDTO> children = new ArrayList<>();
         for (CallGraphEntity callee : callees) {
+            // 菱形汇聚点：该方法已在其它分支完整展开，直接跳过，不生成 lazy-load 空壳
+            // 避免同一方法在前端被渲染为多个重复节点（gRPC 公共工具方法如 buildResult 尤其容易触发）
+            if (expanded.contains(callee.getCalleeMethod())) continue;
             CallTreeNodeDTO child = buildNodeLazy(repoId, callee.getCalleeMethod(), packagePrefixes,
                     visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, fullExpand, cache);
             children.add(new CallTreeNodeDTO(child.fullMethod(), child.className(), child.methodName(),
@@ -283,6 +284,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         }
         // 桥接的实现方法以合成 IMPL 边接入，递归展开其方法体
         for (String impl : implTargets) {
+            if (expanded.contains(impl)) continue;
             CallTreeNodeDTO child = buildNodeLazy(repoId, impl, packagePrefixes,
                     visited, expanded, depth + 1, maxDepth, nodeCount, hasCycle, fullExpand, cache);
             children.add(new CallTreeNodeDTO(child.fullMethod(), child.className(), child.methodName(),
@@ -302,20 +304,16 @@ public class CallGraphEngineImpl implements CallGraphEngine {
      * 加载某方法的外部 I/O 边界（HTTP/RPC/DB/CACHE/MQ），并把 chunk.resolvedUrls 里解析出的 URL
      * 合成为 HTTP 边界（去重）。供调用树构建与外部依赖汇总复用。
      */
-    private List<BoundaryDTO> loadBoundaries(Long repoId, String fullMethod, RepoDataCache cache) {
+    private List<BoundaryDTO> loadBoundaries(Long repoId, String fullMethod, com.adrninistrator.javacg2.platform.service.RepoDataStore.RepoData cache) {
         Set<String> ioBoundaryTypes = Set.of("HTTP", "RPC", "GRPC", "DB", "CACHE", "REDIS", "MQ");
-        List<BoundaryDTO> boundaries = new ArrayList<>((cache != null
-                ? cache.getBoundaries(fullMethod)
-                : boundaryRepo.findByRepoIdAndFullMethod(repoId, fullMethod))
+        List<BoundaryDTO> boundaries = new ArrayList<>(cache.getBoundaries(fullMethod)
                 .stream()
                 .filter(b -> b.getBoundaryType() != null && ioBoundaryTypes.contains(b.getBoundaryType()))
                 .map(b -> new BoundaryDTO(b.getBoundaryType(), b.getLineNumber(), b.getContext()))
                 .collect(Collectors.toList()));
 
         // 解析出的外部调用 URL（JSON: [{url,configKey,field}]）→ 合成 HTTP 边界
-        ChunkEntity chunk = (cache != null
-                ? cache.getChunk(fullMethod)
-                : chunkRepo.findByRepoIdAndFullMethod(repoId, fullMethod).stream().findFirst().orElse(null));
+        ChunkEntity chunk = cache.getChunk(fullMethod);
         if (chunk != null && chunk.getResolvedUrls() != null && !chunk.getResolvedUrls().isBlank()) {
             Set<String> existingHttpCtx = boundaries.stream()
                     .filter(b -> "HTTP".equals(b.boundaryType()) && b.context() != null)
@@ -356,7 +354,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         if (entryMethod == null || entryMethod.isBlank()) return result;
 
         List<String> packagePrefixes = loadPackagePrefixes(repoId);
-        RepoDataCache cache = new RepoDataCache(repoId);
+        com.adrninistrator.javacg2.platform.service.RepoDataStore.RepoData cache = repoDataStore.get(repoId);
         Set<String> seen = new HashSet<>();
         Deque<String> stack = new ArrayDeque<>();
         stack.push(entryMethod);
@@ -394,44 +392,81 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return result;
     }
 
+    // ── 拓扑图缓存（仓库列表 + 状态不变时直接返回，避免每次全表扫描 40s+）──
+    private volatile TopologyDTO cachedTopology = null;
+    private volatile String cachedTopologyKey = null;
+
     @Override
     public TopologyDTO getTopology() {
-        // 1. 所有仓库基本信息
+        // 用仓库 id+status 拼接作为 cache key，任何仓库重新分析时自动失效
         List<RepositoryEntity> repos = repositoryRepo.findAll();
+        String cacheKey = repos.stream()
+                .map(r -> r.getId() + ":" + r.getStatus() + ":" + (r.getLastSyncTime() != null ? r.getLastSyncTime().toString() : ""))
+                .sorted()
+                .collect(java.util.stream.Collectors.joining("|"));
+        if (cachedTopology != null && cacheKey.equals(cachedTopologyKey)) {
+            return cachedTopology;
+        }
 
-        // 2. 统计每个 repo 的方法总数（chunk 表）
+        // --- 全量计算 ---
+
+        // 2. 统计每个 repo 的方法总数（chunk 表），精确 fullMethod -> repoId 索引
         Map<Long, Integer> repoMethodCount = new HashMap<>();
-        // chunk 全量索引：fullMethod -> repoId（用于 fallback 跨库检测）
         Map<String, Long> chunkMethodToRepo = new HashMap<>();
         chunkRepo.findAll().forEach(c -> {
             repoMethodCount.merge(c.getRepoId(), 1, Integer::sum);
-            // 仅记录唯一归属的方法（同名方法存在于多库时不能用于 fallback）
             chunkMethodToRepo.merge(c.getFullMethod(), c.getRepoId(), (a, b) -> a.equals(b) ? a : -1L);
         });
 
-        // 3. 入口点双重索引：fullMethod -> Map<repoId, ApiEndpointEntity>
+        // 3. 入口点索引（用于 P1 精确匹配 + 包前缀提取）
         Map<String, Map<Long, ApiEndpointEntity>> epByMethodAndRepo = new HashMap<>();
         Map<Long, Integer> repoEntryCount = new HashMap<>();
+        // 从 entry points 提取每个 repo 的专属包前缀（entry points 一定是该 repo 自己写的类，不含共享 proto jar）
+        // repoId -> Set<包前缀3段>
+        Map<Long, Map<String, Integer>> repoPkgCountFromEp = new HashMap<>();
         apiEndpointRepo.findAll().forEach(ep -> {
             epByMethodAndRepo.computeIfAbsent(ep.getFullMethod(), k -> new HashMap<>())
                     .put(ep.getRepoId(), ep);
             repoEntryCount.merge(ep.getRepoId(), 1, Integer::sum);
+            // 取 entry point 类名前3段作为候选包前缀
+            String cls = ep.getClassName();
+            if (cls != null) {
+                String[] parts = cls.split("\\.");
+                if (parts.length >= 3) {
+                    String prefix = parts[0] + "." + parts[1] + "." + parts[2];
+                    repoPkgCountFromEp.computeIfAbsent(ep.getRepoId(), k -> new HashMap<>())
+                            .merge(prefix, 1, Integer::sum);
+                }
+            }
         });
+        // 每个 repo 选 entry points 中出现最多的包前缀作为该 repo 的专属包前缀
+        Map<Long, String> repoDominantPrefix = new HashMap<>();
+        repoPkgCountFromEp.forEach((repoId, pkgMap) ->
+            pkgMap.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .ifPresent(e -> repoDominantPrefix.put(repoId, e.getKey()))
+        );
+        // 反向索引：包前缀 -> repoId
+        Map<String, Long> prefixToRepo = new HashMap<>();
+        repoDominantPrefix.forEach((repoId, prefix) -> prefixToRepo.put(prefix, repoId));
+        logger.info("[拓扑图] repo专属包前缀(来自entry points): {}", repoDominantPrefix);
 
-        // 4. 扫描调用图，识别跨库调用：
-        //    优先路径：callee 是另一个库的 apiEndpoint 入口点（精确）
-        //    Fallback：callee 在 chunk 表中唯一归属另一个库（用于 GRPC/RPC 方法未注册为入口点的情况）
+        // 4. 扫描调用图，识别跨库调用（三级优先级）：
+        //    P1: callee 是另一个库注册的 apiEndpoint 入口点（精确）
+        //    P2: callee 在 chunk 表中唯一归属另一个库（精确，处理非入口点方法）
+        //    P3: callee 类名包前缀匹配另一个库的专属包前缀（处理 gRPC stub/proto 生成类等）
         Map<String, long[]> repoPairCount = new LinkedHashMap<>();
         Map<String, Map<String, long[]>> repoPairMethodMap = new LinkedHashMap<>();
 
         callGraphRepo.findAll().stream()
                 .filter(c -> c.getEnabled() != null && c.getEnabled())
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                .filter(c -> !isBoilerplate(c.getCalleeMethod()))   // 全局过滤样板/噪点方法
                 .forEach(c -> {
                     Long fromRepo = c.getRepoId();
                     String callee = c.getCalleeMethod();
 
-                    // 优先：callee 是另一个库注册的入口点
+                    // P1：callee 是另一个库注册的入口点（精确匹配）
                     Map<Long, ApiEndpointEntity> targetEps = epByMethodAndRepo.get(callee);
                     if (targetEps != null) {
                         for (Map.Entry<Long, ApiEndpointEntity> epEntry : targetEps.entrySet()) {
@@ -442,16 +477,37 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                             repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
                                     .computeIfAbsent(callee, k -> new long[]{0})[0]++;
                         }
-                        return; // 已走入口点路径，不再 fallback
+                        return;
                     }
 
-                    // Fallback：callee 在 chunk 表中唯一归属另一个库
-                    Long toRepo = chunkMethodToRepo.get(callee);
-                    if (toRepo == null || toRepo == -1L || toRepo.equals(fromRepo)) return;
-                    String pairKey = fromRepo + "|" + toRepo;
-                    repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
-                    repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
-                            .computeIfAbsent(callee, k -> new long[]{0})[0]++;
+                    // P2：callee 在 chunk 表中唯一归属另一个库（精确匹配）
+                    Long chunkRepoId = chunkMethodToRepo.get(callee);
+                    if (chunkRepoId != null && !chunkRepoId.equals(-1L) && !chunkRepoId.equals(fromRepo)) {
+                        String pairKey = fromRepo + "|" + chunkRepoId;
+                        repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
+                        repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
+                                .computeIfAbsent(callee, k -> new long[]{0})[0]++;
+                        return;
+                    }
+
+                    // P3：包前缀匹配（只用 entry points 推导的专属前缀，不含共享 proto jar）
+                    // 使用 GrpcNoiseFilter 统一过滤 gRPC 生成的 proto model 包及纯工厂/基础设施类
+                    if (GrpcNoiseFilter.isGrpcNoise(callee)) {
+                        return;
+                    }
+                    int colon3 = callee.lastIndexOf(':');
+                    String calleeClass = colon3 > 0 ? callee.substring(0, colon3) : callee;
+                    String[] parts = calleeClass.split("\\.");
+                    if (parts.length >= 3) {
+                        String calleePkg = parts[0] + "." + parts[1] + "." + parts[2];
+                        Long toRepo = prefixToRepo.get(calleePkg);
+                        if (toRepo != null && !toRepo.equals(fromRepo)) {
+                            String pairKey = fromRepo + "|" + toRepo;
+                            repoPairCount.computeIfAbsent(pairKey, k -> new long[]{0})[0]++;
+                            repoPairMethodMap.computeIfAbsent(pairKey, k -> new LinkedHashMap<>())
+                                    .computeIfAbsent(callee, k -> new long[]{0})[0]++;
+                        }
+                    }
                 });
 
         // 5. 统计每个 repo 被其他仓库调用的方法数（exposed）
@@ -469,8 +525,16 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             return new RepoNodeDTO(r.getId(), r.getName(), r.getStatus(), totalMethods, exposedMethods, entryPoints);
         }).collect(Collectors.toList());
 
-        // 7. 构建 RepoEdgeDTO，推断 callType
-        List<RepoEdgeDTO> edges = repoPairCount.entrySet().stream().map(e -> {
+        // 7. 构建 RepoEdgeDTO，推断 callType（过滤掉两端 repo 不在当前系统内的悬空边）
+        Set<Long> knownRepoIds = repos.stream().map(r -> r.getId()).collect(Collectors.toSet());
+        List<RepoEdgeDTO> edges = repoPairCount.entrySet().stream()
+            .filter(e -> {
+                String[] p = e.getKey().split("\\|", 2);
+                Long caller = Long.parseLong(p[0]);
+                Long callee = Long.parseLong(p[1]);
+                return knownRepoIds.contains(caller) && knownRepoIds.contains(callee);
+            })
+            .map(e -> {
             String[] parts = e.getKey().split("\\|", 2);
             Long callerRepo = Long.parseLong(parts[0]);
             Long calleeRepo = Long.parseLong(parts[1]);
@@ -480,8 +544,9 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             int methodCount = methodMap.size();
 
             List<HotMethod> hotMethods = methodMap.entrySet().stream()
+                    .filter(me -> !GrpcNoiseFilter.isGrpcNoise(me.getKey()))  // 过滤 gRPC 基础设施方法
                     .sorted(Comparator.comparingLong((Map.Entry<String, long[]> me) -> me.getValue()[0]).reversed())
-                    .limit(5)
+                    .limit(20)  // 只取 top 20 热点方法，减少传输量
                     .map(me -> {
                         String callee = me.getKey();
                         int cnt = (int) me.getValue()[0];
@@ -505,7 +570,10 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         logger.info("[拓扑图] 仓库={} 仓库间调用边={} 跨库方法数={}",
                 repoNodes.size(), edges.size(),
                 repoPairMethodMap.values().stream().mapToInt(Map::size).sum());
-        return new TopologyDTO(repoNodes, edges);
+        TopologyDTO result = new TopologyDTO(repoNodes, edges);
+        cachedTopology = result;
+        cachedTopologyKey = cacheKey;
+        return result;
     }
 
     /** 根据热点方法的 endpointType 聚合推断边的调用类型标签 */
@@ -543,11 +611,14 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return prefixes;
     }
 
-    /** 过滤构造方法、setter/getter 等非业务方法 */
+    /** 过滤构造方法、setter/getter、gRPC 生成类噪点方法等非业务方法 */
     private boolean isBoilerplate(String calleeMethod) {
         if (calleeMethod.contains(":<init>(") || calleeMethod.contains(":<clinit>(")) return true;
         String methodName = extractMethodName(calleeMethod);
         if ("equals".equals(methodName) || "hashCode".equals(methodName) || "toString".equals(methodName)) return true;
+
+        // gRPC 噪点（工具类统一判断）
+        if (GrpcNoiseFilter.isGrpcNoise(calleeMethod)) return true;
 
         // 仅按签名特征识别真正的访问器，避免误杀 getDetail(Long)/getById(Long) 这类业务方法：
         // 真正的 getter/is 访问器是无参的 getXxx()/isXxx()；真正的 setter 是单参的 setXxx(one)。
@@ -635,6 +706,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
     public List<CallerDTO> getCallees(Long repoId, String fullMethod, int depth) {
         List<CallerDTO> result = callGraphRepo.findByRepoIdAndCallerMethod(repoId, fullMethod).stream()
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                .filter(c -> !isBoilerplate(c.getCalleeMethod()))
                 .map(c -> new CallerDTO(c.getCalleeMethod(), extractClassName(c.getCalleeMethod()),
                         c.getCallType(), c.getLineNumber(), 1))
                 .collect(Collectors.toList());
@@ -1321,6 +1393,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             List<CallGraphEntity> edges = callGraphRepo.findByCalleeMethod(frame.method).stream()
                     .filter(c -> c.getEnabled() != null && c.getEnabled())
                     .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                    .filter(c -> !isBoilerplate(c.getCallerMethod()))
                     .collect(Collectors.toList());
 
             for (CallGraphEntity edge : edges) {
@@ -1406,6 +1479,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             List<CallGraphEntity> edges = callGraphRepo.findByCalleeMethod(frame.method).stream()
                     .filter(c -> c.getEnabled() != null && c.getEnabled())
                     .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                    .filter(c -> !isBoilerplate(c.getCallerMethod()))
                     .collect(Collectors.toList());
 
             for (CallGraphEntity edge : edges) {
@@ -1628,6 +1702,122 @@ public class CallGraphEngineImpl implements CallGraphEngine {
 
     /** 跨库 BFS 帧 */
     private record CrossRepoFrame(String method, int depth) {}
+
+    // ── 上游调用树实现 ────────────────────────────────────────────────────────
+
+    private static final int UPSTREAM_TREE_MAX_NODES = 5000;
+
+    @Override
+    public UpstreamTreeDTO getUpstreamTree(String fullMethod) {
+        Map<Long, String> repoNames = new HashMap<>();
+        repositoryRepo.findAll().forEach(r -> repoNames.put(r.getId(), r.getName()));
+
+        Map<String, AmbiguityWarning> ambiguities = new LinkedHashMap<>();
+        addAmbiguityIfAny(fullMethod, repoNames, ambiguities);
+
+        // visited key = repoId|fullMethod，防止循环
+        Set<String> visited = new HashSet<>();
+        int[] nodeCount = {0};
+        boolean[] truncated = {0 > UPSTREAM_TREE_MAX_NODES};
+        int[] idSeq = {0};
+
+        UpstreamTreeNodeDTO root = buildUpstreamNode(fullMethod, repoNames, visited, nodeCount, truncated, idSeq, ambiguities);
+
+        List<AmbiguityWarning> warnings = new ArrayList<>(ambiguities.values());
+        logger.info("[上游调用树] method={} nodes={} truncated={}", fullMethod, nodeCount[0], truncated[0]);
+        return new UpstreamTreeDTO(fullMethod, nodeCount[0], truncated[0], warnings, root);
+    }
+
+    private UpstreamTreeNodeDTO buildUpstreamNode(
+            String fullMethod,
+            Map<Long, String> repoNames,
+            Set<String> visited,
+            int[] nodeCount,
+            boolean[] truncated,
+            int[] idSeq,
+            Map<String, AmbiguityWarning> ambiguities) {
+
+        if (nodeCount[0]++ > UPSTREAM_TREE_MAX_NODES) {
+            truncated[0] = true;
+        }
+
+        String nodeId = "u-" + (idSeq[0]++);
+        String sref = shortRef(fullMethod);
+
+        // 查询该方法的入口点信息（HTTP/MQ/gRPC 等）
+        // 全局搜——同一方法可能在多个库注册
+        boolean isEndpoint = false;
+        String endpointType = null, httpMethod = null, urlPath = null;
+        Long repoId = null;
+        String repoName = null;
+
+        // 先找 chunk 确认归属仓库
+        List<ChunkEntity> defs = chunkRepo.findByFullMethod(fullMethod);
+        if (!defs.isEmpty()) {
+            repoId = defs.get(0).getRepoId();
+            repoName = repoNames.getOrDefault(repoId, "repo-" + repoId);
+        }
+
+        // 查 endpoint
+        if (repoId != null) {
+            var ep = apiEndpointRepo.findFirstByRepoIdAndFullMethod(repoId, fullMethod);
+            if (ep.isPresent()) {
+                isEndpoint = true;
+                endpointType = ep.get().getEndpointType();
+                httpMethod = ep.get().getHttpMethod();
+                urlPath = ep.get().getUrlPath();
+            }
+        }
+
+        // 如果找不到，全局搜所有库的 endpoint 表
+        if (!isEndpoint) {
+            List<ApiEndpointEntity> epList = apiEndpointRepo.findByFullMethod(fullMethod);
+            if (!epList.isEmpty()) {
+                var epAny = epList.get(0);
+                isEndpoint = true;
+                endpointType = epAny.getEndpointType();
+                httpMethod = epAny.getHttpMethod();
+                urlPath = epAny.getUrlPath();
+                if (repoId == null) {
+                    repoId = epAny.getRepoId();
+                    repoName = repoNames.getOrDefault(repoId, "repo-" + repoId);
+                }
+            }
+        }
+
+        // 检查循环（用 fullMethod 作 key，不区分仓库——同签名不同库的循环极罕见，统一保护）
+        if (visited.contains(fullMethod)) {
+            return new UpstreamTreeNodeDTO(nodeId, fullMethod, sref, repoId, repoName,
+                    isEndpoint, endpointType, httpMethod, urlPath, true, List.of());
+        }
+        visited.add(fullMethod);
+
+        List<UpstreamTreeNodeDTO> callerNodes = new ArrayList<>();
+        if (!truncated[0]) {
+            // 全库 BFS：找所有调用了这个方法的 caller
+            List<CallGraphEntity> edges = callGraphRepo.findByCalleeMethod(fullMethod).stream()
+                    .filter(c -> c.getEnabled() != null && c.getEnabled())
+                    .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
+                    .filter(c -> !isBoilerplate(c.getCallerMethod()))
+                    .collect(Collectors.toList());
+
+            // 同方法在多个库被调用时，按 repoId|callerMethod 去重
+            Set<String> edgeSeen = new HashSet<>();
+            for (CallGraphEntity edge : edges) {
+                String edgeKey = edge.getRepoId() + "|" + edge.getCallerMethod();
+                if (!edgeSeen.add(edgeKey)) continue;
+                addAmbiguityIfAny(edge.getCallerMethod(), repoNames, ambiguities);
+                UpstreamTreeNodeDTO callerNode = buildUpstreamNode(
+                        edge.getCallerMethod(), repoNames, visited, nodeCount, truncated, idSeq, ambiguities);
+                callerNodes.add(callerNode);
+            }
+        }
+
+        visited.remove(fullMethod);  // 回溯，允许同一方法被多个不同路径引用（树中出现多次）
+
+        return new UpstreamTreeNodeDTO(nodeId, fullMethod, sref, repoId, repoName,
+                isEndpoint, endpointType, httpMethod, urlPath, false, callerNodes);
+    }
 
     // ── 批量预加载缓存：全展开模式时一次性加载整个仓库数据到内存 ──────────────────
 

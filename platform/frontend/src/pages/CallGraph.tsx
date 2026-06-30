@@ -1,477 +1,131 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { Select, Spin, Tag, Drawer, Button, Empty, Tooltip, message, Input, Modal, Space } from 'antd';
+import type React from 'react';
+import { Select, Spin, Tag, Drawer, Button, Empty, Tooltip, message, Input, Modal, Space, Tabs } from 'antd';
 import {
-  AimOutlined, ZoomInOutlined, ZoomOutOutlined, ExpandOutlined,
+  ZoomInOutlined, ZoomOutOutlined, ExpandOutlined,
   CodeOutlined, BugOutlined, ApiOutlined, FileTextOutlined,
-  DownOutlined, RightOutlined,
+  DownOutlined, RightOutlined, FolderOutlined,
 } from '@ant-design/icons';
-import G6, { type TreeGraph as TreeGraphType } from '@antv/g6';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import mermaid from 'mermaid';
+import { Graph } from '@antv/g6';
 import {
   fetchRepos, fetchEntryPoints, fetchCallTree, fetchMethodSource, fetchMethodSourceDetail,
   analyzeLog, getMock, saveMock, generateCallChainCode,
-  generateProductDoc, generateDevDoc, generateProductDocDiagrams,
+  generateProductDoc, generateDevDoc,
+  fetchFileTree, fetchClassEdges, fetchRepoJars,
   type RepoEntity, type EntryPoint, type CallTree, type CallTreeNode,
-  type LogAnalysisResult, type MethodSourceDetail,
+  type LogAnalysisResult, type MethodSourceDetail, type BoundaryInfo, type FileTreeItem, type ClassEdge,
 } from '../api';
 import JavaCodeViewer from '../components/JavaCodeViewer';
 
-// ─── Mermaid initialization ──────────────────────────────────────────────────
+// ─── Types & Helpers ─────────────────────────────────────────────────────────
 
-mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
-
-// ─── MermaidBlock component ──────────────────────────────────────────────────
-
-function MermaidBlock({ code }: { code: string }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [svg, setSvg] = useState('');
-
-  useEffect(() => {
-    const id = 'mermaid-' + Math.random().toString(36).slice(2);
-    mermaid.parse(code)
-      .then(() => mermaid.render(id, code))
-      .then(({ svg }) => setSvg(svg))
-      .catch((err) => {
-        console.error('Mermaid render error:', err);
-        setSvg('');
-      });
-  }, [code]);
-
-  return svg ? (
-    <div ref={ref} dangerouslySetInnerHTML={{ __html: svg }} style={{ overflow: 'auto', margin: '8px 0' }} />
-  ) : (
-    <pre style={{ background: '#f5f5f5', padding: 12, borderRadius: 6, fontSize: 12 }}>{code}</pre>
-  );
+interface NodeCustomData {
+  label: string; fullMethod: string; className: string; methodName: string;
+  callType: string; lineNumber: number | null; boundaries: BoundaryInfo[];
+  isRecursive: boolean; isLazyLoad: boolean; ambiguous: boolean; depth: number;
 }
 
-// ─── Boundary color mapping ──────────────────────────────────────────────────
+function collapseBridges(node: CallTreeNode): CallTreeNode {
+  let n = node;
+  while (n.children && n.children.length === 1) {
+    const child = n.children[0];
+    if ((child.methodName || '') === (n.methodName || '') && ['_ITF', 'IMPL', 'INT'].includes(child.callType ?? '')) {
+      n = { ...child, boundaries: [...(n.boundaries ?? []), ...(child.boundaries ?? [])] };
+    } else break;
+  }
+  return { ...n, children: (n.children ?? []).map(collapseBridges) };
+}
 
-const BOUNDARY_COLORS: Record<string, string> = {
-  DB: '#1890ff',
-  HTTP: '#52c41a',
-  EXCEPTION: '#ff4d4f',
-  TRANSACTION: '#722ed1',
-  SERIALIZATION: '#fa8c16',
-  MQ: '#13c2c2',
-  CACHE: '#eb2f96',
+function flattenTree(root: CallTreeNode) {
+  const nodes: Array<{ id: string; data: NodeCustomData }> = [];
+  const edges: Array<{ id: string; source: string; target: string; data: { callType: string } }> = [];
+  const seenN = new Set<string>(), seenE = new Set<string>();
+
+  function walk(node: CallTreeNode, depth: number) {
+    const id = node.fullMethod;
+    if (!seenN.has(id)) {
+      seenN.add(id);
+      const shortClass = (node.className ?? '').split('.').pop()?.split('$')[0] ?? '';
+      nodes.push({ id, data: {
+        label: `${shortClass}.${node.methodName ?? ''}`, fullMethod: id,
+        className: node.className ?? '', methodName: node.methodName ?? '',
+        callType: node.callType ?? '', lineNumber: node.lineNumber,
+        boundaries: node.boundaries ?? [], isRecursive: node.isRecursive,
+        isLazyLoad: node.isLazyLoad, ambiguous: node.ambiguous, depth,
+      }});
+    }
+    for (const child of node.children ?? []) {
+      const eKey = `${id}=>${child.fullMethod}`;
+      if (!seenE.has(eKey)) { seenE.add(eKey); edges.push({ id: `e${edges.length}`, source: id, target: child.fullMethod, data: { callType: child.callType ?? '' } }); }
+      walk(child, depth + 1);
+    }
+  }
+  walk(root, 0);
+  return { nodes, edges, rootId: root.fullMethod };
+}
+
+const _BOUNDARY_COLORS: Record<string, string> = {
+  DB: '#1890ff', HTTP: '#52c41a', GRPC: '#722ed1', MQ: '#fa8c16', CACHE: '#eb2f96', REDIS: '#eb2f96',
 };
+
+function getNodeColor(d: NodeCustomData): string {
+  if (d.isRecursive) return '#ff4d4f';
+  if (d.ambiguous) return '#faad14';
+  // Color by boundaries (IO type)
+  const has = (t: string) => d.boundaries.some(b => b.boundaryType === t);
+  if (has('DB')) return '#1890ff';
+  if (has('GRPC') || has('RPC')) return '#722ed1';
+  if (has('HTTP')) return '#fa8c16';
+  if (has('MQ')) return '#13c2c2';
+  if (has('CACHE') || has('REDIS')) return '#eb2f96';
+  // Color by class name pattern
+  const cls = (d.className ?? '').toLowerCase();
+  if (cls.includes('controller')) return '#52c41a';
+  if (cls.includes('service')) return '#1890ff';
+  if (cls.includes('mapper') || cls.includes('repository') || cls.includes('dao')) return '#722ed1';
+  if (cls.includes('remote') || cls.includes('client') || cls.includes('feign')) return '#fa8c16';
+  if (cls.includes('config') || cls.includes('util') || cls.includes('helper')) return '#8c8c8c';
+  if (d.depth === 0) return '#fa8c16';
+  if (d.isLazyLoad) return '#bfbfbf';
+  return '#1890ff';
+}
 
 const ENDPOINT_TYPE_COLORS: Record<string, string> = {
-  CONTROLLER: '#1890ff',
-  KAFKA: '#fa8c16',
-  ROCKETMQ: '#eb2f96',
-  RABBITMQ: '#13c2c2',
-  MQ: '#fa541c',
-  SCHEDULED: '#722ed1',
-  GRPC: '#52c41a',
-  LISTENER: '#fa8c16',
+  CONTROLLER: '#1890ff', KAFKA: '#fa8c16', ROCKETMQ: '#eb2f96', RABBITMQ: '#13c2c2',
+  MQ: '#fa541c', SCHEDULED: '#722ed1', GRPC: '#52c41a', LISTENER: '#fa8c16',
 };
-
-// ─── G6 data transform ──────────────────────────────────────────────────────
-
-interface G6Node {
-  id: string;
-  label: string;
-  fullMethod: string;
-  className: string;
-  methodName: string;
-  callType: string;
-  lineNumber: number | null;
-  boundaries: { boundaryType: string; lineNumber: number; context: string }[];
-  isRecursive: boolean;
-  isLazyLoad: boolean;
-  ambiguous: boolean;
-  children: G6Node[];
-  // 日志诊断状态
-  diagStatus?: 'OK' | 'ERROR' | 'UNKNOWN';
-  diagMessage?: string;
-}
-
-let nodeIdCounter = 0;
-
-function transformNode(node: CallTreeNode): G6Node {
-  nodeIdCounter += 1;
-  const shortClass = node.className.split('.').pop() ?? node.className;
-  return {
-    id: `node-${nodeIdCounter}`,
-    label: `${shortClass}.${node.methodName}`,
-    fullMethod: node.fullMethod,
-    className: node.className,
-    methodName: node.methodName,
-    callType: node.callType,
-    lineNumber: node.lineNumber,
-    boundaries: node.boundaries ?? [],
-    isRecursive: node.isRecursive,
-    isLazyLoad: node.isLazyLoad,
-    ambiguous: node.ambiguous,
-    children: (node.children ?? []).map(transformNode),
-  };
-}
-
-// ─── Custom G6 node registration ────────────────────────────────────────────
-
-const NODE_HEIGHT = 52;
-const NODE_MIN_WIDTH = 200;
-
-function registerCustomNode() {
-  G6.registerNode(
-    'call-node',
-    {
-      draw(cfg, group) {
-        if (!cfg || !group) return {} as never;
-        const label = (cfg.label as string) ?? '';
-        const boundaries = (cfg.boundaries as G6Node['boundaries']) ?? [];
-        const isRecursive = cfg.isRecursive as boolean;
-        const isAmbiguous = cfg.ambiguous as boolean;
-        const callType = (cfg.callType as string) ?? '';
-
-        // Measure text width
-        const textWidth = G6.Util.getTextSize(label, 12)[0];
-        const boundaryWidth = boundaries.length * 12;
-        const width = Math.max(NODE_MIN_WIDTH, textWidth + boundaryWidth + 40);
-
-        // Background rect - 歧义节点用橙色边框，递归节点用红色边框
-        const strokeColor = isRecursive ? '#ff4d4f' : isAmbiguous ? '#faad14' : '#d9d9d9';
-        const fillColor = isRecursive ? '#fff2f0' : isAmbiguous ? '#fffbe6' : '#ffffff';
-        const lineWidth = (isRecursive || isAmbiguous) ? 2 : 1;
-        const keyShape = group.addShape('rect', {
-          attrs: {
-            x: 0,
-            y: 0,
-            width,
-            height: NODE_HEIGHT,
-            radius: 6,
-            fill: fillColor,
-            stroke: strokeColor,
-            lineWidth: lineWidth,
-            shadowColor: 'rgba(0,0,0,0.06)',
-            shadowBlur: 4,
-            shadowOffsetY: 2,
-            cursor: 'pointer',
-          },
-          name: 'node-rect',
-          draggable: true,
-        });
-
-        // Call type indicator bar
-        if (callType) {
-          group.addShape('rect', {
-            attrs: {
-              x: 0,
-              y: 0,
-              width: 4,
-              height: NODE_HEIGHT,
-              radius: [6, 0, 0, 6],
-              fill: callType === 'INTERFACE' ? '#1890ff' : callType === 'VIRTUAL' ? '#52c41a' : '#8c8c8c',
-            },
-            name: 'type-bar',
-          });
-        }
-
-        // Diagnosis status icon (✅❌❓)
-        const diagStatus = cfg.diagStatus as string | undefined;
-        if (diagStatus) {
-          const statusIcon = diagStatus === 'OK' ? '✅' : diagStatus === 'ERROR' ? '❌' : '❓';
-          group.addShape('text', {
-            attrs: {
-              x: width - 18,
-              y: 16,
-              text: statusIcon,
-              fontSize: 14,
-              textAlign: 'center',
-              textBaseline: 'middle',
-            },
-            name: 'status-icon',
-          });
-          // 如果是 ERROR，给整个节点加红色边框
-          if (diagStatus === 'ERROR') {
-            keyShape.attr('stroke', '#ff4d4f');
-            keyShape.attr('lineWidth', 2);
-            keyShape.attr('fill', '#fff2f0');
-          }
-        }
-
-        // Method name
-        const shortClass = ((cfg.className as string) ?? '').split('.').pop() ?? '';
-        group.addShape('text', {
-          attrs: {
-            x: 12,
-            y: 16,
-            text: (cfg.methodName as string) ?? '',
-            fontSize: 12,
-            fontWeight: 500,
-            fill: '#262626',
-            textBaseline: 'middle',
-            cursor: 'pointer',
-          },
-          name: 'method-text',
-        });
-
-        // Class name (truncated)
-        const displayClass = shortClass.length > 28 ? shortClass.slice(0, 26) + '…' : shortClass;
-        group.addShape('text', {
-          attrs: {
-            x: 12,
-            y: 34,
-            text: displayClass,
-            fontSize: 10,
-            fill: '#8c8c8c',
-            textBaseline: 'middle',
-            cursor: 'pointer',
-          },
-          name: 'class-text',
-        });
-
-        // Boundary tags (colored labels showing type)
-        let tagX = 12;
-        const tagY = 34;
-        boundaries.forEach((b) => {
-          const typeLabel = b.boundaryType;
-          const tagWidth = G6.Util.getTextSize(typeLabel, 9)[0] + 8;
-
-          group.addShape('rect', {
-            attrs: {
-              x: tagX,
-              y: tagY - 6,
-              width: tagWidth,
-              height: 14,
-              radius: 3,
-              fill: BOUNDARY_COLORS[b.boundaryType] ?? '#d9d9d9',
-              cursor: 'pointer',
-            },
-            name: `boundary-bg-${typeLabel}`,
-          });
-          group.addShape('text', {
-            attrs: {
-              x: tagX + tagWidth / 2,
-              y: tagY + 1,
-              text: typeLabel,
-              fontSize: 9,
-              fontWeight: 500,
-              fill: '#fff',
-              textAlign: 'center',
-              textBaseline: 'middle',
-              cursor: 'pointer',
-            },
-            name: `boundary-text-${typeLabel}`,
-          });
-          tagX += tagWidth + 3;
-        });
-
-        // Recursive icon
-        if (isRecursive) {
-          group.addShape('text', {
-            attrs: {
-              x: width - 14,
-              y: 36,
-              text: '↻',
-              fontSize: 14,
-              fill: '#ff4d4f',
-              textAlign: 'center',
-              textBaseline: 'middle',
-            },
-            name: 'recursive-icon',
-          });
-        }
-
-        return keyShape;
-      },
-      getAnchorPoints() {
-        return [
-          [0.5, 0],
-          [0.5, 1],
-        ];
-      },
-    },
-    'single-node',
-  );
-}
-
-let customNodeRegistered = false;
-let customEdgeRegistered = false;
-
-// ─── Animated edge with flowing dot ──────────────────────────────────────────
-
-function registerAnimatedEdge() {
-  G6.registerEdge(
-    'animated-edge',
-    {
-      afterDraw(_cfg, group) {
-        if (!group) return;
-        const keyShape = group.get('children')[0];
-        if (!keyShape) return;
-
-        const dot = group.addShape('circle', {
-          attrs: { x: 0, y: 0, r: 2.5, fill: '#adb5bd', opacity: 0.28 },
-          name: 'flow-dot',
-        });
-
-        dot.animate(
-          (ratio: number) => {
-            try {
-              const p = keyShape.getPoint(ratio);
-              return p ? { x: p.x, y: p.y } : {};
-            } catch {
-              return {};
-            }
-          },
-          { repeat: true, duration: 2400 },
-        );
-      },
-
-      setState(name, value, item) {
-        if (!item) return;
-        const group = item.getContainer();
-        if (!group) return;
-        const keyShape = group.get('children')[0];
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const dot = group.find((el: any) => el.get('name') === 'flow-dot');
-
-        if (name === 'active-out' || name === 'active-in') {
-          if (value) {
-            const isOut = name === 'active-out';
-            const color = isOut ? '#1890ff' : '#52c41a';
-            keyShape?.attr({
-              stroke: color,
-              lineWidth: 2.5,
-              opacity: 1,
-              endArrow: { path: G6.Arrow.triangle(8, 8, 0), fill: color },
-            });
-            if (dot) {
-              dot.stopAnimate();
-              dot.attr({ r: 5, fill: color, opacity: 1 });
-              const ks = keyShape;
-              dot.animate(
-                (ratio: number) => {
-                  try {
-                    const p = ks.getPoint(isOut ? ratio : 1 - ratio);
-                    return p ? { x: p.x, y: p.y } : {};
-                  } catch {
-                    return {};
-                  }
-                },
-                { repeat: true, duration: 600 },
-              );
-            }
-          } else {
-            // restore default idle state
-            keyShape?.attr({
-              stroke: '#c0c0c0',
-              lineWidth: 1,
-              opacity: 1,
-              endArrow: { path: G6.Arrow.triangle(6, 6, 0), fill: '#c0c0c0' },
-            });
-            if (dot) {
-              dot.stopAnimate();
-              dot.attr({ r: 2.5, fill: '#adb5bd', opacity: 0.28 });
-              const ks = keyShape;
-              dot.animate(
-                (ratio: number) => {
-                  try {
-                    const p = ks.getPoint(ratio);
-                    return p ? { x: p.x, y: p.y } : {};
-                  } catch {
-                    return {};
-                  }
-                },
-                { repeat: true, duration: 2400 },
-              );
-            }
-          }
-          return;
-        }
-
-        if (name !== 'active') return;
-        if (value) {
-          keyShape?.attr({
-            stroke: '#1890ff',
-            lineWidth: 2.5,
-            opacity: 1,
-            endArrow: { path: G6.Arrow.triangle(8, 8, 0), fill: '#1890ff' },
-          });
-          if (dot) {
-            dot.stopAnimate();
-            dot.attr({ r: 5, fill: '#1890ff', opacity: 1 });
-            const ks = keyShape;
-            dot.animate(
-              (ratio: number) => {
-                try {
-                  const p = ks.getPoint(ratio);
-                  return p ? { x: p.x, y: p.y } : {};
-                } catch {
-                  return {};
-                }
-              },
-              { repeat: true, duration: 800 },
-            );
-          }
-        } else {
-          keyShape?.attr({
-            stroke: '#c0c0c0',
-            lineWidth: 1,
-            opacity: 1,
-            endArrow: { path: G6.Arrow.triangle(6, 6, 0), fill: '#c0c0c0' },
-          });
-          if (dot) {
-            dot.stopAnimate();
-            dot.attr({ r: 2.5, fill: '#adb5bd', opacity: 0.28 });
-            const ks = keyShape;
-            dot.animate(
-              (ratio: number) => {
-                try {
-                  const p = ks.getPoint(ratio);
-                  return p ? { x: p.x, y: p.y } : {};
-                } catch {
-                  return {};
-                }
-              },
-              { repeat: true, duration: 2400 },
-            );
-          }
-        }
-      },
-    },
-    'cubic-vertical',
-  );
-}
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function CallGraph() {
+  // ── State ──
   const [repos, setRepos] = useState<RepoEntity[]>([]);
-  const [selectedRepoId, setSelectedRepoId] = useState<number | null>(null);
+  const [selectedRepoIds, setSelectedRepoIds] = useState<number[]>([]);
+  const [activeTab, setActiveTab] = useState<'files' | 'entries'>('files');
+
+  // File tree tab
+  const [fileTreeData, setFileTreeData] = useState<Map<number, FileTreeItem[]>>(new Map());
+  const [classEdges, setClassEdges] = useState<ClassEdge[]>([]);
+  const [jarNames, setJarNames] = useState<Map<number, string[]>>(new Map()); // repoId → jar name list (index = jarNum)
+  const [loadingFileTree, setLoadingFileTree] = useState(false);
+
+  // Entry points tab
   const [entryPoints, setEntryPoints] = useState<EntryPoint[]>([]);
   const [loadingEntries, setLoadingEntries] = useState(false);
   const [selectedEntry, setSelectedEntry] = useState<string | null>(null);
   const [callTree, setCallTree] = useState<CallTree | null>(null);
   const [loadingTree, setLoadingTree] = useState(false);
-  const [sourceDrawerOpen, setSourceDrawerOpen] = useState(false);
+  const [searchText, setSearchText] = useState('');
+
+  // Source code panel (bottom 30% — toggled)
+  const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const [sourceCode, setSourceCode] = useState<string>('');
   const [sourceMethod, setSourceMethod] = useState<string>('');
   const [sourceDetail, setSourceDetail] = useState<MethodSourceDetail | null>(null);
   const [loadingSource, setLoadingSource] = useState(false);
-  const [searchText, setSearchText] = useState('');
-  const [logDrawerOpen, setLogDrawerOpen] = useState(false);
-  const [collapsedClasses, setCollapsedClasses] = useState<Set<string>>(new Set());
-  const [collapsedModules, setCollapsedModules] = useState<Set<string>>(new Set());
 
-  // 支持从 URL 参数跳转（从 AI 问答页面点击链接）
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const repoId = params.get('repoId');
-    const method = params.get('method');
-    if (repoId) {
-      setSelectedRepoId(Number(repoId));
-      if (method) {
-        // 延迟加载调用树，等入口点列表加载完
-        setTimeout(() => {
-          setSelectedEntry(method);
-        }, 500);
-      }
-    }
-  }, []);
+  // Drawers & modals (kept from original)
+  const [logDrawerOpen, setLogDrawerOpen] = useState(false);
   const [logText, setLogText] = useState('');
   const [logAnalyzing, setLogAnalyzing] = useState(false);
   const [logResult, setLogResult] = useState<LogAnalysisResult | null>(null);
@@ -482,1140 +136,893 @@ export default function CallGraph() {
   const [codeDrawerOpen, setCodeDrawerOpen] = useState(false);
   const [generatedCode, setGeneratedCode] = useState('');
   const [generatingCode, setGeneratingCode] = useState(false);
-  const [detailDrawerOpen, setDetailDrawerOpen] = useState(false);
-  const [detailNode, setDetailNode] = useState<G6Node | null>(null);
   const [docDrawerOpen, setDocDrawerOpen] = useState(false);
   const [docContent, setDocContent] = useState('');
   const [docLoading, setDocLoading] = useState(false);
   const [docType, setDocType] = useState<'product' | 'dev'>('product');
-  const [docDiagrams, setDocDiagrams] = useState<Record<string, string>>({});
-  const [selectedDiagramType, setSelectedDiagramType] = useState<'flowchart' | 'sequence' | 'swimlane'>('sequence');
-  const [diagramLoading, setDiagramLoading] = useState(false);
+
+  // Collapse state for entry list
+  const [collapsedClasses, setCollapsedClasses] = useState<Set<string>>(new Set());
 
   const graphContainerRef = useRef<HTMLDivElement>(null);
-  const graphRef = useRef<TreeGraphType | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const graphRef = useRef<any>(null);
 
-  // Load repos
+  // ── Load repos ──
   useEffect(() => {
-    fetchRepos().then(setRepos).catch(() => message.error('加载仓库列表失败'));
+    fetchRepos().then(r => {
+      setRepos(r);
+      // Auto-select first analyzed repo
+      if (selectedRepoIds.length === 0) {
+        const first = r.find(repo => repo.status === 'ANALYZED' || repo.status === 'READY');
+        if (first) setSelectedRepoIds([first.id]);
+      }
+    }).catch(() => message.error('加载仓库列表失败'));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Load entry points when repo changes
+  // ── URL params ──
   useEffect(() => {
-    if (!selectedRepoId) {
-      setEntryPoints([]);
-      return;
-    }
-    setLoadingEntries(true);
-    setSelectedEntry(null);
+    const params = new URLSearchParams(window.location.search);
+    const repoId = params.get('repoId');
+    const method = params.get('method') ?? params.get('entry');
+    if (repoId) setSelectedRepoIds([Number(repoId)]);
+    if (method) { setActiveTab('entries'); setTimeout(() => loadCallTree(method), 500); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Load entry points when repos change ──
+  useEffect(() => {
+    // Reset graph state when switching repos
     setCallTree(null);
-    fetchEntryPoints(selectedRepoId)
-      .then(setEntryPoints)
+    setSourceCode('');
+    setSourcePanelOpen(false);
+    setSourceDetail(null);
+    setSelectedEntry(null);
+    if (graphRef.current) { try { graphRef.current.destroy(); } catch { /* */ } graphRef.current = null; }
+
+    if (selectedRepoIds.length === 0) { setEntryPoints([]); return; }
+    setLoadingEntries(true);
+    Promise.all(selectedRepoIds.map(id => fetchEntryPoints(id)))
+      .then(results => setEntryPoints(results.flat()))
       .catch(() => message.error('加载入口点失败'))
       .finally(() => setLoadingEntries(false));
-  }, [selectedRepoId]);
+  }, [selectedRepoIds]);
 
-  // Load call tree
+  // ── Load file tree + class edges + jar names when repos change & tab is files ──
+  useEffect(() => {
+    if (activeTab !== 'files' || selectedRepoIds.length === 0) return;
+    setLoadingFileTree(true);
+    Promise.all([
+      Promise.all(selectedRepoIds.map(id => fetchFileTree(id).then(items => [id, items] as [number, FileTreeItem[]]))),
+      Promise.all(selectedRepoIds.map(id => fetchClassEdges(id).catch(() => [] as ClassEdge[]))),
+      Promise.all(selectedRepoIds.map(id => fetchRepoJars(id).then(jars => [id, jars.map(j => j.name.replace(/\.jar$|\.war$/, ''))] as [number, string[]]))),
+    ])
+      .then(([treeResults, edgeResults, jarResults]) => {
+        const m = new Map<number, FileTreeItem[]>();
+        treeResults.forEach(([id, items]) => m.set(id, items));
+        setFileTreeData(m);
+        setClassEdges(edgeResults.flat());
+        const jm = new Map<number, string[]>();
+        jarResults.forEach(([id, names]) => jm.set(id, names));
+        setJarNames(jm);
+      })
+      .catch(() => message.error('加载文件树失败'))
+      .finally(() => setLoadingFileTree(false));
+  }, [selectedRepoIds, activeTab]);
+
+  // ── Load call tree ──
   const loadCallTree = useCallback(async (fullMethod: string) => {
-    if (!selectedRepoId) return;
+    const repoId = selectedRepoIds[0];
+    if (!repoId) return;
     setSelectedEntry(fullMethod);
     setLoadingTree(true);
-    try {
-      const tree = await fetchCallTree(selectedRepoId, fullMethod);
-      setCallTree(tree);
-    } catch {
-      message.error('加载调用树失败');
-    } finally {
-      setLoadingTree(false);
-    }
-  }, [selectedRepoId]);
+    try { const tree = await fetchCallTree(repoId, fullMethod); setCallTree(tree); }
+    catch { message.error('加载调用树失败'); }
+    finally { setLoadingTree(false); }
+  }, [selectedRepoIds]);
 
-  // 切换调用链入口时清空已缓存的文档内容，避免展示旧入口的文档
-  const prevEntryRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (prevEntryRef.current !== selectedEntry) {
-      prevEntryRef.current = selectedEntry;
-      setDocContent('');
-      setDocDiagrams({});
-    }
-  }, [selectedEntry]);
-
-  // 从 URL 参数自动加载调用树
-  useEffect(() => {
-    if (selectedEntry && selectedRepoId && !callTree) {
-      loadCallTree(selectedEntry);
-    }
-  }, [selectedEntry, selectedRepoId, callTree, loadCallTree]);
-
-  // Show source code
+  // ── Show source in bottom panel ──
   const showSource = useCallback(async (fullMethod: string) => {
-    if (!selectedRepoId) return;
+    const repoId = selectedRepoIds[0];
+    if (!repoId) return;
     setSourceMethod(fullMethod);
-    setSourceDrawerOpen(true);
+    setSourcePanelOpen(true);
     setLoadingSource(true);
-    setSourceDetail(null);
     try {
-      const detail = await fetchMethodSourceDetail(selectedRepoId, fullMethod, selectedEntry ?? undefined);
-      if (detail) {
-        setSourceCode(detail.sourceCode ?? '');
-        setSourceDetail(detail);
-        if (!detail.sourceCode) {
-          const src = await fetchMethodSource(selectedRepoId, fullMethod);
-          if (src) setSourceCode(src);
-        }
-      } else {
-        const src = await fetchMethodSource(selectedRepoId, fullMethod);
-        setSourceCode(src ?? '// 未找到源码');
-      }
-    } catch {
-      setSourceCode('// 获取源码失败');
-    } finally {
-      setLoadingSource(false);
-    }
-  }, [selectedRepoId, selectedEntry]);
+      const detail = await fetchMethodSourceDetail(repoId, fullMethod, selectedEntry ?? undefined);
+      if (detail) { setSourceCode(detail.sourceCode ?? ''); setSourceDetail(detail); }
+      else { const src = await fetchMethodSource(repoId, fullMethod); setSourceCode(src ?? '// 未找到源码'); setSourceDetail(null); }
+    } catch { setSourceCode('// 获取源码失败'); }
+    finally { setLoadingSource(false); }
+  }, [selectedRepoIds, selectedEntry]);
 
-  // Log analysis handler
+  // ── Log analysis ──
   const handleAnalyzeLog = useCallback(async () => {
-    if (!selectedRepoId || !selectedEntry || !logText.trim()) {
-      message.warning('请先选择接口并粘贴日志');
-      return;
-    }
+    const repoId = selectedRepoIds[0];
+    if (!repoId || !selectedEntry || !logText.trim()) { message.warning('请先选择接口并粘贴日志'); return; }
     setLogAnalyzing(true);
-    try {
-      const result = await analyzeLog(selectedRepoId, selectedEntry, logText);
-      setLogResult(result);
-      message.success(result.summary);
+    try { const r = await analyzeLog(repoId, selectedEntry, logText); setLogResult(r); message.success(r.summary); }
+    catch (e: unknown) { if (e instanceof Error) message.error(e.message); }
+    finally { setLogAnalyzing(false); }
+  }, [selectedRepoIds, selectedEntry, logText]);
 
-      // 更新 G6 节点状态
-      if (graphRef.current && !graphRef.current.get('destroyed')) {
-        const statusMap = new Map(result.nodeStatuses.map(s => [s.fullMethod, s]));
-        graphRef.current.getNodes().forEach(node => {
-          const model = node.getModel() as unknown as G6Node;
-          const status = statusMap.get(model.fullMethod);
-          if (status) {
-            graphRef.current!.updateItem(node, {
-              diagStatus: status.status,
-              diagMessage: status.errorMessage,
-            });
-          }
-        });
-      }
-    } catch (err: unknown) {
-      if (err instanceof Error) message.error(err.message);
-    } finally {
-      setLogAnalyzing(false);
-    }
-  }, [selectedRepoId, selectedEntry, logText]);
-
-  // Mock handler
-  const openMockEditor = useCallback(async (fullMethod: string) => {
-    if (!selectedRepoId) return;
+  // ── Mock ──
+  const _openMockEditor = useCallback(async (fullMethod: string) => {
+    const repoId = selectedRepoIds[0]; if (!repoId) return;
     setMockMethod(fullMethod);
-    try {
-      const mock = await getMock(selectedRepoId, fullMethod);
-      setMockRequest(mock?.mockRequest ?? '{\n  \n}');
-      setMockResponse(mock?.mockResponse ?? '{\n  "code": 200,\n  "data": {}\n}');
-    } catch {
-      setMockRequest('{\n  \n}');
-      setMockResponse('{\n  "code": 200,\n  "data": {}\n}');
-    }
+    try { const mock = await getMock(repoId, fullMethod); setMockRequest(mock?.mockRequest ?? '{}'); setMockResponse(mock?.mockResponse ?? '{"code":200}'); }
+    catch { setMockRequest('{}'); setMockResponse('{"code":200}'); }
     setMockModalOpen(true);
-  }, [selectedRepoId]);
-
+  }, [selectedRepoIds]);
   const handleSaveMock = useCallback(async () => {
-    if (!selectedRepoId) return;
-    try {
-      await saveMock(selectedRepoId, mockMethod, mockRequest, mockResponse);
-      message.success('Mock 已保存');
-      setMockModalOpen(false);
-    } catch (err: unknown) {
-      if (err instanceof Error) message.error(err.message);
-    }
-  }, [selectedRepoId, mockMethod, mockRequest, mockResponse]);
+    const repoId = selectedRepoIds[0]; if (!repoId) return;
+    try { await saveMock(repoId, mockMethod, mockRequest, mockResponse); message.success('Mock 已保存'); setMockModalOpen(false); }
+    catch (e: unknown) { if (e instanceof Error) message.error(e.message); }
+  }, [selectedRepoIds, mockMethod, mockRequest, mockResponse]);
 
+  // ── Code gen ──
   const handleGenerateCode = useCallback(async () => {
-    if (!selectedRepoId || !selectedEntry) return;
+    const repoId = selectedRepoIds[0]; if (!repoId || !selectedEntry) return;
     setGeneratingCode(true);
-    try {
-      // 如果有日志诊断结果，传给后端
-      let statuses: Record<string, string> | undefined;
-      if (logResult?.nodeStatuses) {
-        statuses = {};
-        for (const ns of logResult.nodeStatuses) {
-          statuses[ns.fullMethod] = ns.status;
-          if (ns.errorMessage) {
-            statuses[ns.fullMethod + '.error'] = ns.errorMessage;
-          }
-        }
-      }
-      const code = await generateCallChainCode(selectedRepoId, selectedEntry, statuses);
-      setGeneratedCode(code);
-      setCodeDrawerOpen(true);
-    } catch (err: unknown) {
-      if (err instanceof Error) message.error(err.message);
-    } finally {
-      setGeneratingCode(false);
-    }
-  }, [selectedRepoId, selectedEntry, logResult]);
+    try { const code = await generateCallChainCode(repoId, selectedEntry); setGeneratedCode(code); setCodeDrawerOpen(true); }
+    catch (e: unknown) { if (e instanceof Error) message.error(e.message); }
+    finally { setGeneratingCode(false); }
+  }, [selectedRepoIds, selectedEntry]);
 
+  // ── Doc gen ──
   const handleGenerateDoc = useCallback(async (type: 'product' | 'dev') => {
-    if (!selectedRepoId || !selectedEntry) return;
-    setDocType(type);
-    setDocDrawerOpen(true);
-
-    // 同一入口、同类型文档已有内容则直接打开，不重复请求（后端已做缓存，但避免前端无意义的网络往返）
-    if (docContent && docType === type) return;
-
-    setDocLoading(true);
+    const repoId = selectedRepoIds[0]; if (!repoId || !selectedEntry) return;
+    setDocType(type); setDocDrawerOpen(true); setDocLoading(true);
     try {
-      if (type === 'product') {
-        const doc = await generateProductDoc(selectedRepoId, selectedEntry);
-        setDocContent(doc);
-        setSelectedDiagramType('sequence');
-        loadDiagram('sequence');
-      } else {
-        const doc = await generateDevDoc(selectedRepoId, selectedEntry);
-        setDocContent(doc);
-        setDocDiagrams({});
-      }
-    } catch (err: unknown) {
-      if (err instanceof Error) message.error(err.message);
-      setDocContent('生成失败');
-    } finally {
-      setDocLoading(false);
-    }
-  }, [selectedRepoId, selectedEntry, docContent, docType]);
+      const doc = type === 'product' ? await generateProductDoc(repoId, selectedEntry) : await generateDevDoc(repoId, selectedEntry);
+      setDocContent(doc);
+    } catch { setDocContent('生成失败'); }
+    finally { setDocLoading(false); }
+  }, [selectedRepoIds, selectedEntry]);
 
-  // 按需加载图表
-  const loadDiagram = useCallback(async (diagramType: 'flowchart' | 'sequence' | 'swimlane') => {
-    if (!selectedRepoId || !selectedEntry) return;
-    
-    // 如果已经加载过，直接返回
-    if (docDiagrams[diagramType]) {
-      return;
-    }
-    
-    setDiagramLoading(true);
-    try {
-      const allDiagrams = await generateProductDocDiagrams(selectedRepoId, selectedEntry);
-      setDocDiagrams(allDiagrams);
-    } catch (err: unknown) {
-      if (err instanceof Error) message.error('图表加载失败: ' + err.message);
-    } finally {
-      setDiagramLoading(false);
-    }
-  }, [selectedRepoId, selectedEntry, docDiagrams]);
-
-  // 切换图表类型
-  const handleDiagramTypeChange = useCallback((type: 'flowchart' | 'sequence' | 'swimlane') => {
-    setSelectedDiagramType(type);
-    loadDiagram(type);
-  }, [loadDiagram]);
-
-  // Render / update G6 graph
+  // ── G6 file relationship graph (files tab) ──
   useEffect(() => {
-    if (!callTree?.root || !graphContainerRef.current) return;
+    if (activeTab !== 'files' || fileTreeData.size === 0 || !graphContainerRef.current) return;
 
-    // Register custom node once
-    if (!customNodeRegistered) {
-      registerCustomNode();
-      customNodeRegistered = true;
-    }
-    if (!customEdgeRegistered) {
-      registerAnimatedEdge();
-      customEdgeRegistered = true;
-    }
-
-    // Reset counter and transform data
-    nodeIdCounter = 0;
-    const treeData = transformNode(callTree.root);
-
-    // Destroy previous graph
-    if (graphRef.current) {
-      graphRef.current.destroy();
-      graphRef.current = null;
-    }
-
+    if (graphRef.current) { try { graphRef.current.destroy(); } catch { /* */ } graphRef.current = null; }
     const container = graphContainerRef.current;
-    const width = container.clientWidth || 800;
-    const height = container.clientHeight || 600;
 
-    // 节点数超过阈值时不 fitView，避免整图缩到看不清；Minimap 始终开启供全局导航
-    const isLargeGraph = (callTree?.totalNodes ?? 0) > 60;
-    const minimap = new G6.Minimap({
-      size: [180, 120],
-      type: 'keyShape',
+    // Color palette per package (rotate through 8 colors)
+    const PALETTE = ['#1890ff', '#52c41a', '#722ed1', '#fa8c16', '#eb2f96', '#13c2c2', '#2f54eb', '#fa541c'];
+    const allItems = [...fileTreeData.values()].flat();
+    const pkgList = [...new Set(allItems.map(i => i.packageName || ''))].sort();
+    const pkgColorMap = new Map(pkgList.map((pkg, i) => [pkg, PALETTE[i % PALETTE.length]]));
+
+    // Include ALL classes (single repo, no limit needed)
+    const nodes = allItems.map(item => {
+      const short = (item.className.split('.').pop() ?? item.className).replace(/\$.+/, '');
+      const color = pkgColorMap.get(item.packageName || '') ?? '#1890ff';
+      return { id: item.className, data: { label: short, pkg: item.packageName, methodCount: item.methodCount, color } };
     });
 
-    const graph = new G6.TreeGraph({
+    // Edges: use real call_graph class-level edges (filtered to only nodes present in graph)
+    const nodeIdSet = new Set(nodes.map(n => n.id));
+    const edges = classEdges
+      .filter(e => nodeIdSet.has(e.source) && nodeIdSet.has(e.target))
+      .map((e, i) => ({ id: `fe${i}`, source: e.source, target: e.target }));
+
+    // Initialize node positions near center to avoid left-top-corner start
+    const cx = (container.clientWidth || 800) / 2;
+    const cy = (container.clientHeight || 500) / 2;
+    const nodesWithPos = nodes.map(n => ({
+      ...n,
+      style: { x: cx + (Math.random() - 0.5) * 200, y: cy + (Math.random() - 0.5) * 200 },
+    }));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const graph = new (Graph as any)({
       container,
-      width,
-      height,
-      fitView: !isLargeGraph,
-      fitViewPadding: [40, 40, 40, 40],
-      animate: true,
-      animateCfg: { duration: 300 },
-      modes: {
-        default: ['drag-canvas', 'zoom-canvas', 'drag-node'],
-      },
-      plugins: [minimap],
-      nodeStateStyles: {
-        active: {
-          shadowColor: 'rgba(24,144,255,0.35)',
-          shadowBlur: 10,
-          stroke: '#1890ff',
-          lineWidth: 2,
+      width: container.clientWidth || 800,
+      height: container.clientHeight || 500,
+      autoFit: 'view',
+      data: { nodes: nodesWithPos, edges },
+      node: {
+        style: (datum: { id: string; data?: { label: string; pkg: string; methodCount: number; color: string } }) => {
+          const d = datum.data ?? { label: '', pkg: '', methodCount: 1, color: '#1890ff' };
+          const size = Math.min(Math.max(d.methodCount * 3 + 12, 18), 50);
+          return {
+            size, fill: d.color, stroke: '#fff', lineWidth: 1.5,
+            opacity: 0.9, labelText: d.label, labelFill: '#262626', labelFontSize: 10,
+            labelPlacement: 'bottom', labelOffsetY: 5, cursor: 'pointer',
+            shadowColor: d.color, shadowBlur: 4, shadowOffsetY: 0,
+          };
         },
-      },
-      defaultNode: {
-        type: 'call-node',
-      },
-      defaultEdge: {
-        type: 'animated-edge',
-        style: {
-          stroke: '#c0c0c0',
-          lineWidth: 1,
-          endArrow: {
-            path: G6.Arrow.triangle(6, 6, 0),
-            fill: '#c0c0c0',
-          },
+        state: {
+          selected: { stroke: '#fa8c16', lineWidth: 3, halo: true, haloStroke: '#fa8c16', haloLineWidth: 18, haloStrokeOpacity: 0.35, labelFontWeight: 700, labelFontSize: 12 },
+          active: { halo: true, haloStroke: '#1890ff', haloLineWidth: 12, haloStrokeOpacity: 0.25 },
+          inactive: { opacity: 0.5 },
         },
+        animation: { enter: 'fade' },
+      },
+      edge: {
+        style: { stroke: '#999', lineWidth: 1.5, opacity: 0.4, endArrow: true, endArrowSize: 5 },
+        state: { active: { stroke: '#fa8c16', lineWidth: 2.5, opacity: 1 }, inactive: { opacity: 0.08 } },
       },
       layout: {
-        type: 'compactBox',
-        direction: 'TB',
-        getId: (d: G6Node) => d.id,
-        getHeight: () => NODE_HEIGHT,
-        getWidth: (d: G6Node) => {
-          const textW = G6.Util.getTextSize(d.label ?? '', 12)[0];
-          const bw = (d.boundaries?.length ?? 0) * 12;
-          return Math.max(NODE_MIN_WIDTH, textW + bw + 40);
-        },
-        getVGap: () => 40,
-        getHGap: () => 20,
+        type: 'd3-force',
+        link: { distance: 50 },
+        charge: { strength: -100 },
+        center: { x: 0, y: 0, strength: 0.1 },
+        collide: { radius: 18 },
+        x: { strength: 0.05 },
+        y: { strength: 0.05 },
       },
+      behaviors: ['drag-canvas', 'drag-element-force', { type: 'click-select', multiple: false }],
     });
 
-    // Node click → show detail drawer
-    graph.on('node:click', (evt) => {
-      const model = evt.item?.getModel() as G6Node | undefined;
-      if (model) {
-        setDetailNode(model);
-        setDetailDrawerOpen(true);
-      }
-    });
-
-    // Node hover → highlight adjacent edges with directional animation
-    graph.on('node:mouseenter', (evt) => {
-      const item = evt.item;
+    // Click node: highlight neighbors + show source
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    graph.on('node:click', (event: any) => {
+      const nodeId = event?.itemId ?? event?.target?.id;
+      if (!nodeId) return;
+      const item = allItems.find(i => i.className === nodeId);
       if (!item) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const edges = (item as any).getEdges?.() ?? [];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      edges.forEach((edge: any) => {
-        const isSource = edge.getSource() === item;
-        graph.setItemState(edge, isSource ? 'active-out' : 'active-in', true);
+
+      // Highlight: clicked=selected, neighbors=active, rest=inactive
+      const neighbors = new Set<string>();
+      neighbors.add(nodeId);
+      classEdges.forEach(e => {
+        if (e.source === nodeId) neighbors.add(e.target);
+        if (e.target === nodeId) neighbors.add(e.source);
       });
-      graph.setItemState(item, 'active', true);
-    });
-    graph.on('node:mouseleave', (evt) => {
-      const item = evt.item;
-      if (!item) return;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const edges = (item as any).getEdges?.() ?? [];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      edges.forEach((edge: any) => {
-        graph.setItemState(edge, 'active-out', false);
-        graph.setItemState(edge, 'active-in', false);
-      });
-      graph.setItemState(item, 'active', false);
-    });
-
-    // Collapse / expand on dblclick
-    graph.on('node:dblclick', (evt) => {
-      const item = evt.item;
-      if (!item) return;
-      const model = item.getModel();
-      if (model.children && (model.children as G6Node[]).length > 0) {
-        graph.updateItem(item, { collapsed: !model.collapsed });
-        graph.layout();
+      const states: Record<string, string[]> = {};
+      for (const n of allItems) {
+        if (n.className === nodeId) states[n.className] = ['selected'];
+        else if (neighbors.has(n.className)) states[n.className] = ['active'];
+        else states[n.className] = ['inactive'];
       }
+      try { graph.setElementState?.(states); } catch { /* */ }
+
+      // Load source with structured detail
+      const repoId = selectedRepoIds[0];
+      if (repoId) {
+        showSource(item.className + ':__CLASS__()');
+      }
+
+      // Scroll left panel to the file
+      setTimeout(() => {
+        const el = document.querySelector(`[data-classname="${item.className}"]`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.classList.add('active');
+        }
+      }, 100);
     });
 
-    graph.data(treeData);
-    graph.render();
-    if (isLargeGraph) {
-      // 大图：定位到根节点并显示在顶部，不缩放到全图
-      const rootNode = graph.findById(treeData.id);
-      if (rootNode) {
-        graph.focusItem(rootNode);
-        // focusItem 把根节点居中，再上移让它出现在顶部附近
-        graph.translate(0, -(height / 2 - 80));
-      }
-    } else {
-      graph.fitView();
-    }
+    // Click empty canvas → clear highlights + close source
+    graph.on('canvas:click', () => {
+      try {
+        const clearStates: Record<string, string[]> = {};
+        allItems.forEach(item => { clearStates[item.className] = []; });
+        classEdges.forEach((_, i) => { clearStates[`fe${i}`] = []; });
+        graph.setElementState?.(clearStates);
+      } catch { /* */ }
+      setSourcePanelOpen(false);
+    });
 
+    graph.render().catch(console.warn);
     graphRef.current = graph;
 
-    // Resize handler
-    const onResize = () => {
-      if (!graphRef.current || graphRef.current.get('destroyed')) return;
-      const w = container.clientWidth || 800;
-      const h = container.clientHeight || 600;
-      graphRef.current.changeSize(w, h);
-    };
-    window.addEventListener('resize', onResize);
+    const ro = new ResizeObserver(() => {
+      if (!graphRef.current) return;
+      try { graphRef.current.changeSize?.(container.clientWidth, container.clientHeight); } catch { /* */ }
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, [activeTab, fileTreeData, classEdges, showSource, selectedRepoIds]);
 
-    return () => {
-      window.removeEventListener('resize', onResize);
-    };
+  // ── G6 Dagre graph rendering ──
+  useEffect(() => {
+    if (activeTab !== 'entries' || !callTree?.root || !graphContainerRef.current) return;
+
+    const { nodes, edges, rootId } = flattenTree(callTree.root);
+    const nodeMap = new Map(nodes.map(n => [n.id, n.data]));
+
+    if (graphRef.current) { try { graphRef.current.destroy(); } catch { /* */ } graphRef.current = null; }
+    const container = graphContainerRef.current;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const graph = new (Graph as any)({
+      container,
+      width: container.clientWidth || 800,
+      height: container.clientHeight || 400,
+      autoFit: 'view',
+      padding: [40, 40, 40, 40],
+      data: { nodes, edges },
+      node: {
+        type: 'rect',
+        style: (datum: { id: string; data?: NodeCustomData }) => {
+          const d = datum.data ?? {} as NodeCustomData;
+          const color = getNodeColor(d);
+          // Truncate label to max 28 chars, ensure node fits
+          const rawLabel = d.label ?? '';
+          const displayLabel = rawLabel.length > 25 ? rawLabel.slice(0, 24) + '…' : rawLabel;
+          const nodeWidth = 280;
+
+          // Build badges for boundary types (DB/HTTP/GRPC etc)
+          const BADGE_LABELS: Record<string, string> = { DB: 'DB', HTTP: 'HTTP', GRPC: 'RPC', MQ: 'MQ', CACHE: 'Redis' };
+          const badges = [...new Set((d.boundaries ?? []).map(b => BADGE_LABELS[b.boundaryType]).filter(Boolean))];
+          const badgeLine = badges.length > 0 ? badges.join(' | ') : '';
+
+          return {
+            size: [nodeWidth, 64], radius: 12,
+            fill: color, stroke: color, lineWidth: d.depth === 0 ? 3 : 1.5,
+            labelText: badgeLine ? `${displayLabel}\n${badgeLine}` : displayLabel,
+            labelFill: '#fff', labelFontSize: 13,
+            labelPlacement: 'center', cursor: 'pointer',
+            shadowColor: color, shadowBlur: 6, shadowOffsetY: 2,
+          };
+        },
+        state: {
+          selected: { lineWidth: 3, stroke: '#1890ff', shadowBlur: 12, shadowColor: '#1890ff' },
+          active: { lineWidth: 2.5, stroke: '#4a90e2' },
+          inactive: { opacity: 0.65 },
+        },
+      },
+      edge: {
+        type: 'polyline',
+        style: (datum: { data?: { callType: string } }) => {
+          const ct = datum.data?.callType ?? '';
+          const isImpl = ['IMPL', 'INT', '_ITF'].includes(ct);
+          return {
+            stroke: isImpl ? '#fa8c16' : '#000',
+            lineWidth: 2,
+            endArrow: true,
+            endArrowSize: 10,
+            radius: 8,
+            labelText: ct && ct !== 'ITR' && ct !== 'STA' ? ct : '',
+            labelFontSize: 10,
+            labelFill: isImpl ? '#fa8c16' : '#666',
+            labelBackground: true,
+            labelBackgroundFill: '#fff',
+            labelBackgroundRadius: 2,
+          };
+        },
+        state: { active: { stroke: '#1890ff', lineWidth: 1.5 }, inactive: { opacity: 0.1 } },
+      },
+      layout: { type: 'antv-dagre', rankdir: 'TB', nodesep: 30, ranksep: 80, nodeSize: [280, 70] },
+      behaviors: ['drag-canvas', 'drag-element', { type: 'click-select', multiple: false }],
+      animation: { duration: 300 },
+    });
+
+    // Node click → show source in bottom panel (click again to deselect)
+    let lastSelectedNode: string | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    graph.on('node:click', (event: any) => {
+      const nodeId = event?.itemId ?? event?.target?.id;
+      if (!nodeId) return;
+      const data = nodeMap.get(nodeId);
+      if (!data) return;
+
+      // If clicking same node again → deselect, restore all, hide source
+      if (lastSelectedNode === nodeId) {
+        lastSelectedNode = null;
+        try {
+          const states: Record<string, string[]> = {};
+          nodes.forEach(n => { states[n.id] = []; });
+          graph.setElementState?.(states);
+        } catch { /* */ }
+        setSourcePanelOpen(false);
+        return;
+      }
+      lastSelectedNode = nodeId;
+
+      // Highlight clicked node + adjacent
+      try {
+        const neighbors = new Set<string>();
+        neighbors.add(nodeId);
+        edges.forEach(e => {
+          if (e.source === nodeId) neighbors.add(e.target);
+          if (e.target === nodeId) neighbors.add(e.source);
+        });
+        const states: Record<string, string[]> = {};
+        nodes.forEach(n => {
+          if (n.id === nodeId) states[n.id] = ['selected'];
+          else if (neighbors.has(n.id)) states[n.id] = ['active'];
+          else states[n.id] = ['inactive'];
+        });
+        graph.setElementState?.(states);
+      } catch { /* */ }
+
+      showSource(data.fullMethod);
+    });
+
+    // Click empty canvas → clear highlights + close source
+    graph.on('canvas:click', () => {
+      try {
+        const clearStates: Record<string, string[]> = {};
+        nodes.forEach(n => { clearStates[n.id] = []; });
+        edges.forEach(e => { clearStates[e.id] = []; });
+        graph.setElementState?.(clearStates);
+      } catch { /* */ }
+      setSourcePanelOpen(false);
+    });
+
+    graph.render().catch(console.warn);
+    graphRef.current = graph;
+
+    const ro = new ResizeObserver(() => {
+      if (!graphRef.current) return;
+      try { graphRef.current.changeSize?.(container.clientWidth, container.clientHeight); } catch { /* */ }
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
   }, [callTree, showSource]);
 
-  // ─── Group entry points ──────────────────────────────────────────────────
+  // ── Toolbar ──
+  const handleZoomIn = () => { try { graphRef.current?.zoomBy?.(1.3); } catch { /* */ } };
+  const handleZoomOut = () => { try { graphRef.current?.zoomBy?.(0.7); } catch { /* */ } };
+  const handleFitView = () => { try { graphRef.current?.fitView?.({ padding: 20 }); } catch { /* */ } };
 
+  // ── File tree click: highlight graph node + show source ──
+  const handleFileTreeClick = useCallback((className: string) => {
+    const repoId = selectedRepoIds[0];
+    if (!repoId) return;
+
+    // Highlight in graph: set clicked node + neighbors to active/selected, rest to inactive
+    const graph = graphRef.current;
+    if (graph) {
+      try {
+        // Find neighbors of clicked node from classEdges
+        const neighbors = new Set<string>();
+        neighbors.add(className);
+        classEdges.forEach(e => {
+          if (e.source === className) neighbors.add(e.target);
+          if (e.target === className) neighbors.add(e.source);
+        });
+
+        // Build state map: all nodes are in graph (single repo, full render)
+        const states: Record<string, string[]> = {};
+        const allItems = [...fileTreeData.values()].flat();
+        for (const item of allItems) {
+          if (item.className === className) {
+            states[item.className] = ['selected'];
+          } else if (neighbors.has(item.className)) {
+            states[item.className] = ['active'];
+          } else {
+            states[item.className] = ['inactive'];
+          }
+        }
+        try { graph.setElementState?.(states); } catch { /* */ }
+
+        // Highlight edges
+        const edgeStates: Record<string, string[]> = {};
+        classEdges.forEach((e, i) => {
+          const edgeId = `fe${i}`;
+          if (e.source === className || e.target === className) {
+            edgeStates[edgeId] = ['active'];
+          } else {
+            edgeStates[edgeId] = ['inactive'];
+          }
+        });
+        try { graph.setElementState?.(edgeStates); } catch { /* */ }
+
+        // Focus on node
+        try { graph.focusElement?.(className, { duration: 400 }); } catch { /* */ }
+      } catch { /* graph API variation */ }
+    }
+
+    // Load full class source with structured detail (params, dependencies, etc)
+    showSource(className + ':__CLASS__()');
+  }, [selectedRepoIds, classEdges, fileTreeData, showSource]);
+
+  // ── Entry point grouping helpers ──
   const grouped = entryPoints.reduce<Record<string, EntryPoint[]>>((acc, ep) => {
-    const type = ep.endpointType || 'OTHER';
-    if (!acc[type]) acc[type] = [];
-    acc[type].push(ep);
-    return acc;
+    const t = ep.endpointType || 'OTHER'; if (!acc[t]) acc[t] = []; acc[t].push(ep); return acc;
   }, {});
+  const groupOrder = ['CONTROLLER','KAFKA','ROCKETMQ','RABBITMQ','MQ','GRPC','SCHEDULED','LISTENER','OTHER'];
+  const groupLabels: Record<string,string> = { CONTROLLER:'HTTP 接口',KAFKA:'Kafka',ROCKETMQ:'RocketMQ',RABBITMQ:'RabbitMQ',MQ:'MQ',GRPC:'gRPC 服务',SCHEDULED:'定时任务',LISTENER:'监听',OTHER:'其他' };
 
-  const groupOrder = ['CONTROLLER', 'KAFKA', 'ROCKETMQ', 'RABBITMQ', 'MQ', 'GRPC', 'SCHEDULED', 'LISTENER', 'OTHER'];
-  const groupLabels: Record<string, string> = {
-    CONTROLLER: 'HTTP 接口',
-    KAFKA: 'Kafka 消费者',
-    ROCKETMQ: 'RocketMQ 消费者',
-    RABBITMQ: 'RabbitMQ 消费者',
-    MQ: 'MQ 消费者',
-    GRPC: 'gRPC 服务',
-    SCHEDULED: '定时任务',
-    LISTENER: '消息监听',
-    OTHER: '其他',
-  };
-
-  // Filter entry points by search
   const filterEntries = (eps: EntryPoint[]) => {
     if (!searchText) return eps;
     const lower = searchText.toLowerCase();
-    // 仅按「类简称 + 方法名 + URL」匹配，不匹配完整包路径，
-    // 避免搜关键词时命中同名业务包下的无关 Controller。
-    const simpleClass = (cn: string) => {
-      const c = cn.split('$')[0];                 // 去内部类
-      return (c.split('.').pop() ?? c).toLowerCase();
-    };
-    const methodName = (fm: string) => {
-      const afterColon = fm.includes(':') ? fm.slice(fm.lastIndexOf(':') + 1) : fm;
-      return (afterColon.split('(')[0] ?? '').toLowerCase();
-    };
-    return eps.filter(
-      (ep) =>
-        (ep.urlPath ?? '').toLowerCase().includes(lower) ||
-        simpleClass(ep.className ?? '').includes(lower) ||
-        methodName(ep.fullMethod ?? '').includes(lower),
+    return eps.filter(ep =>
+      (ep.urlPath ?? '').toLowerCase().includes(lower) ||
+      (ep.className ?? '').split('.').pop()?.toLowerCase().includes(lower) ||
+      (ep.fullMethod ?? '').split(':').pop()?.split('(')[0]?.toLowerCase().includes(lower)
     );
   };
 
-  // 把一组入口点按所属类（文件）分组，返回 [类简称, 全名, 方法列表][]，类名排序稳定
   const groupByClass = (eps: EntryPoint[]): Array<[string, string, EntryPoint[]]> => {
     const map = new Map<string, EntryPoint[]>();
-    for (const ep of eps) {
-      const cls = ep.className ?? '(未知类)';
-      (map.get(cls) ?? map.set(cls, []).get(cls)!).push(ep);
+    for (const ep of eps) { const cls = ep.className ?? '?'; (map.get(cls) ?? map.set(cls, []).get(cls)!).push(ep); }
+    return Array.from(map.entries()).map(([cls, list]) => [(cls.split('.').pop() ?? cls), cls, list] as [string, string, EntryPoint[]]).sort((a, b) => a[0].localeCompare(b[0]));
+  };
+
+  const toggleClass = (cls: string) => setCollapsedClasses(prev => { const n = new Set(prev); n.has(cls) ? n.delete(cls) : n.add(cls); return n; });
+
+  // ── File tree rendering helper — IDEA style ──
+  const [expandedPkgs, setExpandedPkgs] = useState<Set<string>>(new Set());
+  const togglePkg = (key: string) => setExpandedPkgs(prev => {
+    const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n;
+  });
+
+  const classColor = (shortName: string): string => {
+    if (shortName.endsWith('Controller')) return '#2e7d32';
+    if (shortName.endsWith('Service') || shortName.endsWith('ServiceImpl')) return '#1565c0';
+    if (shortName.endsWith('Mapper') || shortName.endsWith('Repository') || shortName.endsWith('Dao')) return '#6a1b9a';
+    if (shortName.endsWith('Config') || shortName.endsWith('Configuration')) return '#4527a0';
+    if (shortName.endsWith('Exception') || shortName.endsWith('Error')) return '#c62828';
+    if (shortName.endsWith('Interceptor') || shortName.endsWith('Filter') || shortName.endsWith('Aspect')) return '#e65100';
+    return '#333';
+  };
+
+  const buildPackageTree = (items: FileTreeItem[], repoName: string) => {
+    // 1) Find common prefix to strip
+    const pkgs = items.map(i => i.packageName).filter(Boolean);
+    let commonLen = 0;
+    if (pkgs.length > 0) {
+      const first = pkgs[0].split('.');
+      for (let i = 0; i < first.length; i++) {
+        if (pkgs.every(p => p.split('.')[i] === first[i])) commonLen++;
+        else break;
+      }
     }
-    return Array.from(map.entries())
-      .map(([cls, list]) => {
-        const short = (cls.split('$')[0].split('.').pop()) ?? cls;
-        return [short, cls, list] as [string, string, EntryPoint[]];
-      })
-      .sort((a, b) => a[0].localeCompare(b[0]));
-  };
 
-  const toggleClass = (cls: string) => {
-    setCollapsedClasses((prev) => {
-      const next = new Set(prev);
-      if (next.has(cls)) next.delete(cls); else next.add(cls);
-      return next;
-    });
-  };
+    // 2) Build tree
+    type N = { seg: string; path: string; children: Map<string, N>; classes: FileTreeItem[] };
+    const root: N = { seg: repoName, path: '', children: new Map(), classes: [] };
 
-  // 从完整类名派生所属 module：取「分层包段」(controller/listener/handler/...) 之前的最后一段，
-  // 如 a.b.goods.controller.backend.X -> goods，a.b.order.task.Y -> order。
-  // 这样多 module 项目里同名类（每个 module 都有的 HealthController）能按 module 区分。
-  const moduleOf = (className: string): string => {
-    const segs = (className ?? '').split('$')[0].split('.');
-    if (segs.length < 2) return className || '(默认)';
-    const layerWords = new Set([
-      'controller', 'listener', 'handler', 'task', 'job', 'schedule',
-      'scheduled', 'service', 'web', 'rest', 'api', 'rpc', 'grpc', 'mq', 'consumer',
-    ]);
-    const layerIdx = segs.findIndex((s) => layerWords.has(s.toLowerCase()));
-    if (layerIdx > 0) return segs[layerIdx - 1];
-    // 没有可识别的分层段：退而取倒数第二段（类名前一段）
-    return segs[segs.length - 2];
-  };
-
-  // 把一组入口点先按 module 分组，返回 [module, 方法列表][]，按 module 名排序
-  const groupByModule = (eps: EntryPoint[]): Array<[string, EntryPoint[]]> => {
-    const map = new Map<string, EntryPoint[]>();
-    for (const ep of eps) {
-      const mod = moduleOf(ep.className ?? '');
-      (map.get(mod) ?? map.set(mod, []).get(mod)!).push(ep);
+    for (const item of items) {
+      const parts = (item.packageName || '').split('.').slice(commonLen);
+      let cur = root;
+      const trail: string[] = [];
+      for (const p of parts) {
+        trail.push(p);
+        if (!cur.children.has(p)) cur.children.set(p, { seg: p, path: trail.join('.'), children: new Map(), classes: [] });
+        cur = cur.children.get(p)!;
+      }
+      cur.classes.push(item);
     }
-    return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+    // 3) Compact middle packages (IDEA style: if node has 1 child and 0 classes → merge)
+    function compact(node: N): N {
+      const newCh = new Map<string, N>();
+      for (const [, child] of node.children) {
+        let c = compact(child);
+        while (c.children.size === 1 && c.classes.length === 0) {
+          const [, grandchild] = [...c.children.entries()][0];
+          c = { ...grandchild, seg: c.seg + '.' + grandchild.seg };
+        }
+        newCh.set(c.seg, c);
+      }
+      return { ...node, children: newCh };
+    }
+    const tree = compact(root);
+
+    // 4) Render with collapse/expand
+    function count(n: N): number { return n.classes.length + [...n.children.values()].reduce((s, c) => s + count(c), 0); }
+
+    function render(node: N, depth: number, isRoot: boolean): React.ReactNode {
+      const key = `${repoName}::${node.path}`;
+      const expanded = isRoot || expandedPkgs.has(key);
+      const total = count(node);
+      const hasKids = node.children.size > 0 || node.classes.length > 0;
+
+      return (
+        <div key={key}>
+          <div onClick={() => hasKids && !isRoot && togglePkg(key)}
+            style={{ padding: `2px 4px 2px ${depth * 16}px`, fontSize: 12, display: 'flex', alignItems: 'center', gap: 4,
+              cursor: hasKids ? 'pointer' : 'default', userSelect: 'none',
+              fontWeight: isRoot ? 600 : 400, background: isRoot ? '#fafafa' : undefined }}>
+            {hasKids && !isRoot ? (expanded ? <DownOutlined style={{ fontSize: 8, color: '#999' }} /> : <RightOutlined style={{ fontSize: 8, color: '#999' }} />) : <span style={{ width: 10 }} />}
+            <span style={{ color: '#b09050', fontSize: 11 }}>{isRoot ? '📦' : '📂'}</span>
+            <span style={{ flex: 1, color: '#262626' }}>{node.seg}</span>
+            <span style={{ color: '#bfbfbf', fontSize: 10, paddingRight: 4 }}>{total}</span>
+          </div>
+          {expanded && [...node.children.values()].sort((a, b) => a.seg.localeCompare(b.seg)).map(c => render(c, depth + 1, false))}
+          {expanded && node.classes.sort((a, b) => a.className.localeCompare(b.className)).map(cls => {
+            const short = (cls.className.split('.').pop() ?? '').replace(/\$.+/, '');
+            return (
+              <div key={cls.className} className="entry-item" data-classname={cls.className} onClick={() => handleFileTreeClick(cls.className)}
+                style={{ padding: `2px 4px 2px ${(depth + 1) * 16}px`, fontSize: 12, display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                <span style={{ color: '#6897bb', fontWeight: 700, fontSize: 10, width: 12 }}>C</span>
+                <span style={{ color: classColor(short), flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{short}</span>
+                <span style={{ color: '#bfbfbf', fontSize: 10 }}>{cls.methodCount}</span>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    return render(tree, 0, true);
   };
 
-  const toggleModule = (mod: string) => {
-    setCollapsedModules((prev) => {
-      const next = new Set(prev);
-      if (next.has(mod)) next.delete(mod); else next.add(mod);
-      return next;
-    });
-  };
-
-  // ─── Toolbar actions ─────────────────────────────────────────────────────
-
-  const handleZoomIn = () => graphRef.current?.zoom(1.2, undefined, true);
-  const handleZoomOut = () => graphRef.current?.zoom(0.8, undefined, true);
-  const handleFitView = () => graphRef.current?.fitView();
-
+  // ── JSX Render ──
   return (
     <div className="callgraph-page">
-      {/* ── Left Panel ── */}
+      {/* ═══ Left Panel ═══ */}
       <div className="callgraph-left">
+        {/* Repo multi-select */}
         <div className="left-header">
-          <Select
-            style={{ width: '100%', marginBottom: 8 }}
-            placeholder="选择仓库"
-            value={selectedRepoId}
-            onChange={(val) => setSelectedRepoId(val)}
-            options={repos
-              .filter((r) => r.status === 'ANALYZED' || r.status === 'READY')
-              .map((r) => ({ label: r.name, value: r.id }))}
-            allowClear
-          />
-          {selectedRepoId && (
-            <Input.Search
-              placeholder="搜索入口点..."
-              value={searchText}
-              onChange={(e) => setSearchText(e.target.value)}
-              allowClear
-              size="small"
-            />
-          )}
+          <Select style={{ width: '100%', marginBottom: 8 }} placeholder="选择仓库"
+            value={selectedRepoIds[0] ?? null} onChange={v => setSelectedRepoIds(v ? [v] : [])}
+            options={repos.filter(r => r.status === 'ANALYZED' || r.status === 'READY').map(r => ({ label: r.name, value: r.id }))}
+            allowClear />
         </div>
 
+        {/* Tabs: 目录结构 / 调用链 */}
+        <Tabs activeKey={activeTab} onChange={k => { setActiveTab(k as 'files' | 'entries'); setSourcePanelOpen(false); setSourceCode(''); setSourceDetail(null); }} size="small"
+          style={{ padding: '0 8px' }}
+          items={[
+            { key: 'files', label: <span><FolderOutlined /> 目录结构</span> },
+            { key: 'entries', label: <span><ApiOutlined /> 调用链</span> },
+          ]} />
+
         <div className="entry-list">
-          {loadingEntries ? (
-            <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div>
-          ) : !selectedRepoId ? (
-            <Empty description="请先选择仓库" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-          ) : entryPoints.length === 0 ? (
-            <Empty description="暂无入口点，请先分析仓库" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-          ) : (
-            groupOrder.map((type) => {
-              const eps = filterEntries(grouped[type] ?? []);
-              if (eps.length === 0) return null;
-              const moduleGroups = groupByModule(eps);
+          {activeTab === 'files' ? (
+            /* ── 目录结构 Tab ── */
+            loadingFileTree ? <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div> :
+            selectedRepoIds.length === 0 ? <Empty description="请先选择仓库" image={Empty.PRESENTED_IMAGE_SIMPLE} /> :
+            Array.from(fileTreeData.entries()).map(([repoId, items]) => {
+              const repo = repos.find(r => r.id === repoId);
+              const jars = jarNames.get(repoId) ?? [];
+              // Group items by jarNum (module)
+              const byJar = new Map<number, FileTreeItem[]>();
+              for (const item of items) {
+                const j = item.jarNum ?? 0;
+                (byJar.get(j) ?? byJar.set(j, []).get(j)!).push(item);
+              }
               return (
-                <div key={type}>
-                  <div className="entry-group-title">
-                    <Tag color={ENDPOINT_TYPE_COLORS[type] ?? '#8c8c8c'} style={{ fontSize: 11 }}>
-                      {groupLabels[type] ?? type}
-                    </Tag>
-                    <span style={{ marginLeft: 4, fontSize: 11, color: '#bfbfbf' }}>
-                      {moduleGroups.length} 个模块 · {eps.length} 个接口
-                    </span>
+                <div key={repoId}>
+                  <div style={{ padding: '6px 8px', fontWeight: 600, fontSize: 12, color: '#262626', background: '#fafafa', borderBottom: '1px solid #f0f0f0' }}>
+                    📦 {repo?.name ?? `repo-${repoId}`}
+                    <span style={{ color: '#bfbfbf', fontWeight: 400, marginLeft: 6 }}>{items.length} 类 · {byJar.size} 模块</span>
                   </div>
-                  {moduleGroups.map(([mod, modEps]) => {
-                    const modKey = `${type}::${mod}`;
-                    const modCollapsed = collapsedModules.has(modKey);
-                    const classGroups = groupByClass(modEps);
+                  {[...byJar.entries()].sort((a, b) => a[0] - b[0]).map(([jarNum, jarItems]) => {
+                    const moduleName = jars[jarNum] ?? `module-${jarNum}`;
                     return (
-                      <div key={modKey} className="entry-module-group">
-                        <div className="entry-module-header" onClick={() => toggleModule(modKey)}>
-                          {modCollapsed ? <RightOutlined /> : <DownOutlined />}
-                          <span className="entry-module-name" title={mod}>📦 {mod}</span>
-                          <span className="entry-module-count">{classGroups.length} 类 / {modEps.length}</span>
-                        </div>
-                        {!modCollapsed && classGroups.map(([shortClass, fullClass, classEps]) => {
-                          const collapsed = collapsedClasses.has(fullClass);
-                          return (
-                            <div key={fullClass} className="entry-class-group">
-                              <div className="entry-class-header" onClick={() => toggleClass(fullClass)}>
-                                {collapsed ? <RightOutlined /> : <DownOutlined />}
-                                <span className="entry-class-name" title={fullClass}>{shortClass}</span>
-                                <span className="entry-class-count">{classEps.length}</span>
-                              </div>
-                              {!collapsed && classEps.map((ep) => (
-                                <div
-                                  key={ep.id}
-                                  className={`entry-item${selectedEntry === ep.fullMethod ? ' active' : ''}`}
-                                  onClick={() => loadCallTree(ep.fullMethod)}
-                                >
-                                  <div className="entry-method">
-                                    {ep.httpMethod && (
-                                      <Tag
-                                        color={
-                                          ep.httpMethod === 'GET' ? 'green' :
-                                          ep.httpMethod === 'POST' ? 'blue' :
-                                          ep.httpMethod === 'PUT' ? 'orange' :
-                                          ep.httpMethod === 'DELETE' ? 'red' : 'default'
-                                        }
-                                        style={{ fontSize: 10, marginRight: 4 }}
-                                      >
-                                        {ep.httpMethod}
-                                      </Tag>
-                                    )}
-                                    {ep.urlPath || ep.fullMethod.split(':').pop()?.split('(')[0]}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          );
-                        })}
+                      <div key={`${repoId}:${jarNum}`}>
+                        {byJar.size > 1 && (
+                          <div style={{ padding: '4px 8px 2px 12px', fontSize: 11, fontWeight: 600, color: '#1890ff', background: '#f0f7ff', borderBottom: '1px solid #e6f0fa' }}>
+                            📂 {moduleName} <span style={{ color: '#bfbfbf', fontWeight: 400 }}>{jarItems.length}</span>
+                          </div>
+                        )}
+                        {buildPackageTree(jarItems, moduleName)}
                       </div>
                     );
                   })}
                 </div>
               );
             })
+          ) : (
+            /* ── 调用链 Tab ── */
+            <>
+              {selectedRepoIds.length > 0 && (
+                <Input.Search placeholder="搜索入口点..." value={searchText}
+                  onChange={e => setSearchText(e.target.value)} allowClear size="small" style={{ margin: '0 8px 8px', width: 'calc(100% - 16px)' }} />
+              )}
+              {loadingEntries ? <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div> :
+               selectedRepoIds.length === 0 ? <Empty description="请先选择仓库" image={Empty.PRESENTED_IMAGE_SIMPLE} /> :
+               entryPoints.length === 0 ? <Empty description="暂无入口点" image={Empty.PRESENTED_IMAGE_SIMPLE} /> :
+               groupOrder.map(type => {
+                 const eps = filterEntries(grouped[type] ?? []);
+                 if (!eps.length) return null;
+                 const classGroups = groupByClass(eps);
+                 return (
+                   <div key={type}>
+                     <div className="entry-group-title">
+                       <Tag color={ENDPOINT_TYPE_COLORS[type] ?? '#8c8c8c'} style={{ fontSize: 10 }}>{groupLabels[type] ?? type}</Tag>
+                       <span style={{ fontSize: 10, color: '#bfbfbf' }}>{eps.length}</span>
+                     </div>
+                     {classGroups.map(([shortClass, fullClass, classEps]) => {
+                       const col = collapsedClasses.has(fullClass);
+                       return (
+                         <div key={fullClass} className="entry-class-group">
+                           <div className="entry-class-header" onClick={() => toggleClass(fullClass)}>
+                             {col ? <RightOutlined /> : <DownOutlined />}
+                             <span className="entry-class-name" title={fullClass}>{shortClass}</span>
+                             <span className="entry-class-count">{classEps.length}</span>
+                           </div>
+                           {!col && classEps.map(ep => (
+                             <div key={ep.id} className={`entry-item${selectedEntry === ep.fullMethod ? ' active' : ''}`}
+                               onClick={() => loadCallTree(ep.fullMethod)}>
+                               <div className="entry-method">
+                                 {ep.httpMethod && <Tag color={ep.httpMethod==='GET'?'green':ep.httpMethod==='POST'?'blue':'orange'} style={{ fontSize: 9, marginRight: 4 }}>{ep.httpMethod}</Tag>}
+                                 {ep.urlPath || ep.fullMethod.split(':').pop()?.split('(')[0]}
+                               </div>
+                             </div>
+                           ))}
+                         </div>
+                       );
+                     })}
+                   </div>
+                 );
+               })}
+            </>
           )}
         </div>
       </div>
 
-      {/* ── Right Panel ── */}
-      <div className="callgraph-right">
-        {loadingTree ? (
-          <div className="graph-placeholder"><Spin size="large" tip="加载调用树..." /></div>
-        ) : !callTree ? (
-          <div className="graph-placeholder">
-            <Empty description="点击左侧入口点查看调用链" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-          </div>
-        ) : (
+      {/* ═══ Right Panel ═══ */}
+      <div className="callgraph-right" style={{ display: 'flex', flexDirection: 'column' }}>
+        {activeTab === 'files' ? (
+          /* ── 目录结构 Tab: 整个仓库的类关系力导向图 + 底部源码 ── */
           <>
-            {/* Toolbar */}
             <div className="graph-toolbar">
-              <Tooltip title="放大">
-                <Button size="small" icon={<ZoomInOutlined />} onClick={handleZoomIn} />
-              </Tooltip>
-              <Tooltip title="缩小">
-                <Button size="small" icon={<ZoomOutOutlined />} onClick={handleZoomOut} />
-              </Tooltip>
-              <Tooltip title="适应画布">
-                <Button size="small" icon={<ExpandOutlined />} onClick={handleFitView} />
-              </Tooltip>
-              <Tooltip title="日志诊断">
-                <Button size="small" type="primary" danger icon={<BugOutlined />} onClick={() => setLogDrawerOpen(true)}>
-                  日志诊断
-                </Button>
-              </Tooltip>
-              <Tooltip title="生成可运行代码">
-                <Button size="small" icon={<CodeOutlined />} onClick={handleGenerateCode} loading={generatingCode}>
-                  生成代码
-                </Button>
-              </Tooltip>
-              <Tooltip title="产品文档（业务功能说明）">
-                <Button size="small" icon={<FileTextOutlined />} onClick={() => handleGenerateDoc('product')}>
-                  产品文档
-                </Button>
-              </Tooltip>
-              <Tooltip title="研发文档（技术逻辑+伪代码）">
-                <Button size="small" icon={<FileTextOutlined />} onClick={() => handleGenerateDoc('dev')}>
-                  研发文档
-                </Button>
-              </Tooltip>
-            </div>
-
-            {/* Stats */}
-            <div className="graph-stats">
-              <span>节点: {callTree.totalNodes}</span>
-              <span style={{ margin: '0 8px' }}>|</span>
-              <span>深度: {callTree.maxDepth}</span>
-              {callTree.hasCycle && (
-                <>
-                  <span style={{ margin: '0 8px' }}>|</span>
-                  <Tag color="warning" style={{ margin: 0 }}>存在循环</Tag>
-                </>
-              )}
-              {callTree.warnings && callTree.warnings.length > 0 && (
-                <>
-                  <span style={{ margin: '0 8px' }}>|</span>
-                  <Tooltip title={
-                    <div style={{ maxWidth: 400 }}>
-                      <div style={{ marginBottom: 8, fontWeight: 600 }}>以下方法在多个仓库中有相同签名定义：</div>
-                      {callTree.warnings.map((w, i) => (
-                        <div key={i} style={{ marginBottom: 6, fontSize: 12 }}>
-                          <div style={{ color: '#ffe58f' }}>{w.fullMethod.split(':').pop()}</div>
-                          <div style={{ paddingLeft: 8 }}>
-                            {w.locations.map((loc, j) => (
-                              <div key={j}>• {loc.repoName}</div>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                      <div style={{ marginTop: 8, color: '#d9d9d9', fontSize: 11 }}>
-                        静态分析无法确定调用指向哪个仓库的实现，请人工确认
-                      </div>
-                    </div>
-                  }>
-                    <Tag color="warning" style={{ margin: 0, cursor: 'pointer' }}>
-                      歧义: {callTree.warnings.length}
-                    </Tag>
-                  </Tooltip>
-                </>
-              )}
-            </div>
-
-            {/* Graph */}
-            <div className="graph-container" ref={graphContainerRef} />
-
-            {/* Legend */}
-            <div style={{
-              position: 'absolute', bottom: 12, left: 12,
-              background: 'rgba(255,255,255,0.92)', borderRadius: 6,
-              padding: '8px 14px', fontSize: 11, color: '#595959',
-              boxShadow: '0 2px 8px rgba(0,0,0,0.08)', zIndex: 10,
-              display: 'flex', gap: 12, flexWrap: 'wrap',
-            }}>
-              <span><AimOutlined style={{ marginRight: 4 }} />单击查看源码</span>
-              <span><CodeOutlined style={{ marginRight: 4 }} />双击展开/折叠</span>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                边界:
-                {Object.entries(BOUNDARY_COLORS).map(([k, c]) => (
-                  <Tooltip key={k} title={k}>
-                    <span className={`boundary-dot ${k}`} style={{ background: c }} />
-                  </Tooltip>
-                ))}
+              <Tooltip title="放大"><Button size="small" icon={<ZoomInOutlined />} onClick={handleZoomIn} /></Tooltip>
+              <Tooltip title="缩小"><Button size="small" icon={<ZoomOutOutlined />} onClick={handleZoomOut} /></Tooltip>
+              <Tooltip title="适应画布"><Button size="small" icon={<ExpandOutlined />} onClick={handleFitView} /></Tooltip>
+              <div style={{ flex: 1 }} />
+              <span style={{ fontSize: 11, color: '#8c8c8c' }}>
+                {fileTreeData.size > 0 && `${[...fileTreeData.values()].reduce((s, v) => s + v.length, 0)} 个类`}
               </span>
             </div>
+            {/* Graph (fills available space) */}
+            <div style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden', borderBottom: sourcePanelOpen ? '1px solid #f0f0f0' : 'none' }}>
+              <div ref={graphContainerRef} style={{ width: '100%', height: '100%' }} />
+            </div>
+            {/* Source panel (30%) — only visible when a node is clicked */}
+            {sourcePanelOpen && (
+            <div style={{ height: '30%', maxHeight: '30%', minHeight: 0, overflow: 'auto', background: '#fff', borderTop: '1px solid #e8e8e8', position: 'relative' }}>
+              <Button size="small" type="text" onClick={() => setSourcePanelOpen(false)}
+                style={{ position: 'sticky', top: 0, right: 0, zIndex: 10, float: 'right', color: '#8c8c8c' }}>✕</Button>
+              {loadingSource ? (
+                <div style={{ textAlign: 'center', padding: 24 }}><Spin /><div style={{ color: '#8c8c8c', marginTop: 8, fontSize: 12 }}>加载源码...</div></div>
+              ) : sourceCode ? (
+                <div style={{ height: '100%' }}>
+                  <div style={{ padding: '6px 12px', background: '#f5f5f5', borderBottom: '1px solid #e8e8e8', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <CodeOutlined style={{ color: '#1890ff' }} />
+                    <span style={{ fontSize: 12, color: '#262626', fontFamily: 'monospace', fontWeight: 600 }}>
+                      {sourceMethod.split(':')[0]?.split('.').pop() ?? sourceMethod}
+                    </span>
+                  </div>
+                  <JavaCodeViewer code={sourceCode} maxHeight="100%" />
+                </div>
+              ) : (
+                <div style={{ textAlign: 'center', padding: 24, color: '#8c8c8c', fontSize: 12 }}>无源码</div>
+              )}
+            </div>
+            )}
+          </>
+        ) : (
+          /* ── 调用链 Tab: Dagre 流程图 + 底部源码 ── */
+          <>
+            {loadingTree ? (
+              <div className="graph-placeholder"><Spin size="large" /><div style={{ marginTop: 12, color: '#8c8c8c' }}>加载调用树...</div></div>
+            ) : !callTree ? (
+              <div className="graph-placeholder">
+                <Empty description={<span style={{ color: '#8c8c8c' }}>选择左侧入口查看调用链</span>} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+              </div>
+            ) : (
+              <>
+                {/* Toolbar */}
+                <div className="graph-toolbar">
+                  <Tooltip title="放大"><Button size="small" icon={<ZoomInOutlined />} onClick={handleZoomIn} /></Tooltip>
+                  <Tooltip title="缩小"><Button size="small" icon={<ZoomOutOutlined />} onClick={handleZoomOut} /></Tooltip>
+                  <Tooltip title="适应画布"><Button size="small" icon={<ExpandOutlined />} onClick={handleFitView} /></Tooltip>
+                  <div style={{ width: 1, height: 16, background: '#e8e8e8', margin: '0 4px' }} />
+                  <Button size="small" icon={<FileTextOutlined />} onClick={() => handleGenerateDoc('product')}>产品文档</Button>
+                  <div style={{ flex: 1 }} />
+                  <span style={{ fontSize: 11, color: '#8c8c8c' }}>节点: {callTree.totalNodes} | 深度: {callTree.maxDepth}</span>
+                </div>
+
+                {/* Dagre graph (fills space) */}
+                <div style={{ flex: 1, minHeight: 0, position: 'relative', borderBottom: sourcePanelOpen ? '1px solid #f0f0f0' : 'none' }}>
+                  <div ref={graphContainerRef} style={{ width: '100%', height: '100%' }} />
+                </div>
+
+                {/* Source code panel (30%) — toggled */}
+                {sourcePanelOpen && (
+                <div style={{ height: '30%', maxHeight: '30%', minHeight: 0, overflow: 'auto', background: '#fff', borderTop: '1px solid #e8e8e8', position: 'relative' }}>
+                  <Button size="small" type="text" onClick={() => setSourcePanelOpen(false)}
+                    style={{ position: 'sticky', top: 0, right: 0, zIndex: 10, float: 'right', color: '#8c8c8c' }}>✕</Button>
+                  {loadingSource ? (
+                    <div style={{ textAlign: 'center', padding: 24 }}><Spin /><div style={{ color: '#8c8c8c', marginTop: 8, fontSize: 12 }}>加载源码...</div></div>
+                  ) : sourceCode ? (
+                    <div style={{ height: '100%' }}>
+                      <div style={{ padding: '6px 12px', background: '#f5f5f5', borderBottom: '1px solid #e8e8e8', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <CodeOutlined style={{ color: '#1890ff' }} />
+                        <span style={{ fontSize: 12, color: '#262626', fontFamily: 'monospace', fontWeight: 600 }}>
+                          {sourceMethod.split(':').pop()?.split('(')[0] ?? sourceMethod}
+                        </span>
+                        <span style={{ fontSize: 11, color: '#8c8c8c', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {sourceMethod.split(':')[0]?.split('.').slice(-2).join('.')}
+                        </span>
+                      </div>
+                      {/* Structured info ABOVE code */}
+                      {sourceDetail && (
+                        <div style={{ padding: '10px 12px', borderBottom: '1px solid #e8e8e8', fontSize: 12, background: '#fafafa' }}>
+                          {sourceDetail.paramClasses && sourceDetail.paramClasses.length > 0 && (
+                            <div style={{ marginBottom: 10 }}>
+                              <div style={{ fontWeight: 700, color: '#1890ff', marginBottom: 6 }}>📋 入参类型</div>
+                              {sourceDetail.paramClasses.map((p, i) => (
+                                <div key={i} style={{ marginBottom: 4, paddingLeft: 12 }}>
+                                  <span style={{ fontWeight: 600, color: '#262626' }}>{p.shortName}</span>
+                                  {p.fields.length > 0 && (
+                                    <div style={{ paddingLeft: 12, color: '#595959', fontSize: 11, marginTop: 2 }}>
+                                      {p.fields.map((f, j) => <span key={j} style={{ marginRight: 8, padding: '1px 6px', background: '#e6f4ff', borderRadius: 3, display: 'inline-block', marginBottom: 2 }}>{f}</span>)}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {sourceDetail.chainContext && sourceDetail.chainContext.length > 0 && (
+                            <div style={{ marginBottom: 10 }}>
+                              <div style={{ fontWeight: 700, color: '#fa8c16', marginBottom: 6 }}>🔗 外部依赖</div>
+                              <div style={{ paddingLeft: 12, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                {sourceDetail.chainContext.map((c, i) => (
+                                  <span key={i} style={{ padding: '2px 8px', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 4, color: '#d46b08', fontSize: 11 }}>{c}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {sourceDetail.enumValues && sourceDetail.enumValues.length > 0 && (
+                            <div>
+                              <div style={{ fontWeight: 700, color: '#722ed1', marginBottom: 6 }}>📌 常量/枚举</div>
+                              <div style={{ paddingLeft: 12, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                {sourceDetail.enumValues.slice(0, 12).map((v, i) => (
+                                  <span key={i} style={{ padding: '2px 8px', background: '#f9f0ff', border: '1px solid #d3adf7', borderRadius: 4, color: '#531dab', fontFamily: 'monospace', fontSize: 11 }}>{v}</span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <JavaCodeViewer code={sourceCode} maxHeight="none" />
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: 'center', padding: 24, color: '#bfbfbf', fontSize: 12 }}>无源码</div>
+                  )}
+                </div>
+                )}
+              </>
+            )}
           </>
         )}
       </div>
 
-      {/* ── Node Detail Drawer ── */}
-      <Drawer
-        title={
-          <span style={{ fontSize: 13 }}>
-            {detailNode?.diagStatus === 'ERROR' ? '❌ ' : detailNode?.diagStatus === 'OK' ? '✅ ' : detailNode?.diagStatus === 'UNKNOWN' ? '❓ ' : ''}
-            {detailNode?.label ?? '节点详情'}
-          </span>
-        }
-        placement="right"
-        width={560}
-        open={detailDrawerOpen}
-        onClose={() => setDetailDrawerOpen(false)}
-        extra={
-          <Space>
-            <Button size="small" icon={<CodeOutlined />} onClick={() => { if (detailNode) showSource(detailNode.fullMethod); }}>
-              查看源码
-            </Button>
-            {detailNode?.boundaries?.some(b => b.boundaryType === 'HTTP' || b.boundaryType === 'GRPC') && (
-              <Button size="small" icon={<ApiOutlined />} onClick={() => { if (detailNode) openMockEditor(detailNode.fullMethod); }}>
-                Mock
-              </Button>
-            )}
-          </Space>
-        }
-      >
-        {detailNode && (
-          <div style={{ fontSize: 13 }}>
-            {/* 方法签名 */}
-            <div style={{ padding: '8px 12px', background: '#fafafa', borderRadius: 6, marginBottom: 12, fontFamily: 'monospace', fontSize: 12, wordBreak: 'break-all' }}>
-              {detailNode.fullMethod}
-            </div>
-
-            {/* 调用类型 */}
-            {detailNode.callType && (
-              <div style={{ marginBottom: 12 }}>
-                <span style={{ color: '#8c8c8c' }}>调用类型: </span>
-                <Tag>{detailNode.callType}</Tag>
-                {detailNode.lineNumber && <span style={{ color: '#8c8c8c', marginLeft: 8 }}>行号: {detailNode.lineNumber}</span>}
-              </div>
-            )}
-
-            {/* 诊断状态 */}
-            {detailNode.diagStatus && (
-              <div style={{
-                padding: '10px 12px', borderRadius: 6, marginBottom: 12,
-                background: detailNode.diagStatus === 'ERROR' ? '#fff2f0' : detailNode.diagStatus === 'OK' ? '#f6ffed' : '#fffbe6',
-                border: `1px solid ${detailNode.diagStatus === 'ERROR' ? '#ffccc7' : detailNode.diagStatus === 'OK' ? '#b7eb8f' : '#ffe58f'}`,
-              }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                  {detailNode.diagStatus === 'OK' ? '✅ 正常' : detailNode.diagStatus === 'ERROR' ? '❌ 异常' : '❓ 未识别'}
-                </div>
-                {detailNode.diagMessage && (
-                  <div style={{ fontSize: 12, color: '#cf1322', whiteSpace: 'pre-wrap' }}>{detailNode.diagMessage}</div>
-                )}
-              </div>
-            )}
-
-            {/* 递归标记 */}
-            {detailNode.isRecursive && (
-              <div style={{ padding: '8px 12px', background: '#fff2f0', borderRadius: 6, marginBottom: 12, color: '#ff4d4f' }}>
-                ⚠️ 递归调用 — 此节点在调用链中形成环
-              </div>
-            )}
-
-            {/* 歧义标记 */}
-            {detailNode.ambiguous && (
-              <div style={{ padding: '8px 12px', background: '#fff7e6', borderRadius: 6, marginBottom: 12, color: '#d48806', borderLeft: '3px solid #faad14' }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                  ⚠️ 此节点在多个仓库中非唯一性
-                </div>
-                <div style={{ fontSize: 12 }}>
-                  此方法签名在多个仓库中有相同定义。静态分析仅靠签名匹配，无法确定调用真正指向哪个仓库的实现，请人工确认。
-                </div>
-              </div>
-            )}
-
-            {/* 边界点详情 */}
-            {detailNode.boundaries && detailNode.boundaries.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>边界点 ({detailNode.boundaries.length})</div>
-                {detailNode.boundaries.map((b, i) => {
-                  const color = BOUNDARY_COLORS[b.boundaryType] ?? '#999';
-                  const contextLines = (b.context || '').split('\n');
-                  return (
-                    <div key={i} style={{ padding: '8px 12px', background: '#fafafa', borderRadius: 6, marginBottom: 6, borderLeft: `3px solid ${color}` }}>
-                      <div style={{ fontWeight: 500 }}>
-                        <Tag color={color} style={{ marginRight: 6 }}>{b.boundaryType}</Tag>
-                        {contextLines[0]}
-                        {b.lineNumber ? <span style={{ color: '#999', marginLeft: 8 }}>(行 {b.lineNumber})</span> : null}
-                      </div>
-                      {contextLines.length > 1 && (
-                        <div style={{ marginTop: 6, padding: '6px 8px', background: '#f0f0f0', borderRadius: 4, fontFamily: 'monospace', fontSize: 11, color: '#555' }}>
-                          {contextLines.slice(1).filter(l => l.trim()).map((line, j) => (
-                            <div key={j}>{line}</div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* 无边界点时 */}
-            {(!detailNode.boundaries || detailNode.boundaries.length === 0) && !detailNode.diagStatus && !detailNode.isRecursive && (
-              <div style={{ color: '#999', textAlign: 'center', padding: 20 }}>
-                普通业务方法，无特殊标记
-              </div>
-            )}
-          </div>
-        )}
-      </Drawer>
-
-      {/* ── Source Code Drawer ── */}
-      <Drawer
-        title={
-          <span style={{ fontSize: 13 }}>
-            <CodeOutlined style={{ marginRight: 8 }} />
-            {sourceMethod.length > 80 ? sourceMethod.slice(0, 78) + '…' : sourceMethod}
-          </span>
-        }
-        placement="bottom"
-        height="55%"
-        open={sourceDrawerOpen}
-        onClose={() => setSourceDrawerOpen(false)}
-        destroyOnClose
-      >
-        {loadingSource ? (
-          <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div>
-        ) : (
-          <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            {/* 上半部分：方法信息（可滚动，最多占 40%） */}
-            <div style={{ maxHeight: '40%', overflow: 'auto', flexShrink: 0 }}>
-            {/* 方法签名 */}
-            {sourceDetail?.methodSignature && (
-              <div style={{ padding: '8px 12px', background: '#e8f4fd', borderRadius: 6, marginBottom: 8, fontFamily: 'monospace', fontSize: 13, color: '#0050b3', wordBreak: 'break-all' }}>
-                📋 {sourceDetail.methodSignature}
-              </div>
-            )}
-
-            {/* 入参实体类字段 */}
-            {sourceDetail?.paramClasses && sourceDetail.paramClasses.length > 0 && (
-              <div style={{ padding: '8px 12px', background: '#f6ffed', borderRadius: 6, marginBottom: 8, fontSize: 12, borderLeft: '3px solid #52c41a' }}>
-                <div style={{ fontWeight: 600, marginBottom: 6, color: '#389e0d' }}>📦 入参实体类字段</div>
-                {sourceDetail.paramClasses.map((pc, i) => (
-                  <div key={i} style={{ marginBottom: i < sourceDetail.paramClasses.length - 1 ? 8 : 0 }}>
-                    <div style={{ fontWeight: 600, color: '#531dab', marginBottom: 2 }}>{pc.shortName}</div>
-                    {pc.fields.map((f, j) => {
-                      const isRequired = f.startsWith('* ');
-                      const fieldText = isRequired ? f.substring(2) : f.startsWith('  ') ? f.substring(2) : f;
-                      const commentIdx = fieldText.indexOf('//');
-                      const annoIdx = fieldText.indexOf('@');
-                      const mainEnd = annoIdx > 0 && (commentIdx < 0 || annoIdx < commentIdx) ? annoIdx : (commentIdx > 0 ? commentIdx : fieldText.length);
-                      const fieldPart = fieldText.substring(0, mainEnd).trim();
-                      const restPart = fieldText.substring(mainEnd);
-                      return (
-                        <div key={j} style={{ fontFamily: 'monospace', paddingLeft: 12, lineHeight: 1.8, display: 'flex', alignItems: 'baseline', gap: 4 }}>
-                          <span style={{ color: isRequired ? '#ff4d4f' : '#d9d9d9', fontWeight: 600, width: 10, flexShrink: 0 }}>
-                            {isRequired ? '*' : ' '}
-                          </span>
-                          <span style={{ color: '#333' }}>{fieldPart}</span>
-                          {restPart && <span style={{ color: '#8c8c8c', fontSize: 11 }}>{restPart}</span>}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* 调用链上游上下文 */}
-            {sourceDetail?.chainContext && sourceDetail.chainContext.length > 0 && (
-              <div style={{ padding: '8px 12px', background: '#f0f5ff', borderRadius: 6, marginBottom: 8, fontSize: 12, borderLeft: '3px solid #1890ff' }}>
-                <div style={{ fontWeight: 600, marginBottom: 4, color: '#1890ff' }}>🔗 调用链上游传递的值</div>
-                {sourceDetail.chainContext.map((v, i) => {
-                  const [name, ...valueParts] = v.split(' = ');
-                  const value = valueParts.join(' = ');
-                  return (
-                    <div key={i} style={{ fontFamily: 'monospace', padding: '2px 0' }}>
-                      <span style={{ color: '#531dab' }}>{name}</span>
-                      <span style={{ color: '#999' }}> = </span>
-                      <span style={{ color: '#389e0d' }}>{value}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* 当前节点枚举值 */}
-            {sourceDetail?.enumValues && sourceDetail.enumValues.length > 0 && (
-              <div style={{ padding: '8px 12px', background: '#fff7e6', borderRadius: 6, marginBottom: 8, fontSize: 12 }}>
-                <div style={{ fontWeight: 600, marginBottom: 4, color: '#d48806' }}>📌 常量/枚举值解析</div>
-                {sourceDetail.enumValues.map((v, i) => {
-                  const [name, ...valueParts] = v.split(' = ');
-                  const value = valueParts.join(' = ');
-                  return (
-                    <div key={i} style={{ fontFamily: 'monospace', padding: '2px 0' }}>
-                      <span style={{ color: '#531dab' }}>{name}</span>
-                      <span style={{ color: '#999' }}> = </span>
-                      <span style={{ color: '#389e0d' }}>{value}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* 上半部分结束 */}
-            </div>
-
-            {/* 源码（占剩余空间） */}
-            <div style={{ flex: 1, overflow: 'hidden', minHeight: '200px' }}>
-              <JavaCodeViewer
-                code={sourceCode}
-                startLine={sourceDetail?.startLine ?? 1}
-                maxHeight="100%"
-              />
-            </div>
-          </div>
-        )}
-      </Drawer>
-
-      {/* ── Log Analysis Drawer ── */}
-      <Drawer
-        title={<span><BugOutlined style={{ marginRight: 8 }} />日志诊断</span>}
-        placement="right"
-        width={560}
-        open={logDrawerOpen}
-        onClose={() => setLogDrawerOpen(false)}
-      >
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontWeight: 500, marginBottom: 6 }}>粘贴线上日志：</div>
-          <Input.TextArea
-            rows={10}
-            value={logText}
-            onChange={e => setLogText(e.target.value)}
-            placeholder="粘贴包含异常堆栈的日志内容..."
-            style={{ fontFamily: 'monospace', fontSize: 12 }}
-          />
-        </div>
-        <Button
-          type="primary"
-          danger
-          icon={<BugOutlined />}
-          onClick={handleAnalyzeLog}
-          loading={logAnalyzing}
-          disabled={!selectedEntry}
-          block
-        >
-          分析日志
-        </Button>
-
+      {/* ═══ Drawers & Modals ═══ */}
+      <Drawer title="日志诊断" placement="right" width={560} open={logDrawerOpen} onClose={() => setLogDrawerOpen(false)}>
+        <div style={{ marginBottom: 12, fontSize: 13, color: '#8c8c8c' }}>粘贴接口日志，自动标注异常节点。</div>
+        <Input.TextArea rows={12} value={logText} onChange={e => setLogText(e.target.value)} placeholder="粘贴日志内容..." style={{ fontFamily: 'monospace', fontSize: 12 }} />
+        <Button type="primary" danger style={{ marginTop: 12 }} onClick={handleAnalyzeLog} loading={logAnalyzing} block>开始诊断</Button>
         {logResult && (
           <div style={{ marginTop: 16 }}>
             <div style={{ fontWeight: 600, marginBottom: 8 }}>{logResult.summary}</div>
-            {logResult.extractedException && (
-              <div style={{ padding: '8px 12px', background: '#fff2f0', borderRadius: 6, marginBottom: 8, fontSize: 12, color: '#cf1322' }}>
-                异常: {logResult.extractedException}
+            {logResult.nodeStatuses.filter(s => s.status === 'ERROR').map((s, i) => (
+              <div key={i} style={{ padding: '8px 10px', background: '#fff2f0', border: '1px solid #ffccc7', borderRadius: 6, marginBottom: 6 }}>
+                <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#cf1322' }}>{s.fullMethod.split(':').pop()}</div>
+                {s.errorMessage && <div style={{ fontSize: 11, marginTop: 4, whiteSpace: 'pre-wrap' }}>{s.errorMessage}</div>}
               </div>
-            )}
-            {logResult.extractedUrl && (
-              <div style={{ padding: '8px 12px', background: '#e6f7ff', borderRadius: 6, marginBottom: 8, fontSize: 12 }}>
-                URL: {logResult.extractedUrl}
-              </div>
-            )}
-            <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
-              节点状态（点击 ❌ 节点可查看详情，点击 <ApiOutlined /> 可配置 Mock）：
-            </div>
-            <div style={{ maxHeight: 300, overflow: 'auto' }}>
-              {logResult.nodeStatuses.map((ns, i) => {
-                const icon = ns.status === 'OK' ? '✅' : ns.status === 'ERROR' ? '❌' : '❓';
-                const shortMethod = ns.fullMethod.split(':').pop()?.split('(')[0] ?? ns.fullMethod;
-                const shortClass = ns.fullMethod.split(':')[0]?.split('.').pop() ?? '';
-                return (
-                  <div key={i} style={{
-                    padding: '6px 8px', borderBottom: '1px solid #f5f5f5',
-                    background: ns.status === 'ERROR' ? '#fff2f0' : 'transparent',
-                    display: 'flex', alignItems: 'flex-start', gap: 8,
-                  }}>
-                    <span>{icon}</span>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: 500 }}>{shortClass}.{shortMethod}</div>
-                      {ns.errorMessage && (
-                        <div style={{ fontSize: 11, color: '#cf1322', marginTop: 2, wordBreak: 'break-all' }}>
-                          {ns.errorMessage}
-                        </div>
-                      )}
-                    </div>
-                    {ns.status === 'ERROR' && (
-                      <Tooltip title="配置 Mock">
-                        <Button size="small" icon={<ApiOutlined />} onClick={() => openMockEditor(ns.fullMethod)} />
-                      </Tooltip>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+            ))}
           </div>
         )}
       </Drawer>
 
-      {/* ── Mock Editor Modal ── */}
-      <Modal
-        title={<span><ApiOutlined style={{ marginRight: 8 }} />配置 Mock 数据</span>}
-        open={mockModalOpen}
-        onOk={handleSaveMock}
-        onCancel={() => setMockModalOpen(false)}
-        okText="保存"
-        cancelText="取消"
-        width={600}
-      >
-        <div style={{ fontSize: 12, color: '#666', marginBottom: 12 }}>
-          方法: {mockMethod.length > 80 ? mockMethod.slice(0, 78) + '…' : mockMethod}
-        </div>
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ fontWeight: 500, marginBottom: 4 }}>Mock 请求入参 (JSON)：</div>
-          <Input.TextArea
-            rows={6}
-            value={mockRequest}
-            onChange={e => setMockRequest(e.target.value)}
-            style={{ fontFamily: 'monospace', fontSize: 12 }}
-          />
-        </div>
-        <div>
-          <div style={{ fontWeight: 500, marginBottom: 4 }}>Mock 返回值 (JSON)：</div>
-          <Input.TextArea
-            rows={6}
-            value={mockResponse}
-            onChange={e => setMockResponse(e.target.value)}
-            style={{ fontFamily: 'monospace', fontSize: 12 }}
-          />
+      <Drawer title={<span><CodeOutlined style={{ marginRight: 8 }} />调用链展平代码</span>} placement="bottom" height="60%" open={codeDrawerOpen} onClose={() => setCodeDrawerOpen(false)}
+        extra={<Button size="small" onClick={() => { navigator.clipboard.writeText(generatedCode); message.success('已复制'); }}>复制</Button>}>
+        <div style={{ height: '100%' }}><JavaCodeViewer code={generatedCode} maxHeight="100%" /></div>
+      </Drawer>
+
+      <Drawer title={<span><FileTextOutlined style={{ marginRight: 8 }} />{docType === 'product' ? '产品文档' : '研发文档'}</span>}
+        placement="right" width={700} open={docDrawerOpen} onClose={() => setDocDrawerOpen(false)}
+        extra={<Space>
+          <Button size="small" type={docType==='product'?'primary':'default'} onClick={() => handleGenerateDoc('product')}>产品视角</Button>
+          <Button size="small" type={docType==='dev'?'primary':'default'} onClick={() => handleGenerateDoc('dev')}>研发视角</Button>
+          <Button size="small" onClick={() => { navigator.clipboard.writeText(docContent); message.success('已复制'); }}>复制</Button>
+        </Space>}>
+        {docLoading ? <div style={{ textAlign: 'center', padding: 40 }}><Spin /></div> :
+          <div style={{ whiteSpace: 'pre-wrap', fontSize: 13 }}>{docContent}</div>}
+      </Drawer>
+
+      <Modal title={`Mock: ${mockMethod.split(':').pop()?.split('(')[0]}`} open={mockModalOpen}
+        onCancel={() => setMockModalOpen(false)} onOk={handleSaveMock} okText="保存" width={700}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div><div style={{ fontSize: 12, color: '#8c8c8c', marginBottom: 4 }}>请求</div>
+            <Input.TextArea rows={10} value={mockRequest} onChange={e => setMockRequest(e.target.value)} style={{ fontFamily: 'monospace', fontSize: 12 }} /></div>
+          <div><div style={{ fontSize: 12, color: '#8c8c8c', marginBottom: 4 }}>响应</div>
+            <Input.TextArea rows={10} value={mockResponse} onChange={e => setMockResponse(e.target.value)} style={{ fontFamily: 'monospace', fontSize: 12 }} /></div>
         </div>
       </Modal>
-
-      {/* ── Generated Code Drawer ── */}
-      <Drawer
-        title={<span><CodeOutlined style={{ marginRight: 8 }} />调用链展平代码（可直接运行）</span>}
-        placement="bottom"
-        height="60%"
-        open={codeDrawerOpen}
-        onClose={() => setCodeDrawerOpen(false)}
-        extra={
-          <Button size="small" onClick={() => {
-            navigator.clipboard.writeText(generatedCode);
-            message.success('已复制到剪贴板');
-          }}>
-            复制代码
-          </Button>
-        }
-      >
-        <div style={{ height: '100%' }}>
-          <JavaCodeViewer code={generatedCode} maxHeight="100%" />
-        </div>
-      </Drawer>
-
-      {/* ── Doc Drawer ── */}
-      <Drawer
-        title={<span><FileTextOutlined style={{ marginRight: 8 }} />{docType === 'product' ? '产品功能文档' : '研发技术文档'}</span>}
-        placement="right"
-        width={700}
-        open={docDrawerOpen}
-        onClose={() => setDocDrawerOpen(false)}
-        extra={
-          <Space>
-            <Button size="small" type={docType === 'product' ? 'primary' : 'default'} onClick={() => handleGenerateDoc('product')}>产品视角</Button>
-            <Button size="small" type={docType === 'dev' ? 'primary' : 'default'} onClick={() => handleGenerateDoc('dev')}>研发视角</Button>
-            {docType === 'product' && (
-              <Select
-                size="small"
-                value={selectedDiagramType}
-                onChange={handleDiagramTypeChange}
-                style={{ width: 120 }}
-                loading={diagramLoading}
-                options={[
-                  { label: '📊 流程图', value: 'flowchart' },
-                  { label: '⏱️ 时序图', value: 'sequence' },
-                  { label: '🏊 泳道图', value: 'swimlane' },
-                ]}
-              />
-            )}
-            <Button size="small" onClick={() => {
-              navigator.clipboard.writeText(docContent);
-              message.success('已复制到剪贴板');
-            }}>复制</Button>
-          </Space>
-        }
-      >
-        {docLoading ? (
-          <div style={{ textAlign: 'center', padding: 40 }}><Spin size="large" /></div>
-        ) : (
-          <div className="markdown-body" style={{ padding: '0 8px' }}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                code: ({ className, children }) => {
-                  const match = /language-mermaid/.exec(className || '');
-                  if (match) {
-                    // 如果是产品文档且有图表数据，使用选中的图表类型
-                    if (docType === 'product' && docDiagrams[selectedDiagramType]) {
-                      // 从图表数据中提取纯 Mermaid 代码（去掉 ```mermaid 标记）
-                      let mermaidCode = docDiagrams[selectedDiagramType];
-                      if (mermaidCode.startsWith('```mermaid')) {
-                        mermaidCode = mermaidCode.replace(/^```mermaid\n/, '').replace(/\n```$/, '');
-                      }
-                      return <MermaidBlock code={mermaidCode} />;
-                    }
-                    return <MermaidBlock code={String(children).trim()} />;
-                  }
-                  // Inline code
-                  if (!className) {
-                    return <code style={{ background: '#f0f0f0', padding: '2px 6px', borderRadius: 3, fontSize: '0.9em' }}>{children}</code>;
-                  }
-                  // Regular code block
-                  return <code className={className}>{children}</code>;
-                },
-                pre: ({ children }) => <>{children}</>,
-                // Support HTML details/summary for collapsible sections
-                details: ({ children }) => <details style={{ marginBottom: 16 }}>{children}</details>,
-                summary: ({ children }) => <summary style={{ cursor: 'pointer', padding: '8px 0', fontWeight: 500, fontSize: 14, color: '#1890ff' }}>{children}</summary>,
-              }}
-            >{docContent}</ReactMarkdown>
-          </div>
-        )}
-      </Drawer>
     </div>
   );
 }

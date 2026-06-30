@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 import Prism from 'prismjs';
 import 'prismjs/components/prism-java';
-import 'prismjs/themes/prism-tomorrow.css';
+import 'prismjs/themes/prism-coy.css';
 
 // IDEA-like 风格覆盖
 const STYLE_OVERRIDE = `
@@ -10,8 +10,8 @@ const STYLE_OVERRIDE = `
   font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
   font-size: 13px;
   line-height: 1.7;
-  background: #2b2b2b;
-  border-radius: 6px;
+  background: #fff;
+  border-radius: 0;
   overflow: auto;
 }
 .code-viewer pre {
@@ -27,13 +27,13 @@ const STYLE_OVERRIDE = `
   display: flex;
 }
 .code-viewer .line-num {
-  color: #606366;
+  color: #999;
   text-align: right;
   padding-right: 16px;
   padding-left: 12px;
   user-select: none;
   min-width: 40px;
-  border-right: 1px solid #3c3f41;
+  border-right: 1px solid #eee;
 }
 .code-viewer .line-code {
   padding-left: 12px;

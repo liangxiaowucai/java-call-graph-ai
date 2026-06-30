@@ -4,7 +4,9 @@ import com.adrninistrator.javacg2.platform.dto.ApiResponse;
 import com.adrninistrator.javacg2.platform.dto.CloneRequest;
 import com.adrninistrator.javacg2.platform.dto.RepositoryDetailDTO;
 import com.adrninistrator.javacg2.platform.dto.RepositoryListDTO;
+import com.adrninistrator.javacg2.platform.entity.ChunkEntity;
 import com.adrninistrator.javacg2.platform.entity.RepositoryEntity;
+import com.adrninistrator.javacg2.platform.repository.ChunkRepo;
 import com.adrninistrator.javacg2.platform.repository.RepositoryRepo;
 import com.adrninistrator.javacg2.platform.service.BytecodeAnalyzer;
 import com.adrninistrator.javacg2.platform.service.BuildLogService;
@@ -22,6 +24,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.stream.Stream;
@@ -41,13 +44,18 @@ public class RepositoryController {
     private final DocGenerator docGenerator;
     private final ClaudeApiClient claudeClient;
     private final BuildLogService buildLogService;
+    private final ChunkRepo chunkRepo;
+    private final com.adrninistrator.javacg2.platform.repository.CallGraphRepo callGraphRepo;
+    private final com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore;
 
     public RepositoryController(RepositoryRepo repositoryRepo, RepositoryManager repositoryManager,
                                  BytecodeAnalyzer bytecodeAnalyzer,
                                  @Qualifier("analysisExecutor") ExecutorService analysisExecutor,
                                  com.adrninistrator.javacg2.platform.repository.RepoConfigRepo repoConfigRepo,
                                  DocGenerator docGenerator, ClaudeApiClient claudeClient,
-                                 BuildLogService buildLogService) {
+                                 BuildLogService buildLogService, ChunkRepo chunkRepo,
+                                 com.adrninistrator.javacg2.platform.repository.CallGraphRepo callGraphRepo,
+                                 com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore) {
         this.repositoryRepo = repositoryRepo;
         this.repositoryManager = repositoryManager;
         this.bytecodeAnalyzer = bytecodeAnalyzer;
@@ -56,6 +64,9 @@ public class RepositoryController {
         this.docGenerator = docGenerator;
         this.claudeClient = claudeClient;
         this.buildLogService = buildLogService;
+        this.chunkRepo = chunkRepo;
+        this.callGraphRepo = callGraphRepo;
+        this.repoDataStore = repoDataStore;
     }
 
     @GetMapping
@@ -394,5 +405,156 @@ public class RepositoryController {
         }
 
         return ApiResponse.ok(jars);
+    }
+
+    /**
+     * 获取仓库的类间调用关系（用于文件关系图的边）。
+     * 从 call_graph 表聚合：caller 类名 → callee 类名（去重），只返回两端都在本仓库业务包内的边。
+     */
+    @GetMapping("/{id}/class-edges")
+    public ApiResponse<List<Map<String, String>>> getClassEdges(@PathVariable Long id) {
+        var repo = repositoryRepo.findById(id).orElse(null);
+        if (repo == null) return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
+
+        // 读取包前缀
+        String prefixRaw = repoConfigRepo.findByRepoIdAndConfigKey(id, "analyze.package.prefix")
+                .map(c -> c.getConfigValue())
+                .orElse(null);
+        List<String> prefixes = new java.util.ArrayList<>();
+        if (prefixRaw != null) {
+            for (String p : prefixRaw.split("[,;\\s]+")) {
+                String t = p.trim(); if (!t.isEmpty()) prefixes.add(t);
+            }
+        }
+
+        // 聚合类间调用（去重）
+        Set<String> seen = new java.util.HashSet<>();
+        List<Map<String, String>> edges = new java.util.ArrayList<>();
+
+        // Use memory cache instead of DB query
+        var repoData = repoDataStore.get(id);
+        for (var cg : repoData.callGraphMap.values().stream().flatMap(java.util.Collection::stream).collect(java.util.stream.Collectors.toList())) {
+            if (cg.getEnabled() == null || !cg.getEnabled()) continue;
+            if ("EXTENDS".equals(cg.getCallType()) || "IMPLEMENTS".equals(cg.getCallType())) continue;
+
+            String callerFull = cg.getCallerMethod();
+            String calleeFull = cg.getCalleeMethod();
+            int c1 = callerFull.lastIndexOf(':');
+            int c2 = calleeFull.lastIndexOf(':');
+            if (c1 <= 0 || c2 <= 0) continue;
+
+            String callerClass = callerFull.substring(0, c1);
+            String calleeClass = calleeFull.substring(0, c2);
+
+            // 同类调用跳过
+            if (callerClass.equals(calleeClass)) continue;
+            // 跳过匿名内部类
+            if (callerClass.matches(".*\\$\\d+$") || calleeClass.matches(".*\\$\\d+$")) continue;
+            // 只保留业务包内的边
+            if (!prefixes.isEmpty()) {
+                if (prefixes.stream().noneMatch(callerClass::startsWith)) continue;
+                if (prefixes.stream().noneMatch(calleeClass::startsWith)) continue;
+            }
+            // 跳过 gRPC/proto 生成类
+            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoiseClass(callerClass)) continue;
+            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoiseClass(calleeClass)) continue;
+
+            String key = callerClass + ">" + calleeClass;
+            if (seen.add(key)) {
+                edges.add(Map.of("source", callerClass, "target", calleeClass));
+            }
+        }
+
+        return ApiResponse.ok(edges);
+    }
+
+    /**
+     * 获取仓库的类/文件树结构（从 chunks 表聚合，只返回业务代码）。
+     * 过滤规则：
+     *  1. 包前缀匹配（业务代码）
+     *  2. 过滤 gRPC/protobuf 生成类（GrpcNoiseFilter）
+     *  3. 过滤 $Builder / OrBuilder / 匿名内部类
+     *  4. 过滤 .api.client.model / .api.client.service 包（proto 生成）
+     */
+    @GetMapping("/{id}/file-tree")
+    public ApiResponse<List<Map<String, Object>>> getFileTree(@PathVariable Long id) {
+        var repo = repositoryRepo.findById(id).orElse(null);
+        if (repo == null) return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
+
+        // 读取用户配置的包前缀，只展示属于本项目的业务类
+        String prefixRaw = repoConfigRepo.findByRepoIdAndConfigKey(id, "analyze.package.prefix")
+                .map(c -> c.getConfigValue())
+                .orElse(null);
+        List<String> packagePrefixes = new java.util.ArrayList<>();
+        if (prefixRaw != null && !prefixRaw.isBlank()) {
+            for (String p : prefixRaw.split("[,;\\s]+")) {
+                String t = p.trim();
+                if (!t.isEmpty()) packagePrefixes.add(t);
+            }
+        }
+
+        // 从 chunks 数据推断每个 jarNum 的模块名
+        // 策略：按 jarNum 分组，取该组类名中最常见的顶层包段作为模块名
+        Map<Integer, String> jarNameMap = new java.util.HashMap<>();
+        Map<Integer, Map<String, Integer>> jarPkgCount = new java.util.HashMap<>();
+        for (ChunkEntity chunk : repoDataStore.get(id).chunkMap.values()) {
+            Integer jn = chunk.getJarNum();
+            if (jn == null) continue;
+            String cn = chunk.getClassName();
+            if (cn == null) continue;
+            // 取类名的倒数第2段（通常是 module 特征段，如 tla.base / tla.consumer）
+            String[] segs = cn.split("\\.");
+            String key = segs.length >= 4 ? segs[segs.length - 3] + "." + segs[segs.length - 2] : (segs.length >= 3 ? segs[segs.length - 2] : cn);
+            jarPkgCount.computeIfAbsent(jn, k -> new java.util.HashMap<>()).merge(key, 1, Integer::sum);
+        }
+        jarPkgCount.forEach((jn, pkgMap) -> {
+            // 取出现最多的包段作为模块名
+            String bestPkg = pkgMap.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse("module-" + jn);
+            jarNameMap.put(jn, bestPkg);
+        });
+
+        Map<String, Map<String, Object>> classMap = new java.util.LinkedHashMap<>();
+        for (ChunkEntity chunk : repoDataStore.get(id).chunkMap.values()) {
+            String cn = chunk.getClassName();
+            if (cn == null || cn.isBlank()) continue;
+
+            // 如果配置了包前缀，只显示前缀匹配的类（本项目业务代码）
+            if (!packagePrefixes.isEmpty() && packagePrefixes.stream().noneMatch(cn::startsWith)) continue;
+
+            // 跳过匿名内部类 $1, $2（目录结构不展示，但调用链保留）
+            if (cn.matches(".*\\$\\d+$")) continue;
+            // 跳过所有命名内部类（$ChapterStat 等，属于外部类的一部分）
+            if (cn.contains("$")) continue;
+            // 跳过 gRPC 生成类（工厂类、Stub、MethodHandlers 等）
+            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoiseClass(cn)) continue;
+            // 跳过 proto 生成包
+            String pkg = chunk.getPackageName() != null ? chunk.getPackageName() : "";
+            if (pkg.contains(".api.client.model") || pkg.contains(".api.client.service")
+                    || pkg.contains(".api.grpc.model") || pkg.contains(".proto.")) continue;
+
+            // 用 className + jarNum 作为唯一键，区分多 module 同名类
+            String uniqueKey = cn + "#" + (chunk.getJarNum() != null ? chunk.getJarNum() : 0);
+            final String finalPkg = pkg;
+            final Integer jarNum = chunk.getJarNum();
+            final String jarName = jarNameMap.getOrDefault(jarNum != null ? jarNum : 0, "module-" + (jarNum != null ? jarNum : 0));
+            classMap.compute(uniqueKey, (k, v) -> {
+                if (v == null) {
+                    v = new java.util.LinkedHashMap<>();
+                    v.put("className", cn);
+                    v.put("packageName", finalPkg);
+                    v.put("filePath", chunk.getFilePath());
+                    v.put("jarNum", jarNum != null ? jarNum : 0);
+                    v.put("jarName", jarName);
+                    v.put("methodCount", 0);
+                }
+                v.put("methodCount", (int) v.get("methodCount") + 1);
+                return v;
+            });
+        }
+
+        return ApiResponse.ok(new ArrayList<>(classMap.values()));
     }
 }

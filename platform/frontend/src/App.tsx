@@ -15,30 +15,30 @@ import QAChat from './pages/QAChat';
 import Settings from './pages/Settings';
 import RequestChainAnalyzer from './pages/RequestChainAnalyzer';
 import RepoTopology from './pages/RepoTopology';
-import OperationLogPanel from './components/OperationLogPanel';
-import { useOperationLog, type LogEntry } from './hooks/useOperationLog';
+import ImpactAnalysis from './pages/ImpactAnalysis';
+// import OperationLogPanel from './components/OperationLogPanel';
+// import { useOperationLog, type LogEntry } from './hooks/useOperationLog';
 
 const { Sider, Content } = Layout;
 
 const menuItems = [
   { key: '/repos', icon: <DatabaseOutlined />, label: '仓库管理' },
-  { key: '/callgraph', icon: <ApartmentOutlined />, label: '调用链分析' },
-  { key: '/topology', icon: <ShareAltOutlined />, label: '仓库拓扑' },
+  { key: '/callgraph', icon: <ApartmentOutlined />, label: '仓库拓扑' },
   { key: '/request-analyzer', icon: <BugOutlined />, label: '调用链追踪' },
   { key: '/qa', icon: <RobotOutlined />, label: 'AI 问答' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统配置' },
 ];
 
 // 全局日志 Context
-type AddLogFn = (action: string, detail?: string, level?: LogEntry['level']) => void;
+type AddLogFn = (action: string, detail?: string, level?: string) => void;
 export const LogContext = createContext<AddLogFn>(() => {});
 export const useLog = () => useContext(LogContext);
 
 function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { logs, addLog, clearLogs } = useOperationLog();
-  const [logPanelOpen, setLogPanelOpen] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const addLog: AddLogFn = (_action: string, _detail?: string) => {};
 
   const selectedKey = menuItems.find((m) => location.pathname.startsWith(m.key))?.key ?? '/repos';
 
@@ -72,12 +72,7 @@ function AppLayout() {
           </Content>
         </Layout>
       </Layout>
-      <OperationLogPanel
-        logs={logs}
-        open={logPanelOpen}
-        onToggle={() => setLogPanelOpen(!logPanelOpen)}
-        onClear={clearLogs}
-      />
+      {/* OperationLogPanel removed */}
     </LogContext.Provider>
   );
 }
@@ -85,7 +80,12 @@ function AppLayout() {
 export default function App() {
   return (
     <BrowserRouter>
-      <AppLayout />
+      <Routes>
+        {/* 独立全屏页（无侧边栏） */}
+        <Route path="/impact" element={<ImpactAnalysis />} />
+        {/* 主应用（带侧边栏） */}
+        <Route path="*" element={<AppLayout />} />
+      </Routes>
     </BrowserRouter>
   );
 }

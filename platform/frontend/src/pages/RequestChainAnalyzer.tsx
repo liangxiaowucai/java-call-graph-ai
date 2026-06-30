@@ -663,6 +663,17 @@ export default function RequestChainAnalyzer() {
               // DB 调用：显示 SQL 的前40个字符
               const sql = b.context.split('\n')[0].trim().substring(0, 40);
               sequence.push(`    Note over ${currentId}: ${icon} ${sql}...`);
+            } else if (b.boundaryType === 'GRPC' && b.context) {
+              // gRPC 调用：显示 proto 服务方法名 + 请求模型类型
+              const grpcMatch = b.context.match(/📡 gRPC:\s*(.+)/);
+              const modelMatch = b.context.match(/📦 请求:\s*(.+)/);
+              if (grpcMatch) {
+                const callLabel = grpcMatch[1].trim();
+                const modelLabel = modelMatch ? `<br/>📦 ${modelMatch[1].trim()}` : '';
+                sequence.push(`    Note over ${currentId}: ${icon} ${callLabel}${modelLabel}`);
+              } else {
+                sequence.push(`    Note over ${currentId}: ${icon} ${b.context.split('\n')[0].substring(0, 60)}`);
+              }
             } else {
               sequence.push(`    Note over ${currentId}: ${icon} ${b.boundaryType}`);
             }

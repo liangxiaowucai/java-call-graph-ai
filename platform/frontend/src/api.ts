@@ -968,3 +968,92 @@ export async function fetchCrossRepoImpact(method: string, maxDepth = 10): Promi
   return res.data.data;
 }
 
+// ── 跨库调用树 DTO & API ──────────────────────────────────────────────────────
+
+export interface CrossRepoNodeDTO {
+  fullMethod: string;
+  shortRef: string;
+  repoId: number | null;
+  repoName: string | null;
+  callType: string | null;
+  lineNumber: number | null;
+  crossesRepo: boolean;
+  isRecursive: boolean;
+  isLazyLoad: boolean;
+  external: boolean;
+  ambiguous: boolean;
+  children: CrossRepoNodeDTO[];
+}
+
+export interface CrossRepoTreeDTO {
+  root: CrossRepoNodeDTO;
+  totalNodes: number;
+  maxDepth: number;
+  hasCycle: boolean;
+  truncated: boolean;
+  warnings: { fullMethod: string; locations: { repoId: number; repoName: string }[] }[];
+}
+
+export async function fetchCrossRepoTree(method: string, maxDepth = 10): Promise<CrossRepoTreeDTO> {
+  const res = await api.get<ApiResponse<CrossRepoTreeDTO>>('/cross-repo/tree', { params: { method, maxDepth } });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '跨库调用树加载失败');
+  return res.data.data;
+}
+
+// ── 上游调用树 ────────────────────────────────────────────────────────────────
+
+export interface UpstreamTreeNodeDTO {
+  id: string;
+  fullMethod: string;
+  shortRef: string;
+  repoId: number | null;
+  repoName: string | null;
+  isEndpoint: boolean;
+  endpointType: string | null;
+  httpMethod: string | null;
+  urlPath: string | null;
+  isRecursive: boolean;
+  callers: UpstreamTreeNodeDTO[];
+}
+
+export interface UpstreamTreeDTO {
+  targetMethod: string;
+  totalNodes: number;
+  truncated: boolean;
+  warnings: { fullMethod: string; locations: { repoId: number; repoName: string; filePath: string }[] }[];
+  root: UpstreamTreeNodeDTO;
+}
+
+export async function fetchUpstreamTree(method: string): Promise<UpstreamTreeDTO> {
+  const res = await api.get<ApiResponse<UpstreamTreeDTO>>('/cross-repo/upstream-tree', { params: { method } });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '上游调用树加载失败');
+  return res.data.data;
+}
+
+
+// ── File Tree API ─────────────────────────────────────────────────────────────
+
+export interface FileTreeItem {
+  className: string;
+  packageName: string;
+  filePath: string;
+  methodCount: number;
+  jarNum: number;
+}
+
+export async function fetchFileTree(repoId: number): Promise<FileTreeItem[]> {
+  const res = await api.get<ApiResponse<FileTreeItem[]>>(`/repos/${repoId}/file-tree`);
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '文件树加载失败');
+  return res.data.data;
+}
+
+export interface ClassEdge {
+  source: string;
+  target: string;
+}
+
+export async function fetchClassEdges(repoId: number): Promise<ClassEdge[]> {
+  const res = await api.get<ApiResponse<ClassEdge[]>>(`/repos/${repoId}/class-edges`);
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '类间调用关系加载失败');
+  return res.data.data;
+}

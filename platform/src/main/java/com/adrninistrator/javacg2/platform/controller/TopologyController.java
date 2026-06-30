@@ -35,4 +35,14 @@ public class TopologyController {
             @RequestParam(defaultValue = "10") int maxDepth) {
         return ApiResponse.ok(callGraphEngine.getCrossRepoCallTree(method, maxDepth));
     }
+
+    /**
+     * 上游调用树：无深度限制，向上追溯所有调用方直到没有 caller 为止。
+     * 入口点（HTTP/MQ/gRPC）不是终止条件，继续向上找触发者。
+     */
+    @GetMapping("/cross-repo/upstream-tree")
+    public ApiResponse<CallGraphEngine.UpstreamTreeDTO> getUpstreamTree(
+            @RequestParam String method) {
+        return ApiResponse.ok(callGraphEngine.getUpstreamTree(method));
+    }
 }

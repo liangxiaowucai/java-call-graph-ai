@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Spin, Tag, Drawer, Button, Empty, Tooltip, message, Badge } from 'antd';
+import { Tag, Drawer, Button, Empty, Tooltip, message, Spin } from 'antd';
 import {
   ZoomInOutlined, ZoomOutOutlined, ExpandOutlined, ReloadOutlined, ApartmentOutlined,
   ArrowRightOutlined,
 } from '@ant-design/icons';
-import G6, { type Graph as GraphType } from '@antv/g6';
+import { Graph } from '@antv/g6';
+type GraphType = InstanceType<typeof Graph>;
 import {
-  fetchTopology, fetchCrossRepoImpact,
-  type TopologyDTO, type RepoNodeDTO, type HotMethod, type CrossRepoImpactDTO,
+  fetchTopology,
+  type TopologyDTO, type RepoNodeDTO, type HotMethod,
 } from '../api';
 
 // ── 常量 ─────────────────────────────────────────────────────────────────────
@@ -35,133 +36,8 @@ const NODE_H = 80;
 
 // ── 注册 G6 自定义节点（repo-node） ──────────────────────────────────────────
 
-let registered = false;
-
-function ensureRegistered() {
-  if (registered) return;
-  registered = true;
-
-  G6.registerNode(
-    'repo-node',
-    {
-      draw(cfg, group) {
-        if (!cfg || !group) return {} as never;
-        const name = (cfg.label as string) ?? '';
-        const status = (cfg.status as string) ?? 'CREATED';
-        const totalMethods = (cfg.totalMethods as number) ?? 0;
-        const exposedMethods = (cfg.exposedMethods as number) ?? 0;
-        const entryPoints = (cfg.entryPoints as number) ?? 0;
-        const statusColor = STATUS_COLOR[status] ?? '#d9d9d9';
-
-        // 外框
-        const keyShape = group.addShape('rect', {
-          attrs: {
-            x: 0, y: 0,
-            width: NODE_W, height: NODE_H,
-            radius: 8,
-            fill: '#fff',
-            stroke: statusColor,
-            lineWidth: 2,
-            shadowColor: 'rgba(0,0,0,0.08)',
-            shadowBlur: 6,
-            shadowOffsetY: 2,
-            cursor: 'pointer',
-          },
-          name: 'node-bg',
-          draggable: true,
-        });
-
-        // 顶部色带
-        group.addShape('rect', {
-          attrs: {
-            x: 0, y: 0,
-            width: NODE_W, height: 6,
-            radius: [8, 8, 0, 0],
-            fill: statusColor,
-          },
-          name: 'status-bar',
-        });
-
-        // 仓库名（截断）
-        const displayName = name.length > 18 ? name.slice(0, 17) + '…' : name;
-        group.addShape('text', {
-          attrs: {
-            x: 10, y: 26,
-            text: displayName,
-            fontSize: 13,
-            fontWeight: 600,
-            fill: '#262626',
-            textBaseline: 'middle',
-            cursor: 'pointer',
-          },
-          name: 'repo-name',
-        });
-
-        // 状态标签
-        group.addShape('text', {
-          attrs: {
-            x: NODE_W - 10, y: 26,
-            text: STATUS_LABEL[status] ?? status,
-            fontSize: 10,
-            fill: statusColor,
-            textAlign: 'right',
-            textBaseline: 'middle',
-          },
-          name: 'status-text',
-        });
-
-        // 分割线
-        group.addShape('line', {
-          attrs: {
-            x1: 10, y1: 36, x2: NODE_W - 10, y2: 36,
-            stroke: '#f0f0f0', lineWidth: 1,
-          },
-          name: 'divider',
-        });
-
-        // 统计行：方法数 / 暴露 / 入口点
-        const stats = [
-          { label: '方法', value: totalMethods, color: '#595959' },
-          { label: '暴露', value: exposedMethods, color: '#1890ff' },
-          { label: '入口', value: entryPoints, color: '#52c41a' },
-        ];
-        const colW = NODE_W / 3;
-        stats.forEach((s, i) => {
-          const cx = colW * i + colW / 2;
-          group.addShape('text', {
-            attrs: {
-              x: cx, y: 54,
-              text: String(s.value),
-              fontSize: 14,
-              fontWeight: 600,
-              fill: s.color,
-              textAlign: 'center',
-              textBaseline: 'middle',
-            },
-            name: `stat-val-${i}`,
-          });
-          group.addShape('text', {
-            attrs: {
-              x: cx, y: 70,
-              text: s.label,
-              fontSize: 10,
-              fill: '#8c8c8c',
-              textAlign: 'center',
-              textBaseline: 'middle',
-            },
-            name: `stat-label-${i}`,
-          });
-        });
-
-        return keyShape;
-      },
-      getAnchorPoints() {
-        return [[0.5, 0], [0.5, 1], [0, 0.5], [1, 0.5]];
-      },
-    },
-    'single-node',
-  );
-}
+// ─── G6 v5: graph rendering via useEffect below ─────────────────────────────
+// (no registerNode needed in v5; rect node used with style function)
 
 // ── 数据转换 ──────────────────────────────────────────────────────────────────
 
@@ -189,6 +65,7 @@ interface G6EdgeData {
   calleeRepoId: number;
   hotMethods: HotMethod[];
   callType: string | null;
+  style?: Record<string, unknown>;
 }
 
 function buildGraphData(topo: TopologyDTO): { nodes: G6NodeData[]; edges: G6EdgeData[] } {
@@ -203,18 +80,50 @@ function buildGraphData(topo: TopologyDTO): { nodes: G6NodeData[]; edges: G6Edge
     entryPoints: r.entryPoints,
   }));
 
-  const edges: G6EdgeData[] = topo.edges.map((e, i) => ({
-    id: `edge-${i}`,
-    source: `repo-${e.callerRepoId}`,
-    target: `repo-${e.calleeRepoId}`,
-    label: `${e.methodCount}个方法 · ${e.callCount}次`,
-    callCount: e.callCount,
-    methodCount: e.methodCount,
-    callerRepoId: e.callerRepoId,
-    calleeRepoId: e.calleeRepoId,
-    hotMethods: e.hotMethods,
-    callType: e.callType ?? null,
-  }));
+  const nodeIds = new Set(nodes.map(n => n.id));
+  const seenPairs = new Set<string>();
+
+  // 先收集所有有效边
+  const validEdges = topo.edges.filter(e => {
+    const src = `repo-${e.callerRepoId}`;
+    const tgt = `repo-${e.calleeRepoId}`;
+    const key = `${src}|${tgt}`;
+    if (!nodeIds.has(src) || !nodeIds.has(tgt)) {
+      console.warn('[Topology] dropped edge with missing node:', src, '->', tgt);
+      return false;
+    }
+    if (seenPairs.has(key)) {
+      console.warn('[Topology] dropped duplicate edge:', key);
+      return false;
+    }
+    seenPairs.add(key);
+    return true;
+  });
+
+  // 识别双向对（A→B 且 B→A 同时存在），在数据阶段直接注入 curveOffset。
+  // 必须在数据里设置而非 post-render updateItem，因为 cubic-horizontal 不响应后者。
+  const builtPairSet = new Set(validEdges.map(e => `repo-${e.callerRepoId}|repo-${e.calleeRepoId}`));
+
+  const edges: G6EdgeData[] = validEdges.map((e, i) => {
+    const src = `repo-${e.callerRepoId}`;
+    const tgt = `repo-${e.calleeRepoId}`;
+    const isBidirectional = builtPairSet.has(`${tgt}|${src}`);
+    // 双向对按 id 大小固定偏移方向，两条边各弯向一侧，避免重叠
+    const curveOffset = isBidirectional ? (src < tgt ? 60 : -60) : 0;
+    return {
+      id: `edge-${i}`,
+      source: src,
+      target: tgt,
+      label: `${e.methodCount}个方法 · ${e.callCount}次`,
+      callCount: e.callCount,
+      methodCount: e.methodCount,
+      callerRepoId: e.callerRepoId,
+      calleeRepoId: e.calleeRepoId,
+      hotMethods: e.hotMethods,
+      callType: e.callType ?? null,
+      style: { curveOffset },
+    };
+  });
 
   return { nodes, edges };
 }
@@ -230,11 +139,8 @@ export default function RepoTopology() {
   const [edgeDrawerOpen, setEdgeDrawerOpen] = useState(false);
   const [selectedEdge, setSelectedEdge] = useState<G6EdgeData | null>(null);
 
-  // 方法影响分析（点击热点方法时触发）
-  const [impactLoading, setImpactLoading] = useState(false);
-  const [impactResult, setImpactResult] = useState<CrossRepoImpactDTO | null>(null);
-  const [impactMethod, setImpactMethod] = useState<HotMethod | null>(null);
-  const [selectedMethod, setSelectedMethod] = useState<HotMethod | null>(null);
+  // 方法选中状态
+
 
   const graphContainerRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<GraphType | null>(null);
@@ -253,28 +159,12 @@ export default function RepoTopology() {
 
   useEffect(() => { loadTopology(); }, [loadTopology]);
 
-  const doImpact = useCallback(async (method: HotMethod) => {
-    setImpactMethod(method);
-    setImpactLoading(true);
-    setImpactResult(null);
-    try {
-      const result = await fetchCrossRepoImpact(method.fullMethod);
-      setImpactResult(result);
-    } catch (e: unknown) {
-      message.error(e instanceof Error ? e.message : '影响分析失败');
-    } finally {
-      setImpactLoading(false);
-    }
-  }, []);
-
-  // G6 图渲染
+  // G6 v5 图渲染
   useEffect(() => {
     if (!topo || !graphContainerRef.current) return;
 
-    ensureRegistered();
-
     if (graphRef.current) {
-      graphRef.current.destroy();
+      try { (graphRef.current as GraphType).destroy(); } catch { /* */ }
       graphRef.current = null;
     }
 
@@ -282,118 +172,96 @@ export default function RepoTopology() {
     const width = container.clientWidth || 900;
     const height = container.clientHeight || 650;
 
-    const minimap = new G6.Minimap({ size: [160, 100], type: 'keyShape' });
-
-    const graph = new G6.Graph({
-      container,
-      width,
-      height,
-      fitView: true,
-      fitViewPadding: [60, 60, 60, 60],
-      animate: false,
-      modes: {
-        default: ['drag-canvas', 'zoom-canvas', 'drag-node'],
-      },
-      plugins: [minimap],
-      defaultNode: {
-        type: 'repo-node',
-        size: [NODE_W, NODE_H],
-        anchorPoints: [[0.5, 0], [0.5, 1], [0, 0.5], [1, 0.5]],
-      },
-      defaultEdge: {
-        type: 'quadratic',
-        style: {
-          stroke: '#adc6ff',
-          lineWidth: 2,
-          opacity: 0.8,
-          endArrow: {
-            path: G6.Arrow.triangle(8, 10, 0),
-            fill: '#adc6ff',
-          },
-        },
-        labelCfg: {
-          autoRotate: false,
-          style: {
-            fontSize: 11,
-            fill: '#595959',
-            background: {
-              fill: '#fff',
-              stroke: '#e8e8e8',
-              padding: [3, 6],
-              radius: 3,
-            },
-          },
-        },
-      },
-      layout: {
-        type: 'dagre',
-        rankdir: 'LR',
-        nodesep: 60,
-        ranksep: 160,
-        controlPoints: true,
-      },
-      nodeStateStyles: {
-        active: {
-          stroke: '#1890ff',
-          lineWidth: 2.5,
-          shadowColor: 'rgba(24,144,255,0.3)',
-          shadowBlur: 10,
-        },
-      },
-      edgeStateStyles: {
-        active: {
-          stroke: '#1890ff',
-          lineWidth: 3,
-          opacity: 1,
-        },
-      },
-    });
-
-    // 节点单击 → 进入调用链分析
-    graph.on('node:click', (evt) => {
-      const model = evt.item?.getModel() as G6NodeData | undefined;
-      if (!model) return;
-      navigate(`/callgraph?repoId=${model.repoId}`);
-    });
-
-    // 边单击 → 展示热点方法 Drawer
-    graph.on('edge:click', (evt) => {
-      const model = evt.item?.getModel() as G6EdgeData | undefined;
-      if (!model) return;
-      setSelectedEdge(model);
-      setImpactResult(null);
-      setImpactMethod(null);
-      setSelectedMethod(null);
-      setEdgeDrawerOpen(true);
-    });
-
-    // hover 高亮
-    graph.on('node:mouseenter', (evt) => {
-      if (evt.item) graph.setItemState(evt.item, 'active', true);
-    });
-    graph.on('node:mouseleave', (evt) => {
-      if (evt.item) graph.setItemState(evt.item, 'active', false);
-    });
-    graph.on('edge:mouseenter', (evt) => {
-      if (evt.item) graph.setItemState(evt.item, 'active', true);
-    });
-    graph.on('edge:mouseleave', (evt) => {
-      if (evt.item) graph.setItemState(evt.item, 'active', false);
-    });
-
     const { nodes, edges } = buildGraphData(topo);
-    graph.data({ nodes, edges } as never);
-    graph.render();
-    graph.fitView();
+    // Build an edge lookup map for click handler
+    const edgesMap = new Map(edges.map(e => [e.id, e]));
 
-    graphRef.current = graph;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const graph = new (Graph as any)({
+      container, width, height,
+      autoFit: 'view',
+      data: {
+        nodes: nodes.map(n => {
+          const shortName = n.label.length > 16 ? n.label.slice(0, 15) + '…' : n.label;
+          const statsLine = `${n.totalMethods}方法 · ${n.exposedMethods}暴露 · ${n.entryPoints}入口`;
+          return {
+            id: n.id,
+            data: { repoId: n.repoId, status: n.status, label: n.label,
+                    totalMethods: n.totalMethods, exposedMethods: n.exposedMethods, entryPoints: n.entryPoints },
+            style: {
+              fill: '#ffffff',
+              stroke: STATUS_COLOR[n.status] ?? '#d9d9d9',
+              lineWidth: 2,
+              labelText: shortName,
+              labelFill: '#262626',
+              labelFontSize: 13,
+              labelFontWeight: 700,
+              labelPlacement: 'center' as const,
+              cursor: 'pointer',
+              // badge 用于展示统计信息
+              badges: [
+                { text: statsLine, placement: 'bottom' as const,
+                  backgroundFill: '#f0f5ff', backgroundStroke: '#adc6ff',
+                  fill: '#2f54eb', fontSize: 10, padding: [2, 6] },
+              ],
+            },
+          };
+        }),
+        edges: edges.map(e => ({
+          id: e.id, source: e.source, target: e.target,
+          data: { callerRepoId: e.callerRepoId, calleeRepoId: e.calleeRepoId,
+                  callCount: e.callCount, methodCount: e.methodCount,
+                  hotMethods: e.hotMethods, callType: e.callType },
+          style: {
+            stroke: '#adc6ff', lineWidth: 2, opacity: 0.9,
+            endArrow: true, endArrowSize: 8,
+            curveOffset: (e.style as { curveOffset?: number } | undefined)?.curveOffset ?? 0,
+            labelText: `${e.methodCount}个方法 · ${e.callCount}次`,
+            labelFill: '#262626', labelFontSize: 12,
+            labelBackground: true, labelBackgroundFill: '#fff',
+            labelBackgroundRadius: 4,
+          },
+        })),
+      },
+      node: {
+        type: 'rect',
+        style: {
+          width: NODE_W,
+          height: NODE_H,
+          radius: 8,
+          fill: '#ffffff',
+          stroke: '#d9d9d9',
+          lineWidth: 2,
+        },
+      },
+      layout: { type: 'dagre', rankdir: 'LR', nodesep: 80, ranksep: 220 },
+      behaviors: ['drag-canvas', 'zoom-canvas', 'drag-element'],
+      plugins: [{ type: 'minimap', size: [160, 100] }],
+    });
 
-    const onResize = () => {
-      if (!graphRef.current || graphRef.current.get('destroyed')) return;
-      graphRef.current.changeSize(container.clientWidth || 900, container.clientHeight || 650);
-    };
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
+    graph.on('node:click', (evt: { itemId?: string }) => {
+      const nodeId = evt.itemId;
+      if (!nodeId) return;
+      const repoId = Number(nodeId.replace('repo-', ''));
+      if (!isNaN(repoId)) navigate(`/callgraph?repoId=${repoId}`);
+    });
+
+    graph.on('edge:click', (evt: { itemId?: string }) => {
+      const edgeId = evt.itemId;
+      if (!edgeId) return;
+      const edge = edgesMap.get(edgeId);
+      if (edge) { setSelectedEdge(edge); setEdgeDrawerOpen(true); }
+    });
+
+    graph.render().catch(console.warn);
+    graphRef.current = graph as GraphType;
+
+    const resizeObs = new ResizeObserver(() => {
+      if (!graphRef.current) return;
+      try { (graphRef.current as any).setSize?.([container.clientWidth || 900, container.clientHeight || 650]); } catch { /* */ }
+    });
+    resizeObs.observe(container);
+    return () => resizeObs.disconnect();
   }, [topo, navigate]);
 
   const repoName = useCallback((repoId: number) =>
@@ -418,13 +286,13 @@ export default function RepoTopology() {
         )}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
           <Tooltip title="放大">
-            <Button size="small" icon={<ZoomInOutlined />} onClick={() => graphRef.current?.zoom(1.2)} />
+            <Button size="small" icon={<ZoomInOutlined />} onClick={() => (graphRef.current as any)?.zoom?.(1.2)} />
           </Tooltip>
           <Tooltip title="缩小">
-            <Button size="small" icon={<ZoomOutOutlined />} onClick={() => graphRef.current?.zoom(0.8)} />
+            <Button size="small" icon={<ZoomOutOutlined />} onClick={() => (graphRef.current as any)?.zoom?.(0.8)} />
           </Tooltip>
           <Tooltip title="适应画布">
-            <Button size="small" icon={<ExpandOutlined />} onClick={() => graphRef.current?.fitView()} />
+            <Button size="small" icon={<ExpandOutlined />} onClick={() => (graphRef.current as any)?.fitView?.()} />
           </Tooltip>
           <Tooltip title="刷新">
             <Button size="small" icon={<ReloadOutlined />} onClick={loadTopology} loading={loading} />
@@ -477,8 +345,9 @@ export default function RepoTopology() {
         {/* G6 画布 */}
         <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
           {loading && (
-            <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10 }}>
-              <Spin size="large" tip="加载拓扑图..." />
+            <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 10, gap: 12 }}>
+              <Spin size="large" />
+              <span style={{ color: '#8c8c8c', fontSize: 13 }}>加载拓扑图...</span>
             </div>
           )}
           {!loading && (!topo || topo.repos.length === 0) && (
@@ -510,7 +379,7 @@ export default function RepoTopology() {
         </div>
       </div>
 
-      {/* 边点击 → 热点方法 + 影响分析 Drawer */}
+      {/* 边点击 → 热点方法 Drawer */}
       <Drawer
         title={
           selectedEdge && topo ? (
@@ -529,9 +398,9 @@ export default function RepoTopology() {
           ) : '跨库调用详情'
         }
         placement="right"
-        width={480}
+        width={520}
         open={edgeDrawerOpen}
-        onClose={() => { setEdgeDrawerOpen(false); setSelectedMethod(null); }}
+        onClose={() => { setEdgeDrawerOpen(false); }}
       >
         {selectedEdge && (
           <div>
@@ -547,143 +416,63 @@ export default function RepoTopology() {
               </div>
             </div>
 
-            {/* 热点方法列表 */}
+            {/* 热点方法列表：每行末尾直接放「详情 ↗」按钮 */}
             <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10 }}>
-              Top {selectedEdge.hotMethods.length} 热点方法
+              全部方法（{selectedEdge.hotMethods.length} 个）
             </div>
             {selectedEdge.hotMethods.map((m, i) => (
               <div
                 key={i}
                 style={{
-                  padding: '10px 12px', marginBottom: 8, borderRadius: 6, cursor: 'pointer',
-                  background: selectedMethod?.fullMethod === m.fullMethod ? '#e6f7ff' : '#fafafa',
-                  border: `1px solid ${selectedMethod?.fullMethod === m.fullMethod ? '#91d5ff' : '#f0f0f0'}`,
-                  transition: 'all 0.2s',
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '8px 10px', marginBottom: 6, borderRadius: 6,
+                  background: '#fafafa', border: '1px solid #f0f0f0',
                 }}
-                onClick={() => { setSelectedMethod(m); setImpactResult(null); setImpactMethod(null); }}
               >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                  <Badge count={i + 1} style={{ backgroundColor: '#8c8c8c', fontSize: 10 }} />
-                  {m.httpMethod && <Tag color="green" style={{ fontSize: 10, margin: 0 }}>{m.httpMethod}</Tag>}
-                  {m.endpointType && m.endpointType !== 'CONTROLLER' && (
-                    <Tag color="blue" style={{ fontSize: 10, margin: 0 }}>{m.endpointType}</Tag>
-                  )}
-                  <span style={{ fontSize: 12, fontFamily: 'monospace', fontWeight: 500, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {m.shortName}
-                  </span>
-                  <span style={{ fontSize: 12, color: '#1890ff', fontWeight: 600, flexShrink: 0 }}>
-                    {m.callCount}次
-                  </span>
-                </div>
-                {m.urlPath && (
-                  <div style={{ fontSize: 11, color: '#8c8c8c', fontFamily: 'monospace', paddingLeft: 20 }}>
-                    {m.urlPath}
+                {/* 序号 */}
+                <span style={{ fontSize: 11, color: '#bfbfbf', width: 18, flexShrink: 0, textAlign: 'right' }}>{i + 1}</span>
+
+                {/* 方法信息 */}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
+                    {m.httpMethod && <Tag color="green" style={{ fontSize: 10, margin: 0, padding: '0 4px' }}>{m.httpMethod}</Tag>}
+                    {m.endpointType && m.endpointType !== 'CONTROLLER' && (
+                      <Tag color="blue" style={{ fontSize: 10, margin: 0, padding: '0 4px' }}>{m.endpointType}</Tag>
+                    )}
+                    <span style={{ fontSize: 12, fontFamily: 'monospace', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {m.shortName}
+                    </span>
                   </div>
-                )}
-                <div style={{ fontSize: 10, color: '#bfbfbf', paddingLeft: 20, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {m.fullMethod}
+                  {m.urlPath && (
+                    <div style={{ fontSize: 11, color: '#8c8c8c', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {m.urlPath}
+                    </div>
+                  )}
                 </div>
+
+                {/* 调用次数 */}
+                <span style={{ fontSize: 12, color: '#1890ff', fontWeight: 600, flexShrink: 0 }}>{m.callCount}次</span>
+
+                {/* 详情按钮 → 影响分析 */}
+                <Button
+                  size="small"
+                  type="link"
+                  style={{ flexShrink: 0, padding: '0 4px', fontSize: 12 }}
+                  onClick={() => {
+                    const url = `/impact?method=${encodeURIComponent(m.fullMethod)}&repoId=${selectedEdge.calleeRepoId}`;
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                  }}
+                >
+                  详情 ↗
+                </Button>
               </div>
             ))}
-
-            {/* 选中方法详情卡片 */}
-            {selectedMethod && (
-              <div style={{ marginTop: 16, padding: '12px 14px', background: '#f0f9ff', borderRadius: 8, border: '1px solid #bae0ff' }}>
-                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>方法详情</span>
-                </div>
-                <div style={{ fontSize: 12, marginBottom: 6 }}>
-                  <span style={{ color: '#8c8c8c', marginRight: 8 }}>类型：</span>
-                  {selectedMethod.endpointType ? (
-                    <Tag color={selectedMethod.endpointType === 'CONTROLLER' ? 'green' : selectedMethod.endpointType === 'GRPC' ? 'blue' : 'orange'} style={{ fontSize: 11 }}>
-                      {selectedMethod.endpointType}
-                    </Tag>
-                  ) : <span style={{ color: '#bfbfbf' }}>-</span>}
-                  {selectedMethod.httpMethod && <Tag color="green" style={{ fontSize: 11, marginLeft: 4 }}>{selectedMethod.httpMethod}</Tag>}
-                </div>
-                {selectedMethod.urlPath && (
-                  <div style={{ fontSize: 12, marginBottom: 6 }}>
-                    <span style={{ color: '#8c8c8c', marginRight: 8 }}>路径：</span>
-                    <span style={{ fontFamily: 'monospace', color: '#262626' }}>{selectedMethod.urlPath}</span>
-                  </div>
-                )}
-                <div style={{ fontSize: 12, marginBottom: 12 }}>
-                  <span style={{ color: '#8c8c8c', marginRight: 8 }}>调用次数：</span>
-                  <span style={{ fontWeight: 600, color: '#1890ff' }}>{selectedMethod.callCount.toLocaleString()}</span>
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <Button
-                    size="small"
-                    type="primary"
-                    onClick={() => doImpact(selectedMethod)}
-                    loading={impactLoading}
-                  >
-                    影响分析
-                  </Button>
-                  <Button
-                    size="small"
-                    onClick={() => window.open(`/callgraph?repoId=${selectedEdge.calleeRepoId}&entry=${encodeURIComponent(selectedMethod.fullMethod)}`, '_blank')}
-                  >
-                    查看调用链 ↗
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {/* 影响分析结果 */}
-            {impactMethod && (
-              <div style={{ marginTop: 16 }}>
-                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span>影响分析</span>
-                  <Tag style={{ fontSize: 11, fontFamily: 'monospace', fontWeight: 400 }}>{impactMethod.shortName}</Tag>
-                </div>
-
-                {impactLoading ? (
-                  <div style={{ textAlign: 'center', padding: 20 }}><Spin /></div>
-                ) : impactResult ? (
-                  <div>
-                    <div style={{ display: 'flex', gap: 16, marginBottom: 12, fontSize: 12 }}>
-                      <span>调用方: <strong>{impactResult.totalCallers}</strong></span>
-                      <span>受影响仓库: <strong>{impactResult.affectedRepoCount}</strong></span>
-                      <span>受影响入口点: <strong>{impactResult.affectedEndpointCount}</strong></span>
-                    </div>
-
-                    {impactResult.repoGroups.map(group => (
-                      <div key={group.repoId} style={{ marginBottom: 12, padding: '8px 10px', background: '#fafafa', borderRadius: 6 }}>
-                        <div style={{ fontWeight: 600, marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <Tag color="blue" style={{ fontSize: 11 }}>{group.repoName}</Tag>
-                          <span style={{ fontSize: 11, color: '#8c8c8c' }}>{group.callers.length} 个调用方</span>
-                        </div>
-                        {group.endpoints.length > 0 && (
-                          <div style={{ marginBottom: 6 }}>
-                            {group.endpoints.map((ep, i) => (
-                              <div key={i} style={{ fontSize: 11, padding: '2px 8px', background: '#f6ffed', borderRadius: 4, marginBottom: 2, borderLeft: '2px solid #52c41a' }}>
-                                {ep.httpMethod && <Tag color="green" style={{ fontSize: 10 }}>{ep.httpMethod}</Tag>}
-                                <span style={{ fontFamily: 'monospace' }}>{ep.urlPath ?? ep.shortRef}</span>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {group.callers.slice(0, 3).map((c, i) => (
-                          <div key={i} style={{ fontSize: 11, color: '#595959', fontFamily: 'monospace', paddingLeft: 8 }}>
-                            {'  '.repeat(Math.min(c.depth - 1, 3))}↳ {c.shortRef}
-                          </div>
-                        ))}
-                        {group.callers.length > 3 && (
-                          <div style={{ fontSize: 11, color: '#999', paddingLeft: 8 }}>...还有 {group.callers.length - 3} 个</div>
-                        )}
-                      </div>
-                    ))}
-
-                    {impactResult.truncated && (
-                      <div style={{ padding: '6px 10px', background: '#fffbe6', borderRadius: 4, fontSize: 11, color: '#ad6800', marginTop: 8 }}>
-                        ⚠️ 结果已截断（超过 800 个调用方）
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-            )}
           </div>
         )}
       </Drawer>

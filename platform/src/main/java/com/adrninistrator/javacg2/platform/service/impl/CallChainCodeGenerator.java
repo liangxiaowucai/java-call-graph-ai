@@ -6,6 +6,7 @@ import com.adrninistrator.javacg2.platform.repository.RepositoryRepo;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
 import com.adrninistrator.javacg2.platform.service.LogAnalyzer;
 import com.adrninistrator.javacg2.platform.service.MockService;
+import com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -23,7 +24,7 @@ public class CallChainCodeGenerator {
     private final RepositoryRepo repositoryRepo;
     private final MockService mockService;
 
-    // 精简时要过滤的样板代码模式
+    // 精简时要过滤的样板代码模式（gRPC 方法噪点由 GrpcNoiseFilter 统一识别，不在此列举）
     private static final List<String> BOILERPLATE_PATTERNS = List.of(
             "log.info", "log.debug", "log.warn", "log.error", "log.trace",
             "logger.info", "logger.debug", "logger.warn", "logger.error",
@@ -183,9 +184,18 @@ public class CallChainCodeGenerator {
         }
         // 纯注释
         if (line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) return true;
-        // 空的 try/catch 样板
-        if (line.equals("try {") || line.equals("} catch (Exception e) {") || line.equals("} finally {")) return false; // 保留
+        // gRPC 基础设施方法调用（通过方法名匹配）
+        if (GrpcNoiseFilter.isGrpcInfraMethodName(extractMethodNameFromLine(line))) return true;
         return false;
+    }
+
+    /** 从源码行中粗提取方法名（处理 .methodName( 调用模式）*/
+    private String extractMethodNameFromLine(String line) {
+        int paren = line.lastIndexOf('(');
+        if (paren <= 0) return "";
+        int dot = line.lastIndexOf('.', paren - 1);
+        if (dot < 0) return "";
+        return line.substring(dot + 1, paren).trim();
     }
 
     private boolean isKeyLogic(String line) {

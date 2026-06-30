@@ -83,6 +83,13 @@ public interface CallGraphEngine {
     CrossRepoTreeDTO getCrossRepoCallTree(String fullMethod, int maxDepth);
 
     /**
+     * 上游调用树：从目标方法向上 BFS，无深度限制，直到没有调用方为止。
+     * 入口点（HTTP/MQ/gRPC/定时）不是终止条件，继续向上寻找触发者。
+     * 目标方法为根节点，callers 为子节点（树的方向：从内到外）。
+     */
+    UpstreamTreeDTO getUpstreamTree(String fullMethod);
+
+    /**
      * 影响分析 + 调用点源码：向上追踪所有调用方直到入口点，
      * 并为每个调用方附带「调用当前方法那一行附近的源码片段」及返回类型信息，
      * 便于一次性判断改动是否破坏了上层调用方的契约假设。
@@ -202,6 +209,32 @@ public interface CallGraphEngine {
         Long repoId,
         String repoName,
         String filePath
+    ) {}
+
+    // ── 上游调用树 DTO ────────────────────────────────────────────────────────
+
+    /** 上游调用树结果（根 = 目标方法，子节点 = 直接/间接调用方，叶节点 = 没有更多调用方的节点）*/
+    record UpstreamTreeDTO(
+        String targetMethod,
+        int totalNodes,
+        boolean truncated,
+        List<AmbiguityWarning> warnings,
+        UpstreamTreeNodeDTO root
+    ) {}
+
+    /** 上游调用树节点 */
+    record UpstreamTreeNodeDTO(
+        String id,
+        String fullMethod,
+        String shortRef,
+        Long repoId,
+        String repoName,
+        boolean isEndpoint,
+        String endpointType,
+        String httpMethod,
+        String urlPath,
+        boolean isRecursive,
+        List<UpstreamTreeNodeDTO> callers
     ) {}
 
     // ── 影响分析 + 调用点源码 DTO ──────────────────────────────────────────────
