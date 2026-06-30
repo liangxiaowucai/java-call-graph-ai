@@ -324,109 +324,133 @@ public class ReleaseDocService {
 
         StringBuilder md = new StringBuilder();
         md.append("# 上线文档\n\n");
-        md.append("**生成时间**: ").append(java.time.LocalDate.now()).append("\n\n");
-        md.append("**涉及仓库**: ");
-        // 从 selections 获取仓库名
+        md.append("**生成时间**: ").append(java.time.LocalDateTime.now().toString().replace("T", " ").substring(0, 19)).append("\n\n");
+
+        // 仓库概览表
+        md.append("## 概览\n\n");
+        md.append("| 仓库 | 功能分支 | 对比基线 | 提交数 | 变更文件 |\n");
+        md.append("|------|----------|----------|--------|----------|\n");
         for (RepoSelection sel : selections) {
             RepositoryEntity repo = repositoryRepo.findById(sel.repoId()).orElse(null);
-            if (repo != null) md.append(repo.getName()).append(" (`").append(sel.branch()).append("`), ");
+            String name = repo != null ? repo.getName() : "repo-" + sel.repoId();
+            long commitCount = commits.stream().filter(c -> c.repo().equals(name)).count();
+            long fileCount = others.stream().filter(f -> f.repo().equals(name)).count();
+            md.append("| **").append(name).append("** | `").append(sel.branch()).append("` | `")
+              .append(sel.baseBranch()).append("` | ").append(commitCount).append(" | ").append(fileCount).append(" |\n");
         }
-        md.append("\n\n---\n\n");
+        md.append("\n---\n\n");
 
-        // 配置变更
+        // 1. 配置变更
         if (!configs.isEmpty()) {
-            md.append("## 1. 配置变更\n\n");
-            md.append("| 仓库 | 文件 | 类型 | 配置项 | 值 |\n");
-            md.append("|------|------|------|--------|----|\n");
+            md.append("## 1. ⚙️ 配置变更\n\n");
+            md.append("> 以下配置项在分支中有新增或修改，上线前请确认目标环境已同步。\n\n");
+            md.append("| 仓库 | 文件路径 | 类型 | 配置项 | 值 |\n");
+            md.append("|------|----------|------|--------|----|\n");
             for (ConfigChange c : configs) {
-                md.append("| ").append(c.repo()).append(" | ").append(shortPath(c.file()))
-                  .append(" | ").append(c.changeType()).append(" | `").append(c.key())
-                  .append("` | `").append(escape(c.value())).append("` |\n");
+                md.append("| ").append(c.repo()).append(" | `").append(c.file())
+                  .append("` | ").append(c.changeType()).append(" | `").append(escape(c.key()))
+                  .append("` | `").append(escape(truncate(c.value(), 60))).append("` |\n");
             }
             md.append("\n");
         }
 
-        // SQL 变更
+        // 2. SQL 变更
         if (!sqls.isEmpty()) {
-            md.append("## 2. SQL/数据库变更\n\n");
-            md.append("| 仓库 | 文件 | 操作 | 表名 | 详情 |\n");
-            md.append("|------|------|------|------|------|\n");
+            md.append("## 2. 🗄️ SQL/数据库变更\n\n");
+            md.append("> 上线前请在目标数据库执行以下 SQL 脚本。\n\n");
+            md.append("| 仓库 | 文件路径 | 操作 | 表名 | SQL 摘要 |\n");
+            md.append("|------|----------|------|------|----------|\n");
             for (SqlChange s : sqls) {
-                md.append("| ").append(s.repo()).append(" | ").append(shortPath(s.file()))
-                  .append(" | ").append(s.operation()).append(" | ").append(s.tableName())
-                  .append(" | ").append(escape(s.detail())).append(" |\n");
+                md.append("| ").append(s.repo()).append(" | `").append(s.file())
+                  .append("` | **").append(s.operation()).append("** | `").append(s.tableName())
+                  .append("` | ").append(escape(truncate(s.detail(), 80))).append(" |\n");
             }
             md.append("\n");
         }
 
-        // 接口变更
+        // 3. 接口变更
         if (!apis.isEmpty()) {
-            md.append("## 3. 接口变更\n\n");
-            md.append("| 仓库 | 方法 | 路径 | 类型 | 文件 |\n");
-            md.append("|------|------|------|------|------|\n");
+            md.append("## 3. 🌐 接口变更（Controller）\n\n");
+            md.append("> 新增或修改的 HTTP 接口，上线后需通知前端/调用方。\n\n");
+            md.append("| 仓库 | HTTP 方法 | 路径 | 变更类型 | 文件路径 |\n");
+            md.append("|------|-----------|------|----------|----------|\n");
             for (ApiChange a : apis) {
-                md.append("| ").append(a.repo()).append(" | ").append(a.method())
-                  .append(" | `").append(a.path()).append("` | ").append(a.changeType())
-                  .append(" | ").append(shortPath(a.file())).append(" |\n");
+                md.append("| ").append(a.repo()).append(" | **").append(a.method())
+                  .append("** | `").append(a.path()).append("` | ").append(a.changeType())
+                  .append(" | `").append(a.file()).append("` |\n");
             }
             md.append("\n");
         }
 
-        // 依赖变更
+        // 4. 依赖变更
         if (!deps.isEmpty()) {
-            md.append("## 4. 依赖变更\n\n");
-            md.append("| 仓库 | 依赖 | 版本 | 文件 |\n");
-            md.append("|------|------|------|------|\n");
+            md.append("## 4. 📦 依赖变更\n\n");
+            md.append("> 新增或升级的依赖，请确认兼容性。\n\n");
+            md.append("| 仓库 | 依赖 Artifact | 版本 | 文件路径 |\n");
+            md.append("|------|---------------|------|----------|\n");
             for (DependencyChange d : deps) {
-                String ver = d.fromVersion().isEmpty() ? d.toVersion() : d.fromVersion() + " → " + d.toVersion();
+                String ver = d.fromVersion().isEmpty() ? "新增 " + d.toVersion() : d.fromVersion() + " → " + d.toVersion();
                 md.append("| ").append(d.repo()).append(" | `").append(d.artifact())
-                  .append("` | ").append(ver).append(" | ").append(shortPath(d.file())).append(" |\n");
+                  .append("` | ").append(ver).append(" | `").append(d.file()).append("` |\n");
             }
             md.append("\n");
         }
 
-        // 部署变更
+        // 5. 部署变更
         if (!deploys.isEmpty()) {
-            md.append("## 5. 部署/环境变更\n\n");
-            md.append("| 仓库 | 文件 | 类型 | 变更 |\n");
-            md.append("|------|------|------|------|\n");
+            md.append("## 5. 🐳 部署/环境变更\n\n");
+            md.append("> Dockerfile、docker-compose、脚本等部署相关变更。\n\n");
+            md.append("| 仓库 | 文件路径 | 变更类型 | 变更量 |\n");
+            md.append("|------|----------|----------|--------|\n");
             for (DeployChange d : deploys) {
-                md.append("| ").append(d.repo()).append(" | ").append(shortPath(d.file()))
-                  .append(" | ").append(d.changeType()).append(" | ").append(d.detail()).append(" |\n");
+                md.append("| ").append(d.repo()).append(" | `").append(d.file())
+                  .append("` | ").append(d.changeType()).append(" | ").append(d.detail()).append(" |\n");
             }
             md.append("\n");
         }
 
-        // 提交记录
+        // 6. 提交记录（按仓库分组，完整 hash 可回溯）
         if (!commits.isEmpty()) {
-            md.append("## 6. Git 提交记录\n\n");
+            md.append("## 6. 📝 Git 提交记录\n\n");
             String currentRepo = "";
             for (CommitInfo c : commits) {
                 if (!c.repo().equals(currentRepo)) {
                     currentRepo = c.repo();
-                    md.append("### ").append(currentRepo).append("\n\n");
+                    long count = commits.stream().filter(x -> x.repo().equals(currentRepo)).count();
+                    md.append("### ").append(currentRepo).append(" (").append(count).append(" commits)\n\n");
                 }
-                md.append("- `").append(c.hash()).append("` ").append(c.message())
-                  .append(" (").append(c.author()).append(", ").append(c.date()).append(")\n");
+                md.append("- `").append(c.hash()).append("` ").append(escape(c.message()))
+                  .append(" — *").append(c.author()).append("* ").append(c.date()).append("\n");
             }
             md.append("\n");
         }
 
-        // 其他重要文件
+        // 7. 其他代码变更文件清单
         if (!others.isEmpty()) {
-            md.append("## 7. 其他代码变更\n\n");
-            md.append("| 仓库 | 文件 | 状态 | +/- |\n");
-            md.append("|------|------|------|-----|\n");
-            for (FileChange f : others.stream().limit(50).collect(Collectors.toList())) {
-                md.append("| ").append(f.repo()).append(" | ").append(shortPath(f.file()))
-                  .append(" | ").append(f.status()).append(" | +").append(f.additions())
-                  .append("/-").append(f.deletions()).append(" |\n");
+            md.append("## 7. 📄 代码变更文件清单\n\n");
+            md.append("| 仓库 | 文件路径 | 状态 | 增/删行 |\n");
+            md.append("|------|----------|------|--------|\n");
+            for (FileChange f : others.stream().limit(100).collect(Collectors.toList())) {
+                md.append("| ").append(f.repo()).append(" | `").append(f.file())
+                  .append("` | ").append(f.status()).append(" | +").append(f.additions())
+                  .append(" / -").append(f.deletions()).append(" |\n");
             }
-            if (others.size() > 50) md.append("| ... | 共 ").append(others.size()).append(" 个文件 | | |\n");
+            if (others.size() > 100) {
+                md.append("| | *... 共 ").append(others.size()).append(" 个文件* | | |\n");
+            }
             md.append("\n");
         }
+
+        // 尾部
+        md.append("---\n\n");
+        md.append("*本文档由 JavaCG2 自动从 git diff 生成，所有内容均来自版本控制系统的实际变更记录，可通过 commit hash 和文件路径完整回溯。*\n");
 
         return md.toString();
+    }
+
+    private String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() > max ? s.substring(0, max) + "..." : s;
     }
 
     private String shortPath(String path) {

@@ -116,39 +116,48 @@ export default function ReleaseDoc() {
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         {/* Left: Repo/Branch selection */}
-        <div style={{ width: 360, borderRight: '1px solid #f0f0f0', overflow: 'auto', padding: '12px' }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: '#262626' }}>选择仓库与分支</div>
+        <div style={{ width: 380, borderRight: '1px solid #f0f0f0', overflow: 'auto', padding: '16px' }}>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14, color: '#262626', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 16 }}>📦</span> 选择仓库与分支
+          </div>
 
           {selections.map(sel => (
             <div key={sel.repoId} style={{
-              padding: '10px 12px', marginBottom: 8, borderRadius: 8,
-              border: sel.selected ? '1px solid #1890ff' : '1px solid #f0f0f0',
-              background: sel.selected ? '#f0f7ff' : '#fff',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: sel.selected ? 8 : 0 }}>
-                <Checkbox checked={sel.selected} onChange={e => handleCheck(sel.repoId, e.target.checked)} />
-                <span style={{ fontWeight: 600, fontSize: 13 }}>{sel.repoName}</span>
-                <Tag color={sel.selected ? 'blue' : 'default'} style={{ margin: 0 }}>
-                  {repos.find(r => r.id === sel.repoId)?.status ?? ''}
-                </Tag>
+              padding: '12px 14px', marginBottom: 6, borderRadius: 10,
+              border: sel.selected ? '2px solid #1890ff' : '1px solid #e8e8e8',
+              background: sel.selected ? '#f0f7ff' : '#fafafa',
+              transition: 'all 0.2s',
+              cursor: 'pointer',
+            }} onClick={() => !sel.selected && handleCheck(sel.repoId, true)}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <Checkbox checked={sel.selected} onChange={e => { e.stopPropagation(); handleCheck(sel.repoId, e.target.checked); }} />
+                <div style={{ flex: 1 }}>
+                  <span style={{ fontWeight: 600, fontSize: 14, color: '#262626' }}>{sel.repoName}</span>
+                  <Tag color={sel.selected ? 'blue' : 'default'} style={{ marginLeft: 8, fontSize: 10 }}>
+                    {repos.find(r => r.id === sel.repoId)?.status ?? ''}
+                  </Tag>
+                </div>
               </div>
 
               {sel.selected && (
-                <div style={{ paddingLeft: 24, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ fontSize: 11, color: '#8c8c8c', width: 60 }}>功能分支:</span>
-                    <Select size="small" style={{ flex: 1 }} placeholder="选择分支"
+                <div style={{ marginTop: 10, paddingLeft: 30, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, color: '#595959', width: 64, flexShrink: 0 }}>功能分支</span>
+                    <Select size="small" style={{ flex: 1 }} placeholder="选择要上线的分支"
                       value={sel.branch || undefined}
                       onChange={v => setSelections(prev => prev.map(s => s.repoId === sel.repoId ? { ...s, branch: v } : s))}
                       options={sel.branches.map(b => ({ label: b, value: b }))}
                       showSearch filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
                       loading={sel.branches.length === 0}
+                      notFoundContent={<span style={{ color: '#bfbfbf', fontSize: 12 }}>加载中...</span>}
                     />
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ fontSize: 11, color: '#8c8c8c', width: 60 }}>对比基线:</span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, color: '#595959', width: 64, flexShrink: 0 }}>对比基线</span>
                     <Select size="small" style={{ flex: 1 }}
                       value={sel.baseBranch}
+                      showSearch
+                      filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
                       onChange={v => setSelections(prev => prev.map(s => s.repoId === sel.repoId ? { ...s, baseBranch: v } : s))}
                       options={[
                         { label: 'master', value: 'master' },
