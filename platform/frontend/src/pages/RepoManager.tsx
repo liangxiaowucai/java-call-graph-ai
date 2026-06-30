@@ -49,6 +49,8 @@ export default function RepoManager() {
   const [branches, setBranches] = useState<string[]>([]);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editBranches, setEditBranches] = useState<string[]>([]);
+  const [editBranchLoading, setEditBranchLoading] = useState(false);
   const [editingRepo, setEditingRepo] = useState<RepoEntity | null>(null);
   const [editForm] = Form.useForm();
   const [form] = Form.useForm<CloneRequest>();
@@ -1115,9 +1117,32 @@ export default function RepoManager() {
           <Form.Item
             name="branch"
             label="分支"
-            rules={[{ required: true, message: '请输入分支名称' }]}
+            rules={[{ required: true, message: '请选择分支' }]}
           >
-            <Input placeholder="例如: main, master, develop" />
+            <Input.Group compact>
+              <Form.Item name="branch" noStyle rules={[{ required: true, message: '请选择分支' }]}>
+                <Select
+                  style={{ width: 'calc(100% - 90px)' }}
+                  placeholder="请先获取分支列表"
+                  showSearch
+                  filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
+                  options={editBranches.map(b => ({ label: b, value: b }))}
+                  notFoundContent={editBranchLoading ? <Spin size="small" /> : '请点击右侧按钮获取'}
+                />
+              </Form.Item>
+              <Button style={{ width: 90 }} loading={editBranchLoading} onClick={async () => {
+                const gitUrl = editForm.getFieldValue('gitUrl');
+                if (!gitUrl) { message.warning('请先填写 Git 地址'); return; }
+                setEditBranchLoading(true);
+                try {
+                  const list = await fetchBranches(gitUrl, undefined, editingRepo?.repoType);
+                  setEditBranches(list);
+                  message.success(`获取到 ${list.length} 个分支`);
+                } catch (e: unknown) {
+                  if (e instanceof Error) message.error(e.message);
+                } finally { setEditBranchLoading(false); }
+              }}>获取分支</Button>
+            </Input.Group>
           </Form.Item>
           
           <Form.Item
