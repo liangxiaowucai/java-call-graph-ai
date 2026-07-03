@@ -342,55 +342,49 @@ public class CodeAnalysisToolExecutor {
     }
 
     /**
-     * 新增工具：获取接口方法的所有实现类。
-     * 解决多态分派问题，让 Claude 知道调用接口方法时实际走哪个实现。
+     * 获取接口/抽象方法的所有实现类。
+     * 正确逻辑：在同仓库 chunk 中查找方法名+参数签名相同但类名不同的方法，这些就是多态实现。
+     * 不能用 getCallees（下游调用）来找实现类，那是完全不同的概念。
      */
     private String executeGetImplementations(Long repoId, JsonNode input) {
         String fullMethod = input.path("fullMethod").asText(null);
         if (fullMethod == null || fullMethod.isBlank()) {
             return "INVALID_INPUT: fullMethod is required";
         }
-        // 使用 getCallees 中深度 1 + 类型 IMPL/_ITF 来找实现
-        List<CallGraphEngine.CallerDTO> callees = callGraphEngine.getCallees(repoId, fullMethod, 1);
-        List<CallGraphEngine.CallerDTO> impls = callees.stream()
-                .filter(c -> "IMPL".equals(c.callType()) || "_ITF".equals(c.callType()) || "INT".equals(c.callType()))
+
+        // 提取 类名 和 方法名(参数) 部分
+        int colonIdx = fullMethod.indexOf(':');
+        if (colonIdx < 0) return "INVALID_INPUT: fullMethod 格式不正确，期望 类全限定名:方法名(参数)";
+        String targetClass = fullMethod.substring(0, colonIdx);
+        String methodSignature = fullMethod.substring(colonIdx + 1); // 方法名(参数)
+
+        // 在同仓库中查找相同方法签名但不同类的 chunk
+        List<ChunkEntity> candidates = chunkRepo.findByRepoId(repoId).stream()
+                .filter(c -> c.getFullMethod() != null
+                        && c.getFullMethod().endsWith(":" + methodSignature)
+                        && !fullMethod.equals(c.getFullMethod())
+                        && c.getClassName() != null
+                        && !targetClass.equals(c.getClassName()))
                 .collect(Collectors.toList());
 
-        // 也检查 chunk 中同签名但不同类的实现
-        String methodName = fullMethod.contains(":") ? fullMethod.substring(fullMethod.indexOf(':') + 1) : fullMethod;
-        List<ChunkEntity> allImpls = chunkRepo.findByRepoId(repoId).stream()
-                .filter(c -> c.getFullMethod() != null && c.getFullMethod().endsWith(":" + methodName))
-                .filter(c -> !c.getFullMethod().equals(fullMethod))
-                .collect(Collectors.toList());
-
-        if (impls.isEmpty() && allImpls.isEmpty()) {
-            return "NO_IMPLEMENTATIONS: " + fullMethod + " 没有找到实现类（可能本身就是具体实现而非接口/抽象方法）";
+        if (candidates.isEmpty()) {
+            return "NO_IMPLEMENTATIONS: " + fullMethod
+                    + " 没有找到其他实现（可能本身就是唯一实现，或实现类不在当前仓库的源码范围内）";
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append("// ").append(extractShortRef(fullMethod)).append(" 的实现类:\n");
-
-        Set<String> seen = new HashSet<>();
-        if (!impls.isEmpty()) {
-            sb.append("\n## 调用图中的实现分派:\n");
-            for (var impl : impls) {
-                sb.append("  → ").append(impl.fullMethod()).append(" [").append(impl.callType()).append("]\n");
-                seen.add(impl.fullMethod());
+        sb.append("// ").append(extractShortRef(fullMethod)).append(" 的实现类（").append(candidates.size()).append(" 个）:\n");
+        for (ChunkEntity c : candidates) {
+            sb.append("  → ").append(c.getFullMethod());
+            if (c.getClassName() != null) {
+                String shortCls = c.getClassName().contains(".")
+                        ? c.getClassName().substring(c.getClassName().lastIndexOf('.') + 1)
+                        : c.getClassName();
+                sb.append(" (").append(shortCls).append(")");
             }
+            sb.append("\n");
         }
-        if (!allImpls.isEmpty()) {
-            List<ChunkEntity> extras = allImpls.stream()
-                    .filter(c -> !seen.contains(c.getFullMethod()))
-                    .collect(Collectors.toList());
-            if (!extras.isEmpty()) {
-                sb.append("\n## 同签名的其他实现（可能的多态分派目标）:\n");
-                for (ChunkEntity c : extras) {
-                    sb.append("  → ").append(c.getFullMethod());
-                    if (c.getClassName() != null) sb.append(" (").append(c.getClassName()).append(")");
-                    sb.append("\n");
-                }
-            }
-        }
+        sb.append("\n提示：用 getMethodSource 读取具体实现类源码。");
         return sb.toString();
     }
 

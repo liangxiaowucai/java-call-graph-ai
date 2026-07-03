@@ -19,10 +19,13 @@ import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
+
+import java.util.concurrent.ExecutorService;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
@@ -55,9 +58,21 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
     private final com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore;
     private final TransactionTemplate transactionTemplate;
     private final EmbeddingService embeddingService;
+    private final ExecutorService analysisExecutor;
+    private final com.adrninistrator.javacg2.platform.repository.ClassReferenceRepo classReferenceRepo;
+    private final com.adrninistrator.javacg2.platform.repository.JarInfoRepo jarInfoRepo;
+    private final com.adrninistrator.javacg2.platform.repository.EnumConstantRepo enumConstantRepo;
+    private final com.adrninistrator.javacg2.platform.repository.StaticFieldUsageRepo staticFieldUsageRepo;
+    private final com.adrninistrator.javacg2.platform.repository.MethodReturnConstRepo methodReturnConstRepo;
+    private final com.adrninistrator.javacg2.platform.repository.FieldConstantRepo fieldConstantRepo;
+    private final com.adrninistrator.javacg2.platform.repository.GraphLayoutRepo graphLayoutRepo;
 
     @Value("${platform.analysis-output-dir:./data/analysis}")
     private String analysisOutputDir;
+
+    /** 导入完成后是否删除 data/analysis/repo_<id> 中间文件（默认开：数据已固化到 DB）。 */
+    @Value("${platform.cleanup-intermediate-files:true}")
+    private boolean cleanupIntermediateFiles;
 
     public BytecodeAnalyzerImpl(RepositoryRepo repositoryRepo, ChunkRepo chunkRepo,
                                  CallGraphRepo callGraphRepo, BoundaryRepo boundaryRepo,
@@ -70,7 +85,15 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                                  CallGraphEngine callGraphEngine,
                                  RepoConfigRepo repoConfigRepo,
                                  EmbeddingService embeddingService,
-                                 com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore) {
+                                 com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore,
+                                 com.adrninistrator.javacg2.platform.repository.ClassReferenceRepo classReferenceRepo,
+                                 com.adrninistrator.javacg2.platform.repository.JarInfoRepo jarInfoRepo,
+                                 com.adrninistrator.javacg2.platform.repository.EnumConstantRepo enumConstantRepo,
+                                 com.adrninistrator.javacg2.platform.repository.StaticFieldUsageRepo staticFieldUsageRepo,
+                                 com.adrninistrator.javacg2.platform.repository.MethodReturnConstRepo methodReturnConstRepo,
+                                 com.adrninistrator.javacg2.platform.repository.FieldConstantRepo fieldConstantRepo,
+                                 com.adrninistrator.javacg2.platform.repository.GraphLayoutRepo graphLayoutRepo,
+                                 @Qualifier("analysisExecutor") ExecutorService analysisExecutor) {
         this.repositoryRepo = repositoryRepo;
         this.chunkRepo = chunkRepo;
         this.callGraphRepo = callGraphRepo;
@@ -85,7 +108,15 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         this.callGraphEngine = callGraphEngine;
         this.repoConfigRepo = repoConfigRepo;
         this.embeddingService = embeddingService;
+        this.classReferenceRepo = classReferenceRepo;
+        this.jarInfoRepo = jarInfoRepo;
+        this.enumConstantRepo = enumConstantRepo;
+        this.staticFieldUsageRepo = staticFieldUsageRepo;
+        this.methodReturnConstRepo = methodReturnConstRepo;
+        this.fieldConstantRepo = fieldConstantRepo;
+        this.graphLayoutRepo = graphLayoutRepo;
         this.repoDataStore = repoDataStore;
+        this.analysisExecutor = analysisExecutor;
     }
 
     @Override
@@ -229,8 +260,8 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             logger.info("分析完成: repo={}, methods={}, calls={}", repo.getName(), methodCount, callCount);
             buildLogService.append(repoId, "\n📊 分析完成: 方法 " + methodCount + " 个, 调用关系 " + callCount + " 条");
             buildLogService.finish(repoId, true);
-            // 分析完成后异步 warmup 内存缓存，使后续调用链查询直接走内存
-            new Thread(() -> repoDataStore.warmup(repoId), "cache-warmup-" + repoId).start();
+            // 分析完成后提交到线程池异步 warmup，复用已有线程池避免裸 new Thread
+            analysisExecutor.submit(() -> repoDataStore.warmup(repoId));
             return new AnalysisResult(true, "分析完成", methodCount, callCount);
 
         } catch (AnalysisException e) {
@@ -255,6 +286,13 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         callGraphRepo.deleteByRepoId(repoId);
         boundaryRepo.deleteByRepoId(repoId);
         apiEndpointRepo.deleteByRepoId(repoId);
+        classReferenceRepo.deleteByRepoId(repoId);
+        jarInfoRepo.deleteByRepoId(repoId);
+        enumConstantRepo.deleteByRepoId(repoId);
+        staticFieldUsageRepo.deleteByRepoId(repoId);
+        methodReturnConstRepo.deleteByRepoId(repoId);
+        fieldConstantRepo.deleteByRepoId(repoId);
+        graphLayoutRepo.deleteByRepoId(repoId);  // 清除布局缓存，分析完成后重算
 
         // 5. 解析输出文件并导入数据库
         buildLogService.append(repoId, "📥 导入方法信息...");
@@ -276,6 +314,14 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         parseListenerEndpoints(repoId, actualOutputDir, repo.getLocalPath());
         buildLogService.append(repoId, "📥 导入 Spring Bean...");
         parseSpringBean(repoId, actualOutputDir);
+        buildLogService.append(repoId, "📥 解析类引用关系（import）...");
+        parseClassReferences(repoId, repo.getLocalPath());
+        buildLogService.append(repoId, "📥 固化模块名/枚举/常量到数据库...");
+        parseJarInfo(repoId, actualOutputDir);
+        parseEnumConstants(repoId, actualOutputDir);
+        parseStaticFieldUsage(repoId, actualOutputDir);
+        parseMethodReturnConst(repoId, actualOutputDir);
+        parseFieldConstants(repoId, actualOutputDir);
 
         // 5.5 边界点检测（HTTP/gRPC/MQ/DB/缓存/序列化等）
         buildLogService.append(repoId, "🔍 检测边界点（HTTP/gRPC/MQ/DB/缓存/序列化）...");
@@ -304,10 +350,26 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         // 清空源码缓存
         sourceFileCache.clear();
 
+        // 数据已全部固化到 DB，清理中间文件目录（可通过 platform.cleanup-intermediate-files=false 关闭）
+        cleanupIntermediateDir(repoId);
+
         // 6. 更新仓库状态
         repo.setStatus("READY");
         repo.setLastSyncTime(LocalDateTime.now());
         repositoryRepo.save(repo);
+
+        // 7. 异步计算拓扑图布局（径向分包布局，O(n) 级别，不阻塞分析完成响应）
+        //    结果存入 graph_layout 表，所有用户打开拓扑时直接使用，无需客户端重算
+        final LocalDateTime layoutVersion = repo.getLastSyncTime();
+        analysisExecutor.submit(() -> {
+            try {
+                buildLogService.append(repoId, "📐 计算拓扑图布局...");
+                computeAndSaveGraphLayout(repoId, layoutVersion);
+                buildLogService.append(repoId, "✅ 拓扑图布局计算完成");
+            } catch (Exception e) {
+                logger.warn("[GraphLayout] 布局计算失败 repoId={}: {}", repoId, e.getMessage());
+            }
+        });
 
         // 7. 触发后台向量索引（选配功能）。向量建设完全独立于调用链分析：
         //    它只写应用日志、不写本构建日志流，失败也不影响调用链分析结果。
@@ -334,6 +396,91 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         return Path.of(analysisOutputDir, "repo_" + repoId).toString();
     }
 
+    // ── 拓扑图布局计算（径向分包布局） ─────────────────────────────────────────
+
+    /**
+     * 分析完成后计算仓库拓扑图的节点布局，存入 graph_layout 表。
+     * 算法：径向分包布局，O(n)，确定性，无需迭代。
+     * - 以画布中心为原点
+     * - 各包按包名排序，均匀分布在外圆上，包内节点在子圆上排列
+     * - 参考画布大小 1200×800（前端 fitView 会自适应实际尺寸）
+     */
+    private void computeAndSaveGraphLayout(Long repoId, java.time.LocalDateTime version) {
+        // 1. 取所有 chunk，按包分组
+        List<com.adrninistrator.javacg2.platform.entity.ChunkEntity> chunks = chunkRepo.findByRepoId(repoId);
+        if (chunks.isEmpty()) return;
+
+        // 按包名分组，每个包的代表类用 LinkedHashMap 去重
+        Map<String, List<String>> byPkg = new java.util.LinkedHashMap<>();
+        for (com.adrninistrator.javacg2.platform.entity.ChunkEntity c : chunks) {
+            String pkg = c.getPackageName() != null ? c.getPackageName() : "";
+            byPkg.computeIfAbsent(pkg, k -> new ArrayList<>());
+            // 同一类只保留一条（fullMethod 去重到 className）
+            String className = c.getClassName();
+            if (className != null && !byPkg.get(pkg).contains(className)) {
+                byPkg.get(pkg).add(className);
+            }
+        }
+
+        // 2. 画布参考尺寸
+        double cx = 600.0, cy = 400.0;
+        int pkgCount = byPkg.size();
+
+        List<com.adrninistrator.javacg2.platform.entity.GraphLayoutEntity> batch = new ArrayList<>();
+
+        int pkgIdx = 0;
+        for (Map.Entry<String, List<String>> entry : byPkg.entrySet()) {
+            List<String> classes = entry.getValue();
+            int classCount = classes.size();
+
+            // 包中心在半径 pkgRadius 的大圆上
+            double pkgRadius = Math.max(150.0, Math.min(280.0, pkgCount * 25.0));
+            double pkgAngle = pkgCount > 1
+                ? 2 * Math.PI * pkgIdx / pkgCount
+                : 0;
+            double pkgCx = cx + pkgRadius * Math.cos(pkgAngle);
+            double pkgCy = cy + pkgRadius * Math.sin(pkgAngle);
+
+            // 包内节点在子圆上排列
+            double subRadius = Math.max(20.0, Math.min(80.0, classCount * 8.0));
+            for (int i = 0; i < classCount; i++) {
+                double angle = classCount > 1
+                    ? 2 * Math.PI * i / classCount
+                    : 0;
+                double x = pkgCx + (classCount == 1 ? 0 : subRadius * Math.cos(angle));
+                double y = pkgCy + (classCount == 1 ? 0 : subRadius * Math.sin(angle));
+                batch.add(new com.adrninistrator.javacg2.platform.entity.GraphLayoutEntity(
+                    repoId, classes.get(i), x, y, version));
+            }
+            pkgIdx++;
+        }
+
+        // 3. 批量写库（先清旧数据再写，防止重复）
+        graphLayoutRepo.deleteByRepoId(repoId);
+        int saved = 0;
+        int BATCH_SIZE = 500;
+        for (int i = 0; i < batch.size(); i += BATCH_SIZE) {
+            graphLayoutRepo.saveAll(batch.subList(i, Math.min(i + BATCH_SIZE, batch.size())));
+            saved += Math.min(BATCH_SIZE, batch.size() - i);
+        }
+        logger.info("[GraphLayout] 仓库 {} 布局计算完成，节点 {} 个", repoId, saved);
+    }
+
+    /** 删除某仓库的中间文件目录 data/analysis/repo_<id>（数据已固化到 DB）。失败不影响分析。 */
+    private void cleanupIntermediateDir(Long repoId) {
+        if (!cleanupIntermediateFiles) return;
+        Path dir = Path.of(getOutputDir(repoId));
+        if (!Files.exists(dir)) return;
+        try (var stream = Files.walk(dir)) {
+            stream.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.delete(p); } catch (IOException ignored) { /* 尽力删除 */ }
+            });
+            logger.info("已清理中间文件目录: {}", dir);
+        } catch (IOException e) {
+            logger.warn("清理中间文件目录失败(不影响分析结果) {}: {}", dir, e.getMessage());
+        }
+    }
+
     @Override
     @Transactional
     public void rebuildIndex(Long repoId) {
@@ -346,18 +493,17 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         String outputDir = getOutputDir(repoId);
         String actualOutputDir = findActualOutputDir(outputDir);
         if (actualOutputDir == null) {
-            throw new AnalysisException("OUTPUT_NOT_FOUND", "分析产物目录不存在", "");
+            // 中间文件在分析后已被清理（platform.cleanup-intermediate-files=true）。
+            // 补建索引依赖这些产物，此时无法仅补索引，需引导用户走完整重新分析。
+            throw new AnalysisException("OUTPUT_CLEANED",
+                    "中间文件已清理（分析数据已固化到数据库），无法仅补建索引；请对该仓库执行「重新分析」。", "");
         }
 
         logger.info("补建索引开始: repoId={}, outputDir={}", repoId, actualOutputDir);
         buildLogService.append(repoId, "🔄 补建搜索索引和仓库画像...");
 
-        // 先清空已有的 call_summary，避免重复追加
-        List<ChunkEntity> allChunks = chunkRepo.findByRepoId(repoId);
-        for (ChunkEntity chunk : allChunks) {
-            chunk.setCallSummary(null);
-        }
-        chunkRepo.saveAll(allChunks);
+        // 先清空已有的 call_summary，一条 SQL 替代全量 SELECT + loop + saveAll
+        chunkRepo.clearCallSummaryByRepoId(repoId);
 
         // 重新解析注解（修复列索引后重新导入）
         parseMethodAnnotation(repoId, actualOutputDir);
@@ -724,6 +870,114 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
     }
 
     // ========== TSV 解析方法 ==========
+
+    /**
+     * 解析业务类源文件的 import，生成类级引用关系存入 class_reference 表。
+     * 补充 call_graph 缺失的类型引用（方法参数、返回值、字段类型等）。
+     * 支持精确 import 和通配符 import（xxx.*，按已知类展开）。
+     */
+    private void parseClassReferences(Long repoId, String localPath) {
+        if (localPath == null) return;
+        // 本仓库所有已知业务类（用于通配符展开）
+        Set<String> knownClasses = new java.util.HashSet<>();
+        for (ChunkEntity c : chunkRepo.findByRepoId(repoId)) {
+            if (c.getClassName() != null) knownClasses.add(c.getClassName());
+        }
+        List<String> prefixes = loadPackagePrefixesForRef(repoId);
+        Set<String> orgRoots = com.adrninistrator.javacg2.platform.util.CallFilter.deriveOrgRoots(prefixes);
+
+        // 通配符 import（xxx.*）展开用：直接扫描源码得到全部真实类，
+        // 避免依赖 chunks（纯数据类无业务方法→无 chunk→通配符展开漏掉，导致 DTO/实体依赖丢失）
+        Set<String> allSourceClasses = collectAllSourceClasses(localPath);
+
+        List<com.adrninistrator.javacg2.platform.entity.ClassReferenceEntity> batch = new ArrayList<>();
+        Set<String> seenPair = new java.util.HashSet<>();
+        int count = 0;
+
+        for (String className : knownClasses) {
+            if (className.contains("$")) continue; // 跳过内部类
+            if (!prefixes.isEmpty() && prefixes.stream().noneMatch(className::startsWith)) continue;
+
+            Path srcFile = findSourceFileForRef(localPath, className.replace('.', '/') + ".java");
+            if (srcFile == null) continue;
+
+            try {
+                for (String target : parseImportsForRef(srcFile, allSourceClasses)) {
+                    if (target.equals(className)) continue;
+                    // 只保留业务组织根下的类（com.example.*），第三方全部排除
+                    if (!com.adrninistrator.javacg2.platform.util.CallFilter.isBusinessClass(target, orgRoots)) continue;
+                    if (!seenPair.add(className + ">" + target)) continue;
+                    batch.add(new com.adrninistrator.javacg2.platform.entity.ClassReferenceEntity(
+                        repoId, className, target));
+                    count++;
+                    if (batch.size() >= 500) { classReferenceRepo.saveAll(batch); batch.clear(); }
+                }
+            } catch (Exception e) {
+                logger.debug("[ClassRef] 解析失败 {}: {}", className, e.getMessage());
+            }
+        }
+        if (!batch.isEmpty()) classReferenceRepo.saveAll(batch);
+        logger.info("解析 class_reference: {} 条", count);
+    }
+
+    /** 扫描仓库源码目录，得到全部真实类的全限定名（用于通配符 import 展开，不依赖 chunks）。 */
+    private Set<String> collectAllSourceClasses(String localPath) {
+        Set<String> classes = new java.util.HashSet<>();
+        if (localPath == null) return classes;
+        final String marker = "/src/main/java/";
+        try (var stream = Files.walk(Path.of(localPath))) {
+            stream.filter(p -> p.toString().endsWith(".java"))
+                .forEach(p -> {
+                    String s = p.toString().replace('\\', '/');
+                    int idx = s.indexOf(marker);
+                    if (idx < 0) return;
+                    String rel = s.substring(idx + marker.length());
+                    String fqcn = rel.substring(0, rel.length() - ".java".length()).replace('/', '.');
+                    if (!fqcn.isEmpty()) classes.add(fqcn);
+                });
+        } catch (IOException e) {
+            logger.debug("[ClassRef] 扫描源码类失败: {}", e.getMessage());
+        }
+        return classes;
+    }
+
+    private List<String> loadPackagePrefixesForRef(Long repoId) {        String raw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
+                .map(c -> c.getConfigValue()).filter(s -> s != null && !s.isBlank()).orElse(null);
+        List<String> prefixes = new ArrayList<>();
+        if (raw != null) for (String p : raw.split("[,;\\s]+")) {
+            String t = p.trim(); if (!t.isEmpty()) prefixes.add(t);
+        }
+        return prefixes;
+    }
+
+    private Path findSourceFileForRef(String localPath, String relPath) {
+        Path direct = Path.of(localPath, "src", "main", "java", relPath);
+        if (Files.exists(direct)) return direct;
+        try (var dirs = Files.list(Path.of(localPath))) {
+            return dirs.filter(Files::isDirectory)
+                .map(d -> d.resolve("src/main/java/" + relPath))
+                .filter(Files::exists).findFirst().orElse(null);
+        } catch (IOException e) { return null; }
+    }
+
+    private List<String> parseImportsForRef(Path srcFile, Set<String> knownClasses) throws IOException {
+        List<String> result = new ArrayList<>();
+        for (String line : Files.readAllLines(srcFile)) {
+            line = line.trim();
+            if (line.startsWith("import ") && line.endsWith(";")) {
+                String imp = line.substring(7, line.length() - 1).replace("static ", "").trim();
+                if (imp.endsWith(".*")) {
+                    String pkg = imp.substring(0, imp.length() - 2);
+                    for (String known : knownClasses) {
+                        if (known.startsWith(pkg + ".") && known.indexOf('.', pkg.length() + 1) < 0)
+                            result.add(known);
+                    }
+                } else if (!imp.isEmpty()) result.add(imp);
+            }
+            if (line.startsWith("public ") || line.startsWith("class ") || line.startsWith("interface ")) break;
+        }
+        return result;
+    }
 
     private int parseMethodInfo(Long repoId, String outputDir) {
         // method_info: 完整方法 | access_flags | 返回类型 | 数组维度 | 类型分类 | 泛型 | MD5 | jar序号
@@ -2726,7 +2980,21 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         }
 
         // 2. 读取方法级别的 @GetMapping/@PostMapping 等注解
-        int count = 0;
+        // javacg2 对同一注解的每个属性单独输出一行，需先按 (fullMethod, jarNum, annotationClass) 聚合属性，再统一 save
+        // key: fullMethod + "|" + jarNum + "|" + annotationClass  value: 属性 map
+        Map<String, Map<String, String>> methodAnnoAttrs = new LinkedHashMap<>();
+        // 保留各 key 对应的原始字段（fullMethod/jarNum/annotationClass），用于后续构建实体
+        Map<String, String[]> methodAnnoMeta = new LinkedHashMap<>(); // key -> [fullMethod, jarNum, annotationClass]
+
+        Set<String> httpAnnotations = Set.of(
+                "org.springframework.web.bind.annotation.GetMapping",
+                "org.springframework.web.bind.annotation.PostMapping",
+                "org.springframework.web.bind.annotation.PutMapping",
+                "org.springframework.web.bind.annotation.DeleteMapping",
+                "org.springframework.web.bind.annotation.PatchMapping",
+                "org.springframework.web.bind.annotation.RequestMapping"
+        );
+
         for (String line : readTsvFile(outputDir, "method_annotation")) {
             String[] cols = line.split("\t");
             if (cols.length < 4) continue;
@@ -2734,35 +3002,55 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             String fullMethod = cols[0];
             String annotationClass = cols[3];
 
-            // 检查是否是 HTTP 方法映射注解
-            String httpMethod = null;
-            if (annotationClass.equals("org.springframework.web.bind.annotation.GetMapping")) {
-                httpMethod = "GET";
-            } else if (annotationClass.equals("org.springframework.web.bind.annotation.PostMapping")) {
-                httpMethod = "POST";
-            } else if (annotationClass.equals("org.springframework.web.bind.annotation.PutMapping")) {
-                httpMethod = "PUT";
-            } else if (annotationClass.equals("org.springframework.web.bind.annotation.DeleteMapping")) {
-                httpMethod = "DELETE";
-            } else if (annotationClass.equals("org.springframework.web.bind.annotation.PatchMapping")) {
-                httpMethod = "PATCH";
-            } else if (annotationClass.equals("org.springframework.web.bind.annotation.RequestMapping")) {
-                httpMethod = "ALL";
+            if (!httpAnnotations.contains(annotationClass)) continue;
+
+            Integer jarNum = null;
+            if (cols.length > 2) {
+                try { jarNum = Integer.parseInt(cols[2].trim()); } catch (NumberFormatException ignored) {}
             }
 
-            if (httpMethod == null) continue;
+            String key = fullMethod + "|" + jarNum + "|" + annotationClass;
+            methodAnnoAttrs.computeIfAbsent(key, k -> new LinkedHashMap<>());
+            methodAnnoMeta.putIfAbsent(key, new String[]{fullMethod, String.valueOf(jarNum), annotationClass});
+
+            // 收集属性（cols[4]=attrName, cols[5]=attrValue）
+            if (cols.length >= 6 && !cols[4].isBlank()) {
+                methodAnnoAttrs.get(key).put(cols[4], cols[5]);
+            }
+        }
+
+        // 第二遍：按聚合结果构建并 save
+        int count = 0;
+        for (Map.Entry<String, Map<String, String>> entry : methodAnnoAttrs.entrySet()) {
+            String[] meta = methodAnnoMeta.get(entry.getKey());
+            String fullMethod = meta[0];
+            Integer jarNum = "null".equals(meta[1]) ? null : Integer.parseInt(meta[1]);
+            String annotationClass = meta[2];
+            Map<String, String> attrs = entry.getValue();
+
+            // 确定 HTTP 方法
+            String httpMethod;
+            switch (annotationClass) {
+                case "org.springframework.web.bind.annotation.GetMapping"    -> httpMethod = "GET";
+                case "org.springframework.web.bind.annotation.PostMapping"   -> httpMethod = "POST";
+                case "org.springframework.web.bind.annotation.PutMapping"    -> httpMethod = "PUT";
+                case "org.springframework.web.bind.annotation.DeleteMapping" -> httpMethod = "DELETE";
+                case "org.springframework.web.bind.annotation.PatchMapping"  -> httpMethod = "PATCH";
+                default                                                       -> httpMethod = "ALL";
+            }
 
             // 提取类名
             int colonIdx = fullMethod.lastIndexOf(':');
             if (colonIdx < 0) continue;
             String className = fullMethod.substring(0, colonIdx);
 
-            // 查找 value 或 path 属性
+            if (!hasSourceFile(repoPath, className)) continue;
+
+            // 提取 URL 路径（value 或 path 属性）
             String methodPath = "";
-            for (int i = 4; i < cols.length - 1; i++) {
-                if ((cols[i].equals("value") || cols[i].equals("path")) && i + 1 < cols.length) {
-                    String pathValue = cols[i + 1];
-                    // 去掉 {} 包裹
+            for (String attrName : new String[]{"value", "path"}) {
+                if (attrs.containsKey(attrName)) {
+                    String pathValue = attrs.get(attrName);
                     if (pathValue.startsWith("{") && pathValue.endsWith("}")) {
                         pathValue = pathValue.substring(1, pathValue.length() - 1);
                     }
@@ -2776,9 +3064,6 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             String fullPath = basePath + methodPath;
             if (!fullPath.startsWith("/")) fullPath = "/" + fullPath;
 
-            // 只识别有源码的业务类（过滤依赖库）
-            if (!hasSourceFile(repoPath, className)) continue;
-
             ApiEndpointEntity endpoint = new ApiEndpointEntity();
             endpoint.setRepoId(repoId);
             endpoint.setEndpointType("CONTROLLER");
@@ -2787,6 +3072,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             endpoint.setClassName(className);
             endpoint.setFullMethod(fullMethod);
             endpoint.setHttpMethod(httpMethod);
+            endpoint.setJarNum(jarNum);
 
             apiEndpointRepo.save(endpoint);
             count++;
@@ -2820,6 +3106,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
 
         // 先收集每个方法的注解信息（方法 -> 注解类名 -> 属性值列表）
         Map<String, Map<String, Map<String, String>>> methodAnnotations = new LinkedHashMap<>();
+        Map<String, Integer> methodJarNum = new HashMap<>();  // 同时记录每个方法的 jar 序号
         for (String line : readTsvFile(outputDir, "method_annotation")) {
             String[] cols = line.split("\t");
             if (cols.length < 4) continue;
@@ -2828,6 +3115,11 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             String annotationClass = cols[3];
 
             if (!listenerAnnotations.containsKey(annotationClass)) continue;
+
+            // 记录 jarNum（同方法多注解时取第一次遇到的）
+            if (cols.length > 2 && !methodJarNum.containsKey(fullMethod)) {
+                try { methodJarNum.put(fullMethod, Integer.parseInt(cols[2].trim())); } catch (NumberFormatException ignored) {}
+            }
 
             methodAnnotations
                     .computeIfAbsent(fullMethod, k -> new LinkedHashMap<>())
@@ -2853,12 +3145,11 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
         }
 
         int count = 0;
-        Set<String> seen = new HashSet<>();
+        Set<String> seen = new HashSet<>();  // fullMethod|jarNum 精确去重
 
         for (Map.Entry<String, Map<String, Map<String, String>>> entry : methodAnnotations.entrySet()) {
             String fullMethod = entry.getKey();
-            if (seen.contains(fullMethod)) continue;
-            seen.add(fullMethod);
+            Integer jarNum = methodJarNum.get(fullMethod);
 
             for (Map.Entry<String, Map<String, String>> annoEntry : entry.getValue().entrySet()) {
                 String annotationClass = annoEntry.getKey();
@@ -2893,6 +3184,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                 endpoint.setClassName(className);
                 endpoint.setFullMethod(fullMethod);
                 endpoint.setHttpMethod(null);
+                endpoint.setJarNum(methodJarNum.get(fullMethod));
 
                 apiEndpointRepo.save(endpoint);
                 count++;
@@ -2912,6 +3204,7 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                         endpoint.setUrlPath("grpc:" + chunk.getMethodName());
                         endpoint.setClassName(chunk.getClassName());
                         endpoint.setFullMethod(chunk.getFullMethod());
+                        endpoint.setJarNum(chunk.getJarNum());
                         apiEndpointRepo.save(endpoint);
                         seen.add(chunk.getFullMethod()); // 防止继承链扫描（Path 3）再次处理同一方法产生重复
                         count++;
@@ -2934,11 +3227,10 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
                 Map.entry("KafkaConsumer", "KAFKA"),
                 Map.entry("RocketMQListener", "ROCKETMQ"),
                 Map.entry("RabbitConsumer", "RABBITMQ"),
-                // gRPC
+                // gRPC（仅服务端实现类；$BlockingStub/$FutureStub 是客户端存根，不是入口）
                 Map.entry("ImplBase", "GRPC"),
                 Map.entry("GrpcService", "GRPC"),
                 Map.entry("RpcService", "GRPC"),
-                Map.entry("BlockingStub", "GRPC"),
                 // 定时任务
                 Map.entry("TimerTask", "SCHEDULED"),
                 Map.entry("QuartzJobBean", "SCHEDULED"),
@@ -2966,6 +3258,12 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             String childClass = entry.getKey();
             // 只识别有源码的业务类
             if (!hasSourceFile(repoPath, childClass)) continue;
+
+            // $BlockingStub/$FutureStub/$Stub 是 gRPC 客户端存根，不是服务端入口
+            String childSimple = childClass.contains(".") ? childClass.substring(childClass.lastIndexOf('.') + 1) : childClass;
+            if (childSimple.contains("$") && childSimple.substring(childSimple.lastIndexOf('$') + 1).endsWith("Stub")) {
+                continue;
+            }
 
             for (String parent : entry.getValue()) {
                 String parentShort = parent.contains(".") ? parent.substring(parent.lastIndexOf('.') + 1) : parent;
@@ -3073,6 +3371,155 @@ public class BytecodeAnalyzerImpl implements BytecodeAnalyzer {
             count++;
         }
         logger.info("解析 spring_bean: {} 条", count);
+    }
+
+    // ========== 中间文件固化到 DB（jar_info / 枚举 / 常量） ==========
+
+    /** 截断字符串到列长度，避免超长写库异常。 */
+    private String cut(String s, int max) {
+        if (s == null) return null;
+        return s.length() > max ? s.substring(0, max) : s;
+    }
+
+    /** 从路径提取 jar 显示名：取文件名去掉 .jar/.war/.jmod 扩展名。 */
+    private String extractJarDisplayName(String path) {
+        if (path == null || path.isBlank()) return null;
+        int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        String fileName = slash >= 0 ? path.substring(slash + 1) : path;
+        for (String ext : new String[]{".jar", ".war", ".jmod"}) {
+            if (fileName.toLowerCase().endsWith(ext)) {
+                return fileName.substring(0, fileName.length() - ext.length());
+            }
+        }
+        return fileName;
+    }
+
+    /** 固化 jar_info.txt → jar_info 表（jarNum → 模块显示名）。 */
+    private void parseJarInfo(Long repoId, String outputDir) {
+        List<JarInfoEntity> batch = new ArrayList<>();
+        for (String line : readTsvFile(outputDir, "jar_info")) {
+            if (line.isBlank()) continue;
+            String[] cols = line.split("\t", -1);
+            if (cols.length < 3) continue;
+            String type = cols[0].trim();
+            int jarNum;
+            try { jarNum = Integer.parseInt(cols[1].trim()); } catch (NumberFormatException e) { continue; }
+            String displayName;
+            if ("J".equals(type)) {
+                displayName = extractJarDisplayName(cols[2].trim());
+            } else if ("JIJ".equals(type) && cols.length >= 4 && !cols[3].isBlank()) {
+                displayName = extractJarDisplayName(cols[3].trim());
+            } else {
+                continue; // D/R/PJ/FJ 跳过
+            }
+            if (displayName != null && !displayName.isBlank()) {
+                batch.add(new JarInfoEntity(repoId, jarNum, cut(displayName, 500)));
+            }
+        }
+        if (!batch.isEmpty()) jarInfoRepo.saveAll(batch);
+        logger.info("固化 jar_info: {} 条", batch.size());
+    }
+
+    /** 固化 enum_init_assign_info.txt → enum_constant 表（聚合 code/description）。 */
+    private void parseEnumConstants(Long repoId, String outputDir) {
+        // key: enumClass|constName  value: [ordinal, code, description]
+        Map<String, String[]> enumRaw = new LinkedHashMap<>();
+        for (String line : readTsvFile(outputDir, "enum_init_assign_info")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 7) continue;
+            String enumMethod = cols[0];
+            String constName = cols[1];
+            String ordinal = cols[2];
+            String valueType = cols[4];
+            String value = cols[6];
+            String enumClass = enumMethod.contains(":")
+                ? enumMethod.substring(0, enumMethod.lastIndexOf(':')) : enumMethod;
+            String[] entry = enumRaw.computeIfAbsent(enumClass + "|" + constName,
+                k -> new String[]{ordinal, "", ""});
+            if (value != null && !value.isBlank()) {
+                if ("java.lang.Integer".equals(valueType) || "int".equals(valueType)
+                        || "java.lang.Long".equals(valueType) || "long".equals(valueType)) {
+                    if (entry[1].isEmpty()) entry[1] = value;
+                } else if (valueType != null && valueType.contains("String") && value.length() >= 2) {
+                    if (entry[2].isEmpty()) entry[2] = value;
+                }
+            }
+        }
+        List<EnumConstantEntity> batch = new ArrayList<>();
+        for (Map.Entry<String, String[]> e : enumRaw.entrySet()) {
+            String[] parts = e.getKey().split("\\|", 2);
+            if (parts.length < 2) continue;
+            String[] raw = e.getValue();
+            batch.add(new EnumConstantEntity(repoId, cut(parts[0], 500), cut(parts[1], 255),
+                cut(raw[0], 50), cut(raw[1], 255), cut(raw[2], 1000)));
+            if (batch.size() >= 500) { enumConstantRepo.saveAll(batch); batch.clear(); }
+        }
+        if (!batch.isEmpty()) enumConstantRepo.saveAll(batch);
+        logger.info("固化 enum_constant: {} 条", enumRaw.size());
+    }
+
+    /** 固化 method_call_static_field.txt → static_field_usage 表（保留全量，过滤在查询时做）。 */
+    private void parseStaticFieldUsage(Long repoId, String outputDir) {
+        List<StaticFieldUsageEntity> batch = new ArrayList<>();
+        int count = 0;
+        for (String line : readTsvFile(outputDir, "method_call_static_field")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 7) continue;
+            String fieldClass = cols[3];
+            String fieldName = cols[4];
+            String callerMethod = cols[6];
+            Integer lineNum = null;
+            if (cols.length >= 9) {
+                try { lineNum = Integer.parseInt(cols[8].trim()); } catch (NumberFormatException ignored) {}
+            }
+            if (fieldClass == null || fieldName == null || callerMethod == null) continue;
+            batch.add(new StaticFieldUsageEntity(repoId, cut(callerMethod, 1000),
+                cut(fieldClass, 500), cut(fieldName, 255), lineNum));
+            count++;
+            if (batch.size() >= 500) { staticFieldUsageRepo.saveAll(batch); batch.clear(); }
+        }
+        if (!batch.isEmpty()) staticFieldUsageRepo.saveAll(batch);
+        logger.info("固化 static_field_usage: {} 条", count);
+    }
+
+    /** 固化 method_return_const_value.txt → method_return_const 表。 */
+    private void parseMethodReturnConst(Long repoId, String outputDir) {
+        List<MethodReturnConstEntity> batch = new ArrayList<>();
+        int count = 0;
+        for (String line : readTsvFile(outputDir, "method_return_const_value")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 6) continue;
+            String fullMethod = cols[0];
+            String value = cols[5];
+            if (fullMethod == null || value == null || value.isBlank() || "null".equals(value)) continue;
+            batch.add(new MethodReturnConstEntity(repoId, cut(fullMethod, 1000), cut(value, 2000)));
+            count++;
+            if (batch.size() >= 500) { methodReturnConstRepo.saveAll(batch); batch.clear(); }
+        }
+        if (!batch.isEmpty()) methodReturnConstRepo.saveAll(batch);
+        logger.info("固化 method_return_const: {} 条", count);
+    }
+
+    /** 固化 field_info.txt 中的 static final 常量字段 → field_constant 表。 */
+    private void parseFieldConstants(Long repoId, String outputDir) {
+        List<FieldConstantEntity> batch = new ArrayList<>();
+        int count = 0;
+        for (String line : readTsvFile(outputDir, "field_info")) {
+            String[] cols = line.split("\t");
+            if (cols.length < 10) continue;
+            String className = cols[0];
+            String fieldName = cols[1];
+            String fieldType = cols[2];
+            String modifiers = cols[4];
+            if (modifiers != null && modifiers.contains("static") && modifiers.contains("final")) {
+                batch.add(new FieldConstantEntity(repoId, cut(className, 500),
+                    cut(fieldName, 255), cut(fieldType, 500), ""));
+                count++;
+                if (batch.size() >= 500) { fieldConstantRepo.saveAll(batch); batch.clear(); }
+            }
+        }
+        if (!batch.isEmpty()) fieldConstantRepo.saveAll(batch);
+        logger.info("固化 field_constant: {} 条", count);
     }
 
     // ========== 工具方法 ==========

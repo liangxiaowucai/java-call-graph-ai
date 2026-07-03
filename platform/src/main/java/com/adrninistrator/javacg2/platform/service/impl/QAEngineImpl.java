@@ -9,6 +9,7 @@ import com.adrninistrator.javacg2.platform.repository.ChunkRepo;
 import com.adrninistrator.javacg2.platform.repository.SystemConfigRepo;
 import com.adrninistrator.javacg2.platform.service.CallGraphEngine;
 import com.adrninistrator.javacg2.platform.service.EmbeddingService;
+import com.adrninistrator.javacg2.platform.service.RepoDataStore;
 import com.adrninistrator.javacg2.platform.service.VectorStoreService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,6 +17,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -35,6 +37,8 @@ public class QAEngineImpl {
     private final EmbeddingService embeddingService;
     private final VectorStoreService vectorStoreService;
     private final CodeAnalysisToolExecutor toolExecutor;
+    private final RepoDataStore repoDataStore;
+    private final com.adrninistrator.javacg2.platform.service.PromptService promptService;
 
     // 统一的默认 system prompt，贴合 java-callgraph2 平台的数据能力
     public static final String DEFAULT_SYSTEM_PROMPT = ""
@@ -97,13 +101,9 @@ public class QAEngineImpl {
             + "- 源码中有中文注释或日志消息，直接引用\n"
             + "- 源码中确实没有的内容，直接说明，不补充建议\n";
 
-    // 回答缓存: repoId + method + question hash → answer
-    private final Map<String, CachedAnswer> answerCache = new LinkedHashMap<>() {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, CachedAnswer> eldest) {
-            return size() > 100; // 最多缓存 100 条
-        }
-    };
+    // 回答缓存: repoId + method + question hash → answer（带 TTL 30min，防止代码变更后旧缓存长期命中）
+    private static final long CACHE_TTL_MS = 30 * 60 * 1000L;
+    private final Map<String, CachedAnswer> answerCache = new ConcurrentHashMap<>();
 
     public QAEngineImpl(ClaudeApiClient claudeClient, CallGraphEngine callGraphEngine,
                          CallChainCodeGenerator codeGenerator, ApiEndpointRepo apiEndpointRepo,
@@ -112,7 +112,9 @@ public class QAEngineImpl {
                          com.adrninistrator.javacg2.platform.repository.RepositoryRepo repositoryRepo,
                          EmbeddingService embeddingService,
                          VectorStoreService vectorStoreService,
-                         CodeAnalysisToolExecutor toolExecutor) {
+                         CodeAnalysisToolExecutor toolExecutor,
+                         RepoDataStore repoDataStore,
+                         com.adrninistrator.javacg2.platform.service.PromptService promptService) {
         this.claudeClient = claudeClient;
         this.callGraphEngine = callGraphEngine;
         this.codeGenerator = codeGenerator;
@@ -125,21 +127,25 @@ public class QAEngineImpl {
         this.embeddingService = embeddingService;
         this.vectorStoreService = vectorStoreService;
         this.toolExecutor = toolExecutor;
+        this.repoDataStore = repoDataStore;
+        this.promptService = promptService;
     }
 
     /**
      * 搜索接口（模糊匹配注释、URL、方法名、类名）
      */
     public List<EndpointSearchResult> searchEndpoints(Long repoId, String keyword) {
-        List<ApiEndpointEntity> all = apiEndpointRepo.findByRepoId(repoId);
+        // 走 RepoDataStore 缓存，避免每次全表查询
+        RepoDataStore.RepoData cache = repoDataStore.get(repoId);
+        List<ApiEndpointEntity> all = new ArrayList<>(cache.endpointMap().values());
         if (keyword == null || keyword.isBlank()) return all.stream().map(this::toSearchResult).collect(Collectors.toList());
 
         String lower = keyword.toLowerCase();
         String[] words = lower.split("\\s+");
 
-        // 也从 chunks 表获取注释/摘要信息，扩大搜索范围
+        // 从缓存 chunkMap 获取注释/摘要信息，扩大搜索范围
         Map<String, String> chunkSummaries = new HashMap<>();
-        for (ChunkEntity chunk : chunkRepo.findByRepoId(repoId)) {
+        for (var chunk : cache.chunkMap().values()) {
             StringBuilder text = new StringBuilder();
             if (chunk.getCallSummary() != null) text.append(chunk.getCallSummary()).append(" ");
             if (chunk.getAnnotations() != null) text.append(chunk.getAnnotations()).append(" ");
@@ -205,9 +211,11 @@ public class QAEngineImpl {
         for (Long repoId : idsToLoad) {
             var repo = repositoryRepo.findById(repoId).orElse(null);
             if (repo == null || !"READY".equals(repo.getStatus())) continue;
-            List<ApiEndpointEntity> endpoints = apiEndpointRepo.findByRepoId(repoId);
+            // 走 RepoDataStore 缓存，避免每次全表查询
+            RepoDataStore.RepoData cache = repoDataStore.get(repoId);
+            List<ApiEndpointEntity> endpoints = new ArrayList<>(cache.endpointMap().values());
             Map<String, String> summaries = new HashMap<>();
-            for (ChunkEntity chunk : chunkRepo.findByRepoId(repoId)) {
+            for (var chunk : cache.chunkMap().values()) {
                 if (chunk.getCallSummary() != null && !chunk.getCallSummary().isBlank()) {
                     summaries.put(chunk.getFullMethod(), chunk.getCallSummary().toLowerCase());
                 }
@@ -981,32 +989,10 @@ public class QAEngineImpl {
                         projectInfoExtractor.extract(repo.getLocalPath()));
             }
         }
-        String customPrompt = configRepo.findByConfigKey("claude.system.prompt")
-                .map(c -> c.getConfigValue()).filter(s -> s != null && !s.isBlank()).orElse(null);
-
-        // 构建 system prompt（加 function calling 铁律）
-        String systemPrompt = (customPrompt != null ? customPrompt : DEFAULT_SYSTEM_PROMPT)
+        // 构建 system prompt：基础人设（可配置）+ 技术栈 + 工具调用规则（可配置）
+        String systemPrompt = promptService.get("qa.system")
                 + "\n\n" + techStack
-                + "\n\n## 工具调用铁律\n"
-                + "1. 每个结论必须引用工具返回的具体源码，格式：`类名.方法名`\n"
-                + "2. 工具返回 SOURCE_NOT_FOUND 时，只能说\"源码中未找到 XXX 的实现\"\n"
-                + "3. 工具返回 NO_CALLEES/NO_CALLERS 时，如实说明\n"
-                + "4. 禁止对未读取源码的方法做任何推断\n"
-                + "5. 如果分析到安全阀上限仍未找到根因，列出\"已分析方法\"和\"缺少的信息\"\n"
-                + "\n## 工具调用策略（必须遵循）\n"
-                + "1. **先全面收集，再输出结论**：每个入口接口必须依次调用 getCallees → getMethodSource（实现类）→ getExceptions → getConstants → getBoundaries\n"
-                + "2. **多态分派**：遇到接口/抽象方法时，先调 getImplementations 找到实现类，再读实现类源码\n"
-                + "3. **入参分析**：入口方法必须调 getParamClassDef 获取字段定义和校验注解\n"
-                + "4. **聚焦业务逻辑**：优先分析 if/switch 分支、数据转换、外部调用、异常抛出等关键代码\n"
-                + "5. **忽略样板代码**：跳过 getter/setter、日志打印、toString 等无业务含义的代码\n"
-                + "6. **结构化输出**：用表格展示字段、用代码块展示关键逻辑、用列表展示调用链\n"
-                + "7. **下游必读实现**：入口方法的下游外部调用（HTTP/RPC/DB/缓存）涉及的 Service/Remote 方法，必须先 getImplementations + getMethodSource 读到实现类源码后，才能对其行为/风险下结论；未读到就如实说明\n"
-                + "8. **先看地图再下钻**：优先调用 getChainOutline 获取调用链地图，据此定位带 [HTTP/DB/CACHE/MQ/常量/异常] 标记的节点；对这些节点逐个用 getBoundaries/getConstants/getMethodSource 读取明细（如具体 URL、SQL、缓存 key、MQ topic、配置值），再下结论。不要只凭方法名一笔带过外部调用。地图 truncated=true 时，回答中如实说明哪些未覆盖\n"
-                + "9. **外部调用必须完整列出**：getBoundaries/getConstants/getChainOutline 返回的「外部调用」条目（已装配 系统名+完整URL+用途）必须在答案里逐条列出，按 `**系统名**：HTTP调用 \\`完整URL\\` 用途` 的格式，一条都不能漏，URL 必须是 base+path 拼好的完整地址\n"
-                + "\n## 收尾铁律\n"
-                + "答案末尾必须追加一节 `**分析覆盖**`，分两行列出：\n"
-                + "- `已分析`：本次实际读取了源码的关键方法（`类名.方法名`）\n"
-                + "- `未覆盖/不确定`：想分析但源码未读取到或无法确定的部分；没有则写「无」\n";
+                + "\n\n" + promptService.get("qa.tool_rules");
 
         // 构建初始入参：接口摘要列表
         StringBuilder initialContext = new StringBuilder();
@@ -1185,6 +1171,8 @@ public class QAEngineImpl {
                 ));
             }
 
+            // 追加新轮次 tool_result 前，先把历史轮次的工具结果瘦身，避免 messages 体积随轮数线性累积
+            condenseOldToolResults(messages);
             // 把所有 tool_result 追加到 messages
             messages.add(Map.of("role", "user", "content", toolResults));
         }
@@ -1211,6 +1199,50 @@ public class QAEngineImpl {
 
     /** 工具调用步骤，用于 SSE 推送（detail=读取结果摘要/阶段推理，可为 null） */
     public record ToolCallStep(String toolName, String fullMethod, String label, int round, String detail) {}
+
+
+    /**
+     * 把 messages 历史中除最近一轮之外的所有 tool_result 内容替换为轻量占位符。
+     * Claude 已在当轮推理中消化过这些内容，不需要再重复携带原始源码文本，
+     * 从而避免 messages 体积随工具调用轮数线性累积，大幅减少每次请求的 input token。
+     */
+    @SuppressWarnings("unchecked")
+    private void condenseOldToolResults(List<Map<String, Object>> messages) {
+        // 找到最后一条 tool_result 消息的索引，保留它，其余的压缩
+        int lastToolResultIdx = -1;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            Object content = messages.get(i).get("content");
+            if (content instanceof List) {
+                boolean isToolResult = ((List<?>) content).stream()
+                        .anyMatch(b -> b instanceof Map && "tool_result".equals(((Map<?, ?>) b).get("type")));
+                if (isToolResult) { lastToolResultIdx = i; break; }
+            }
+        }
+        if (lastToolResultIdx <= 0) return;
+
+        // 把 lastToolResultIdx 之前所有 tool_result 的 content 字段替换为已读标记
+        for (int i = 0; i < lastToolResultIdx; i++) {
+            Object content = messages.get(i).get("content");
+            if (!(content instanceof List)) continue;
+            List<Map<String, Object>> blocks = (List<Map<String, Object>>) content;
+            boolean isToolResult = blocks.stream().anyMatch(b -> "tool_result".equals(b.get("type")));
+            if (!isToolResult) continue;
+
+            List<Map<String, Object>> condensed = new ArrayList<>();
+            for (Map<String, Object> block : blocks) {
+                if ("tool_result".equals(block.get("type"))) {
+                    condensed.add(Map.of(
+                            "type", "tool_result",
+                            "tool_use_id", block.getOrDefault("tool_use_id", ""),
+                            "content", "CONDENSED: 已在前序轮次分析，结论已纳入推理上下文"
+                    ));
+                } else {
+                    condensed.add(block);
+                }
+            }
+            messages.set(i, Map.of("role", "user", "content", condensed));
+        }
+    }
 
     /** 把工具结果压成一行摘要，便于在思考面板展示“读到了什么”（≤200 字） */
     private String previewResult(String result) {
@@ -1342,22 +1374,17 @@ public class QAEngineImpl {
         }
     }
 
-    // 会话摘要缓存: repoId + methods hash → 摘要文本
-    private final Map<String, String> conversationSummaryCache = new LinkedHashMap<>() {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
-            return size() > 50;
-        }
-    };
+    // 会话摘要缓存: repoId + methods hash → 摘要文本（带 TTL 30min）
+    private final Map<String, CachedSummary> conversationSummaryCache = new ConcurrentHashMap<>();
 
     /**
      * 自由问答（调用 Claude）
      */
     public QAResponse ask(Long repoId, List<String> selectedMethods, String question, List<Map<String, String>> history) {
-        // 检查缓存
+        // 检查缓存（含 TTL 校验）
         String cacheKey = repoId + "|" + String.join(",", selectedMethods) + "|" + question.hashCode();
         CachedAnswer cached = answerCache.get(cacheKey);
-        if (cached != null && history.isEmpty()) {
+        if (cached != null && history.isEmpty() && !cached.isExpired()) {
             return new QAResponse(cached.answer, cached.references, true);
         }
 
@@ -1368,9 +1395,9 @@ public class QAEngineImpl {
         for (String method : selectedMethods) {
             context.append("=== 接口: ").append(shortMethod(method)).append(" ===\n");
 
-            // 加载调用链上每个方法的完整源码
+            // 加载调用链上每个方法的完整源码（深度限制 5 层，避免大项目无限展开）
             try {
-                var tree = callGraphEngine.expandCallTree(repoId, method, Integer.MAX_VALUE, true);
+                var tree = callGraphEngine.expandCallTree(repoId, method, 5, true);
                 if (tree.root() != null) {
                     List<String> chainMethods = new ArrayList<>();
                     collectMethods(tree.root(), chainMethods, new HashSet<>());
@@ -1434,10 +1461,7 @@ public class QAEngineImpl {
         }
 
         // ========== 构建 system prompt: 角色 + 技术栈 + 源码 + 会话摘要 ==========
-        String basePrompt = configRepo.findByConfigKey("claude.system.prompt")
-                .map(c -> c.getConfigValue())
-                .filter(s -> s != null && !s.isBlank())
-                .orElse(DEFAULT_SYSTEM_PROMPT);
+        String basePrompt = promptService.get("qa.system");
 
         StringBuilder systemPrompt = new StringBuilder();
         systemPrompt.append(basePrompt).append("\n\n");
@@ -1447,9 +1471,9 @@ public class QAEngineImpl {
         // 追问时加入会话摘要
         String summaryKey = repoId + "|" + String.join(",", selectedMethods);
         if (!history.isEmpty()) {
-            String existingSummary = conversationSummaryCache.get(summaryKey);
-            if (existingSummary != null) {
-                systemPrompt.append("\n## 之前的对话摘要\n").append(existingSummary).append("\n");
+            CachedSummary existingSummary = conversationSummaryCache.get(summaryKey);
+            if (existingSummary != null && !existingSummary.isExpired()) {
+                systemPrompt.append("\n## 之前的对话摘要\n").append(existingSummary.text).append("\n");
             }
         }
 
@@ -1471,7 +1495,9 @@ public class QAEngineImpl {
         if (!history.isEmpty()) {
             CompletableFuture.runAsync(() -> {
                 try {
-                    String oldSummary = conversationSummaryCache.getOrDefault(finalSummaryKey, "");
+                    String oldSummary = conversationSummaryCache.containsKey(finalSummaryKey)
+                            && !conversationSummaryCache.get(finalSummaryKey).isExpired()
+                            ? conversationSummaryCache.get(finalSummaryKey).text : "";
                     String summaryPrompt = "以下是一次关于 Java 项目代码的问答对话。请生成一段精简的对话摘要。\n\n"
                             + "摘要要求：\n"
                             + "1. 保留用户的问题意图（用户想知道什么）\n"
@@ -1486,7 +1512,7 @@ public class QAEngineImpl {
                     String newSummary = claudeClient.chat(
                             "你是一个代码问答对话的摘要助手。只输出摘要文本，不要标题、不要列表、不要源码。",
                             List.of(Map.of("role", "user", "content", summaryPrompt)));
-                    conversationSummaryCache.put(finalSummaryKey, newSummary);
+                    conversationSummaryCache.put(finalSummaryKey, new CachedSummary(newSummary));
                     logger.debug("会话摘要更新: {}", newSummary.substring(0, Math.min(100, newSummary.length())));
                 } catch (Exception e) {
                     logger.warn("生成会话摘要失败", e);
@@ -1494,7 +1520,7 @@ public class QAEngineImpl {
             });
         }
 
-        // 缓存（仅无历史对话时缓存）
+        // 缓存（仅无历史对话时缓存，带时间戳供 TTL 检查）
         if (history.isEmpty()) {
             answerCache.put(cacheKey, new CachedAnswer(answer, references));
         }
@@ -1508,6 +1534,9 @@ public class QAEngineImpl {
         return new QAResponse(answer, references, false);
     }
 
+    // backfillSummary 方法级并发锁：防止同一方法被多个请求同时回填导致覆盖
+    private final ConcurrentHashMap<String, Boolean> backfillLocks = new ConcurrentHashMap<>();
+
     /**
      * 回填摘要：只写入从源码静态提取的信息（方法签名、注解、参数类型）
      * 严禁将用户问题文本或 AI 输出内容写回数据库，避免搜索索引污染
@@ -1515,44 +1544,54 @@ public class QAEngineImpl {
     private void backfillSummary(Long repoId, List<String> methods, String question, String answer) {
         try {
             for (String method : methods) {
-                chunkRepo.findByRepoIdAndFullMethod(repoId, method).ifPresent(chunk -> {
-                    String existing = chunk.getCallSummary();
-                    // 如果已有静态摘要，不再追加任何内容
-                    if (existing != null && existing.length() > 200) return;
+                // 方法级并发保护：同一方法同时只允许一个线程回填
+                String lockKey = repoId + "|" + method;
+                if (backfillLocks.putIfAbsent(lockKey, Boolean.TRUE) != null) {
+                    logger.debug("回填摘要跳过（已有并发写）: {}", shortMethod(method));
+                    continue;
+                }
+                try {
+                    chunkRepo.findByRepoIdAndFullMethod(repoId, method).ifPresent(chunk -> {
+                        String existing = chunk.getCallSummary();
+                        // 如果已有静态摘要，不再追加任何内容
+                        if (existing != null && existing.length() > 200) return;
 
-                    // 只写入源码静态信息：方法签名 + 参数类型
-                    StringBuilder staticInfo = new StringBuilder();
-                    try {
-                        var detail = callGraphEngine.getMethodSourceDetail(repoId, method, method);
-                        if (detail != null && detail.methodSignature() != null) {
-                            staticInfo.append(detail.methodSignature());
-                        }
-                        if (detail != null && detail.paramClasses() != null) {
-                            for (var pc : detail.paramClasses()) {
-                                staticInfo.append(" ").append(pc.shortName());
+                        // 只写入源码静态信息：方法签名 + 参数类型
+                        StringBuilder staticInfo = new StringBuilder();
+                        try {
+                            var detail = callGraphEngine.getMethodSourceDetail(repoId, method, method);
+                            if (detail != null && detail.methodSignature() != null) {
+                                staticInfo.append(detail.methodSignature());
                             }
+                            if (detail != null && detail.paramClasses() != null) {
+                                for (var pc : detail.paramClasses()) {
+                                    staticInfo.append(" ").append(pc.shortName());
+                                }
+                            }
+                        } catch (Exception e) { /* skip */ }
+
+                        // 注解
+                        if (chunk.getAnnotations() != null && !chunk.getAnnotations().isBlank()) {
+                            staticInfo.append(" ").append(chunk.getAnnotations());
                         }
-                    } catch (Exception e) { /* skip */ }
 
-                    // 注解
-                    if (chunk.getAnnotations() != null && !chunk.getAnnotations().isBlank()) {
-                        staticInfo.append(" ").append(chunk.getAnnotations());
-                    }
+                        // 只追加静态信息，不追加用户问题文本
+                        String newStaticPart = staticInfo.toString().trim();
+                        if (newStaticPart.isEmpty()) return;
 
-                    // 只追加静态信息，不追加用户问题文本
-                    String newStaticPart = staticInfo.toString().trim();
-                    if (newStaticPart.isEmpty()) return;
+                        if (existing != null && !existing.isBlank()) {
+                            if (existing.contains(newStaticPart)) return; // 避免重复
+                            chunk.setCallSummary(existing + " | " + newStaticPart);
+                        } else {
+                            chunk.setCallSummary(newStaticPart);
+                        }
 
-                    if (existing != null && !existing.isBlank()) {
-                        if (existing.contains(newStaticPart)) return; // 避免重复
-                        chunk.setCallSummary(existing + " | " + newStaticPart);
-                    } else {
-                        chunk.setCallSummary(newStaticPart);
-                    }
-
-                    chunkRepo.save(chunk);
-                    logger.debug("回填静态摘要: {} -> {}", shortMethod(method), newStaticPart.substring(0, Math.min(80, newStaticPart.length())));
-                });
+                        chunkRepo.save(chunk);
+                        logger.debug("回填静态摘要: {} -> {}", shortMethod(method), newStaticPart.substring(0, Math.min(80, newStaticPart.length())));
+                    });
+                } finally {
+                    backfillLocks.remove(lockKey);
+                }
             }
         } catch (Exception e) {
             logger.warn("回填摘要失败", e);
@@ -1562,7 +1601,7 @@ public class QAEngineImpl {
     // ========== 预设报告生成 ==========
 
     private String generateRiskReport(Long repoId, String fullMethod) {
-        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, Integer.MAX_VALUE, true);
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, 5, true);
         List<String> methods = new ArrayList<>();
         collectMethods(tree.root(), methods, new HashSet<>());
 
@@ -1587,7 +1626,7 @@ public class QAEngineImpl {
     }
 
     private String generateDbReport(Long repoId, String fullMethod) {
-        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, Integer.MAX_VALUE, true);
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, 5, true);
         List<String> methods = new ArrayList<>();
         collectMethods(tree.root(), methods, new HashSet<>());
 
@@ -1610,7 +1649,7 @@ public class QAEngineImpl {
     }
 
     private String generateExternalReport(Long repoId, String fullMethod) {
-        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, Integer.MAX_VALUE, true);
+        CallGraphEngine.CallTreeDTO tree = callGraphEngine.expandCallTree(repoId, fullMethod, 5, true);
         List<String> methods = new ArrayList<>();
         collectMethods(tree.root(), methods, new HashSet<>());
 
@@ -1710,5 +1749,16 @@ public class QAEngineImpl {
     public record MatchedEndpoint(String fullMethod, String className, String methodName,
                                    String endpointType, String httpMethod, String urlPath,
                                    String repoName, int score) {}
-    private record CachedAnswer(String answer, List<String> references) {}
+    private record CachedAnswer(String answer, List<String> references) {
+        private static final long TTL_MS = 30 * 60 * 1000L;
+        private final long createdAt = System.currentTimeMillis();
+        boolean isExpired() { return System.currentTimeMillis() - createdAt > TTL_MS; }
+    }
+
+    private static class CachedSummary {
+        final String text;
+        final long createdAt = System.currentTimeMillis();
+        CachedSummary(String text) { this.text = text; }
+        boolean isExpired() { return System.currentTimeMillis() - createdAt > 30 * 60 * 1000L; }
+    }
 }
