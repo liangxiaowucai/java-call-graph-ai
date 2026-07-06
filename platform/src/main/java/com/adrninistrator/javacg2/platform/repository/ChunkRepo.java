@@ -43,6 +43,12 @@ public interface ChunkRepo extends JpaRepository<ChunkEntity, Long> {
     @Query("UPDATE ChunkEntity c SET c.embeddingStatus = NULL WHERE c.repoId = :repoId")
     void resetEmbeddingStatus(@Param("repoId") Long repoId);
 
+    /** 批量清空 call_summary（rebuildIndex 专用，替代全量 SELECT + loop + saveAll） */
+    @Transactional
+    @Modifying
+    @Query("UPDATE ChunkEntity c SET c.callSummary = NULL WHERE c.repoId = :repoId")
+    void clearCallSummaryByRepoId(@Param("repoId") Long repoId);
+
     @Query("SELECT c FROM ChunkEntity c WHERE c.repoId = :repoId AND (c.embeddingStatus IS NULL OR c.embeddingStatus != 'DONE')")
     List<ChunkEntity> findPendingByRepoId(@Param("repoId") Long repoId);
 }

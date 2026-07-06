@@ -1,10 +1,13 @@
 package com.adrninistrator.javacg2.platform.entity;
 
 import jakarta.persistence.*;
+import org.hibernate.annotations.Comment;
 import java.time.LocalDateTime;
 
+/** 仓库表：接入的代码仓库及其分析状态、画像与概览。 */
 @Entity
 @Table(name = "repositories")
+@Comment("仓库表：接入的代码仓库及其分析状态、画像与概览")
 public class RepositoryEntity {
 
     @Id
@@ -12,42 +15,55 @@ public class RepositoryEntity {
     private Long id;
 
     @Column(nullable = false)
+    @Comment("仓库名称")
     private String name;
 
     @Column(name = "git_url", nullable = false, length = 500)
+    @Comment("Git 仓库地址")
     private String gitUrl;
 
     @Column(name = "token_encrypted", length = 500)
+    @Comment("访问令牌（加密存储）")
     private String tokenEncrypted;
 
     @Column(name = "repo_type", nullable = false, length = 20)
+    @Comment("仓库类型（GITHUB/GITLAB 等）")
     private String repoType;
 
     @Column(length = 100)
+    @Comment("分析使用的分支")
     private String branch = "main";
 
     @Column(name = "local_path", nullable = false, length = 500)
+    @Comment("本地克隆路径")
     private String localPath;
 
     @Column(name = "last_commit_hash", length = 64)
+    @Comment("最近一次分析的提交 hash")
     private String lastCommitHash;
 
     @Column(name = "last_sync_time")
+    @Comment("最近一次同步/分析时间")
     private LocalDateTime lastSyncTime;
 
     @Column(length = 20)
+    @Comment("状态：CREATED/CLONING/QUEUED/ANALYZING/READY/ERROR")
     private String status = "CREATED";
 
     @Column(name = "created_at")
+    @Comment("创建时间")
     private LocalDateTime createdAt = LocalDateTime.now();
 
     @Column(columnDefinition = "TEXT")
+    @Comment("仓库画像（多仓库场景快速定位用）")
     private String profile;
 
     @Column(columnDefinition = "TEXT")
+    @Comment("项目概览文档")
     private String overview;
 
     @Column(name = "url_path_identifier", length = 200)
+    @Comment("URL 路径标识（用于接口 URL 归属识别）")
     private String urlPathIdentifier;
 
     public Long getId() { return id; }
