@@ -43,6 +43,8 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
     private final ClaudeApiClient claudeClient;
     private final ChunkRepo chunkRepo;
     private final ExternalCallFormatter externalCallFormatter;
+    private final QAEngineImpl qaEngine;
+    private final com.adrninistrator.javacg2.platform.service.PromptService promptService;
 
     // 配置缓存
     private final Map<Long, Map<String, String>> configCache = new HashMap<>();
@@ -54,7 +56,9 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
             RepositoryRepo repositoryRepo,
             ClaudeApiClient claudeClient,
             ChunkRepo chunkRepo,
-            ExternalCallFormatter externalCallFormatter) {
+            ExternalCallFormatter externalCallFormatter,
+            QAEngineImpl qaEngine,
+            com.adrninistrator.javacg2.platform.service.PromptService promptService) {
         this.apiEndpointRepo = apiEndpointRepo;
         this.callGraphEngine = callGraphEngine;
         this.mapper = mapper;
@@ -62,6 +66,8 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
         this.claudeClient = claudeClient;
         this.chunkRepo = chunkRepo;
         this.externalCallFormatter = externalCallFormatter;
+        this.qaEngine = qaEngine;
+        this.promptService = promptService;
     }
 
     @Override
@@ -380,15 +386,7 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
             }
         }
         
-        // 性能评分（简单算法）
-        int score = 100;
-        score -= Math.min(slowRequests * 10, 30);  // 慢请求扣分
-        score -= Math.min(failedRequests * 15, 30); // 失败请求扣分
-        score -= Math.min(totalDbCalls / 5, 20);    // 过多DB调用扣分
-        score = Math.max(score, 0);
-        
-        String scoreEmoji = score >= 80 ? "🟢" : score >= 60 ? "🟡" : "🔴";
-        
+        // 性能评分已移除（本次实测耗时不代表架构风险，架构隐患见 AI 分析）
         sb.append(String.format("| 指标 | 数值 | 状态 |\n"));
         sb.append("|------|------|------|\n");
         sb.append(String.format("| 总耗时 | %dms | %s |\n", 
@@ -409,7 +407,6 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
             totalHttpCalls,
             totalHttpCalls > 10 ? "⚠️" : "✅"));
         sb.append(String.format("| 缓存调用 | %d 次 | - |\n", totalCacheCalls));
-        sb.append(String.format("| **性能评分** | **%d/100** | %s |\n", score, scoreEmoji));
         
         return sb.toString();
     }
@@ -771,168 +768,70 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
     // ==================== AI 分析 ====================
     
     /**
-     * AI 智能分析
+     * AI 智能分析（非流式）——复用 tool-loop 引擎，按需拉取源码，不再一次性拼接巨型上下文
      */
     private String generateAIAnalysis(RequestChainDTO chain, List<DebugAnalysisResult.ApiCall> calls) {
         try {
-            String response = claudeClient.chat(aiSystemPrompt(), List.of(
-                Map.of("role", "user", "content", buildAiContext(chain, calls))
-            ));
-            return "## 🤖 AI 智能分析\n\n" + response;
+            List<QAEngineImpl.ScoredEndpoint> scored = resolveScoredFromCalls(calls);
+            if (scored.isEmpty()) {
+                return "## 🤖 AI 智能分析\n\n*未匹配到后端方法，跳过分析*";
+            }
+            List<QAEngineImpl.MatchedEndpoint> matched = new ArrayList<>();
+            for (QAEngineImpl.ScoredEndpoint se : scored) {
+                matched.add(qaEngine.toMatchedEndpointPublic(se));
+            }
+            QAEngineImpl.SmartQAResponse resp = qaEngine.generateAnswerWithLoop(
+                    scored, buildAiQuestion(chain, calls), List.of(), matched, null);
+            return "## 🤖 AI 智能分析\n\n" + resp.answer();
         } catch (Exception e) {
             logger.error("[AI分析] 失败", e);
             return "## 🤖 AI 智能分析\n\n*暂不可用*";
         }
     }
 
-    /** AI 分析的 system prompt */
-    private String aiSystemPrompt() {
-        return "你是资深后端性能与架构专家，正在排查一次真实请求链路。基于我提供的【调用链、源码、实参数据、外部调用、耗时】给出**具体、可落地**的分析。\n\n" +
-            "要求：\n" +
-            "1. 必须引用具体的类名、方法名、行号、URL 来支撑结论，禁止泛泛而谈（如「优化性能」「加缓存」这类没有落点的话不要写）。\n" +
-            "2. 先定位**最可能的耗时点**：结合调用链结构（哪些是外部 HTTP/DB 调用）和总耗时，推断瓶颈在哪一段，说明理由。\n" +
-            "3. 给出**具体修复方案**：要写清楚改哪个方法、加什么代码/配置（如连接池参数、超时值、批量/并发改造、缓存 key 设计），最好给出代码片段或配置示例。\n" +
-            "4. 指出基于源码可见的**真实风险**：如未设超时、异常被吞、未校验入参、循环调用外部接口等，并定位到具体代码行。\n" +
-            "5. 用中文，结构化输出：## 瓶颈定位 / ## 根因分析 / ## 具体优化方案（编号，含代码或配置） / ## 风险点。\n" +
-            "不要复述我给的数据，直接给分析和方案。";
+    /** 从匹配到后端方法的 ApiCall 收集入口，转成 tool-loop 引擎所需的 ScoredEndpoint 列表 */
+    private List<QAEngineImpl.ScoredEndpoint> resolveScoredFromCalls(List<DebugAnalysisResult.ApiCall> calls) {
+        List<QAEngineImpl.ScoredEndpoint> scored = new ArrayList<>();
+        for (DebugAnalysisResult.ApiCall call : calls) {
+            if (call.getMethod() != null && call.getRecommendedRepo() != null) {
+                scored.addAll(qaEngine.resolveMethodsToScored(
+                        call.getRecommendedRepo().getRepoId(), List.of(call.getMethod())));
+            }
+        }
+        return scored;
     }
 
-    /** 构建 AI 分析的上下文（含调用链、源码、常量、异常、外部调用等完整业务信息） */
-    private String buildAiContext(RequestChainDTO chain, List<DebugAnalysisResult.ApiCall> calls) {
-        StringBuilder ctx = new StringBuilder();
+    /**
+     * 构建 AI 分析的「问题」——轻量的请求链摘要 + 分析诉求。
+     * 只含接口/耗时/状态/请求响应体摘要/入口方法，源码与调用链细节由 AI 通过工具按需拉取，
+     * 从而避免一次性发送巨型 prompt 导致的超时。
+     */
+    private String buildAiQuestion(RequestChainDTO chain, List<DebugAnalysisResult.ApiCall> calls) {
+        StringBuilder q = new StringBuilder();
+        q.append(promptService.get("debug.analysis")).append("\n")
+         .append("## 请求链摘要\n");
         for (int i = 0; i < Math.min(calls.size(), 2); i++) {
             DebugAnalysisResult.ApiCall call = calls.get(i);
             RequestChainDTO.RequestInfo req = i < chain.getRequestChain().size() ? chain.getRequestChain().get(i) : null;
-
-            ctx.append("# 请求 ").append(i + 1).append("\n");
-            ctx.append("- 接口: ").append(call.getRequestMethod() != null ? call.getRequestMethod() : "").append(" ").append(call.getUrl()).append("\n");
-            if (req != null && req.getDuration() != null) ctx.append("- 总耗时: ").append(req.getDuration()).append("ms\n");
-            ctx.append("- HTTP 状态: ").append(call.getStatus()).append("\n");
-            if (call.getRequestBody() != null) ctx.append("- 请求体: ").append(truncate(call.getRequestBody(), 600)).append("\n");
-            if (call.getResponseBody() != null) ctx.append("- 响应体: ").append(truncate(call.getResponseBody(), 400)).append("\n");
-            ctx.append("- 后端入口方法: ").append(call.getMethod()).append("\n");
-
-            if (call.getCallTree() == null || !(call.getCallTree() instanceof CallGraphEngine.CallTreeDTO)) {
-                ctx.append("（未匹配到调用树）\n\n");
-                continue;
-            }
-            CallGraphEngine.CallTreeDTO callTree = (CallGraphEngine.CallTreeDTO) call.getCallTree();
-            if (callTree.root() == null) {
-                ctx.append("（未匹配到调用树）\n\n");
-                continue;
-            }
-            Long repoId = call.getRecommendedRepo() != null ? call.getRecommendedRepo().getRepoId() : null;
-
-            // 收集调用链：方法序列、外部调用、异常、常量、关键方法
-            List<String> chainLines = new ArrayList<>();
-            List<String> externalCalls = new ArrayList<>();
-            List<String> constantsInfo = new ArrayList<>();
-            List<String> exceptionsInfo = new ArrayList<>();
-            LinkedHashSet<String> keyMethods = new LinkedHashSet<>();
-            keyMethods.add(call.getMethod());
-            collectForAi(callTree.root(), 0, new HashSet<>(), chainLines, externalCalls, 
-                         constantsInfo, exceptionsInfo, keyMethods);
-
-            ctx.append("\n## 调用链结构\n");
-            chainLines.forEach(l -> ctx.append(l).append("\n"));
-
-            if (!externalCalls.isEmpty()) {
-                ctx.append("\n## 外部调用（真实 I/O 边界）\n");
-                externalCalls.forEach(e -> ctx.append("- ").append(e).append("\n"));
-            }
-
-            // 业务错误码和异常
-            if (!exceptionsInfo.isEmpty()) {
-                ctx.append("\n## 业务错误码与异常\n");
-                exceptionsInfo.forEach(e -> ctx.append("- ").append(e).append("\n"));
-            }
-
-            // 关键常量和配置值
-            if (!constantsInfo.isEmpty()) {
-                ctx.append("\n## 关键常量与配置\n");
-                constantsInfo.forEach(c -> ctx.append("- ").append(c).append("\n"));
-            }
-
-            // 关键方法源码
-            if (repoId != null) {
-                ctx.append("\n## 关键方法源码\n");
-                int srcCount = 0;
-                for (String m : keyMethods) {
-                    if (srcCount >= 5) break;
-                    String src = null;
-                    try { src = callGraphEngine.getMethodSource(repoId, m); } catch (Exception ignored) {}
-                    if (src != null && !src.isBlank()) {
-                        ctx.append("\n### ").append(shortMethodRef(m)).append("\n```java\n")
-                           .append(truncate(src, 1200)).append("\n```\n");
-                        srcCount++;
-                    }
-                }
-            }
-            ctx.append("\n");
-        }
-        return ctx.toString();
-    }
-
-    /** 递归收集 AI 所需：调用链文本、外部调用、常量、异常、关键方法 */
-    private void collectForAi(CallGraphEngine.CallTreeNodeDTO node, int depth, Set<String> visited,
-                              List<String> chainLines, List<String> externalCalls,
-                              List<String> constantsInfo, List<String> exceptionsInfo,
-                              Set<String> keyMethods) {
-        if (node == null || node.fullMethod() == null || !visited.add(node.fullMethod())) return;
-        if (depth > 12) return;
-        String indent = "  ".repeat(Math.min(depth, 8));
-        String cls = node.className() != null ? node.className().substring(node.className().lastIndexOf('.') + 1) : "?";
-        chainLines.add(indent + "- " + cls + "." + node.methodName() + "()");
-
-        // 边界信息
-        if (node.boundaries() != null) {
-            for (CallGraphEngine.BoundaryDTO b : node.boundaries()) {
-                String type = b.boundaryType();
-                if ("HTTP".equals(type) || "DB".equals(type) || "RPC".equals(type) || "GRPC".equals(type)
-                        || "CACHE".equals(type) || "REDIS".equals(type) || "MQ".equals(type)) {
-                    String c = b.context() != null ? b.context().replace("📌 URL:", "").trim() : "";
-                    externalCalls.add(type + " @ " + cls + "." + node.methodName() + "(): " + c);
-                    keyMethods.add(node.fullMethod());
-                }
+            q.append("\n### 请求 ").append(i + 1).append("\n");
+            q.append("- 接口: ").append(call.getRequestMethod() != null ? call.getRequestMethod() : "")
+             .append(" ").append(call.getUrl()).append("\n");
+            if (req != null && req.getDuration() != null) q.append("- 总耗时: ").append(req.getDuration()).append("ms\n");
+            q.append("- HTTP 状态: ").append(call.getStatus()).append("\n");
+            if (call.getRequestBody() != null) q.append("- 请求体: ").append(truncate(call.getRequestBody(), 600)).append("\n");
+            if (call.getResponseBody() != null) q.append("- 响应体: ").append(truncate(call.getResponseBody(), 400)).append("\n");
+            if (call.getMethod() != null) {
+                q.append("- 后端入口方法: ").append(call.getMethod()).append("\n");
+            } else {
+                q.append("（未匹配到后端方法）\n");
             }
         }
-
-        // 常量信息（来自调用树节点的 constants 字段）
-        if (node.constants() != null && !node.constants().isBlank()) {
-            for (String line : node.constants().split("\n")) {
-                String trimmed = line.trim();
-                if (!trimmed.isEmpty() && trimmed.length() > 2) {
-                    constantsInfo.add(cls + "." + node.methodName() + "(): " + trimmed);
-                }
-            }
-        }
-
-        // 异常/错误码信息（来自调用树节点的 exceptions 字段）
-        if (node.exceptions() != null && !node.exceptions().isBlank()) {
-            exceptionsInfo.add(cls + "." + node.methodName() + "(): " + node.exceptions());
-            keyMethods.add(node.fullMethod());  // 有异常的方法附源码
-        }
-
-        if (node.children() != null) {
-            for (CallGraphEngine.CallTreeNodeDTO c : node.children()) {
-                collectForAi(c, depth + 1, visited, chainLines, externalCalls, 
-                             constantsInfo, exceptionsInfo, keyMethods);
-            }
-        }
+        return q.toString();
     }
 
     private String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() > max ? s.substring(0, max) + "…(截断)" : s;
-    }
-
-    private String shortMethodRef(String fullMethod) {
-        if (fullMethod == null) return "";
-        int colon = fullMethod.lastIndexOf(':');
-        if (colon < 0) return fullMethod;
-        String cls = fullMethod.substring(0, colon);
-        String shortCls = cls.substring(cls.lastIndexOf('.') + 1);
-        return shortCls + fullMethod.substring(colon);
     }
 
     // ==================== 流式分析（SSE） ====================
@@ -1006,10 +905,35 @@ public class RequestChainAnalyzerImpl implements RequestChainAnalyzer {
             if (claudeClient.isConfigured()) {
                 listener.progress("ai", "正在调用 AI 进行性能与风险分析...");
                 try {
-                    String full = claudeClient.chatStream(aiSystemPrompt(),
-                            List.of(Map.of("role", "user", "content", buildAiContext(chain, calls))),
-                            listener::aiToken);
-                    listener.aiDone(full);
+                    // 收集匹配到后端方法的入口 (repoId + fullMethod)，交给 tool-loop 引擎按需拉源码，
+                    // 避免一次性拼接巨型上下文（会导致 prompt 过大、AI 调用超时）
+                    List<QAEngineImpl.ScoredEndpoint> scored = new ArrayList<>();
+                    for (DebugAnalysisResult.ApiCall call : calls) {
+                        if (call.getMethod() != null && call.getRecommendedRepo() != null) {
+                            scored.addAll(qaEngine.resolveMethodsToScored(
+                                    call.getRecommendedRepo().getRepoId(), List.of(call.getMethod())));
+                        }
+                    }
+                    if (scored.isEmpty()) {
+                        listener.progress("ai", "未匹配到后端方法，跳过 AI 分析");
+                        listener.aiDone("");
+                    } else {
+                        List<QAEngineImpl.MatchedEndpoint> matched = new ArrayList<>();
+                        for (QAEngineImpl.ScoredEndpoint se : scored) {
+                            matched.add(qaEngine.toMatchedEndpointPublic(se));
+                        }
+                        String question = buildAiQuestion(chain, calls);
+                        QAEngineImpl.SmartQAResponse resp = qaEngine.generateAnswerWithLoop(
+                                scored, question, List.of(), matched,
+                                // 工具调用步骤 → 进度事件（前端已渲染 progress）
+                                step -> listener.progress("ai-step",
+                                        step.label() + (step.detail() != null && !step.detail().isBlank()
+                                                ? " — " + step.detail() : "")),
+                                null,
+                                // 最终答案逐 token 流式输出
+                                listener::aiToken);
+                        listener.aiDone(resp.answer());
+                    }
                 } catch (Exception e) {
                     logger.warn("[流式AI] 失败", e);
                     listener.progress("ai", "AI 分析不可用: " + e.getMessage());

@@ -29,6 +29,7 @@ public class DocGenerator {
     private final BuildLogService buildLogService;
     private final AnalysisDataExtractor analysisDataExtractor;
     private final ExternalCallFormatter externalCallFormatter;
+    private final com.adrninistrator.javacg2.platform.service.PromptService promptService;
 
     /** 产品文档缓存：key=repoId|entryMethod，TTL 10min，LRU 上限 100 */
     private static final long PRODUCT_DOC_CACHE_TTL_MS = 10 * 60 * 1000L;
@@ -47,7 +48,8 @@ public class DocGenerator {
                          RepositoryRepo repositoryRepo, ProjectInfoExtractor projectInfoExtractor,
                          RepoConfigRepo repoConfigRepo, BuildLogService buildLogService,
                          AnalysisDataExtractor analysisDataExtractor,
-                         ExternalCallFormatter externalCallFormatter) {
+                         ExternalCallFormatter externalCallFormatter,
+                         com.adrninistrator.javacg2.platform.service.PromptService promptService) {
         this.callGraphEngine = callGraphEngine;
         this.boundaryRepo = boundaryRepo;
         this.codeGenerator = codeGenerator;
@@ -60,21 +62,8 @@ public class DocGenerator {
         this.buildLogService = buildLogService;
         this.analysisDataExtractor = analysisDataExtractor;
         this.externalCallFormatter = externalCallFormatter;
+        this.promptService = promptService;
     }
-
-    // AI 文档生成的 system prompt
-    private static final String DOC_SYSTEM_PROMPT = ""
-            + "你是一个源码分析专家，正在将代码逻辑翻译成所有人都能看懂的文档。\n"
-            + "你的读者可能是产品经理、测试工程师、客服人员或新入职的研发。\n\n"
-            + "## 核心原则\n"
-            + "1. 用业务语言描述，不要贴代码片段\n"
-            + "2. 每个结论必须标注来源：(见 `类名.方法名`)\n"
-            + "3. 校验规则要具体到值：不要说\"有校验\"，要说\"商品名称必填，最多50个字符\"\n"
-            + "4. 异常场景要说清触发条件和用户感知\n"
-            + "5. 严禁编造任何内容：所有技术组件、外部依赖、字段、逻辑、状态，必须在提供的源码或数据中有明确依据才能写出，不得根据常识或经验推断补全\n"
-            + "6. 如果提供的信息不足以确定某项内容，直接省略该项，不要猜测或假设\n"
-            + "7. 使用 Mermaid 图表（sequenceDiagram/flowchart/stateDiagram），图表中的节点只能来自已提供的信息\n"
-            + "8. 只输出 Markdown，不要解释性文字\n";
 
     /**
      * AI 生成完整项目概览文档（异步调用）
@@ -237,7 +226,7 @@ public class DocGenerator {
                 + "- 使用 Markdown 格式输出\n"
                 + "- 不要添加接口列表中不存在的功能";
 
-        return claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        return claudeClient.chat(promptService.get("doc.system"), List.of(Map.of("role", "user", "content", prompt)));
     }
 
     /**
@@ -411,7 +400,7 @@ public class DocGenerator {
                 + "- 在每个模块标题下添加业务描述，然后保留接口列表（包括链接）\n"
                 + "- 只输出完整的 Markdown，不要有解释性文字";
 
-        return "## 功能模块\n\n" + claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        return "## 功能模块\n\n" + claudeClient.chat(promptService.get("doc.system"), List.of(Map.of("role", "user", "content", prompt)));
     }
 
     /**
@@ -603,7 +592,7 @@ public class DocGenerator {
                 + "### 功能模块\n"
                 + "按业务域将上述接口分组，每个模块一句话描述职责，列出该模块下的接口路径（格式：`METHOD /path — 简介`）。只做归类，不要新增或推断不存在的模块。\n";
 
-        String aiPart = claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        String aiPart = claudeClient.chat(promptService.get("doc.system"), List.of(Map.of("role", "user", "content", prompt)));
 
         // 文档顺序：AI 项目简介 → 技术栈 → 架构图 → 外部依赖 → AI 功能模块
         return aiPart + "\n\n"
@@ -1308,7 +1297,7 @@ public class DocGenerator {
                 + "只列出源码中明确出现的数据库写操作（INSERT/UPDATE/DELETE），标注来源。找不到时输出：`源码中未发现数据库写操作`。\n";
 
         // 组合：先输出 AI 生成的文字描述，再插入代码生成的 Mermaid 图
-        String aiContent = claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        String aiContent = claudeClient.chat(promptService.get("doc.system"), List.of(Map.of("role", "user", "content", prompt)));
         
         // 在功能描述之后插入业务流程图
         if (!mermaidDiagram.isEmpty()) {
@@ -1669,7 +1658,7 @@ public class DocGenerator {
                     ? "只根据上方配置项，列出实际存在的配置值，不评价其是否合理，不补充未配置项的建议。\n"
                     : "源码中未检测到性能相关配置，此章节无内容。\n");
 
-        return claudeClient.chat(DOC_SYSTEM_PROMPT, List.of(Map.of("role", "user", "content", prompt)));
+        return claudeClient.chat(promptService.get("doc.system"), List.of(Map.of("role", "user", "content", prompt)));
     }
 
     /**
@@ -1892,7 +1881,7 @@ public class DocGenerator {
         // 2. AI 生成业务描述（不包含图表）
         logger.info("[产品文档] 开始调用 AI 生成业务描述");
         String prompt = buildProductDocPromptWithBoundaries(repoId, entryDesc, nodes, dataFlow, boundaries, allMethods, depSummary);
-        String aiContent = claudeClient.chat(PRODUCT_DOC_SYSTEM_PROMPT_WITHOUT_DIAGRAM, List.of(
+        String aiContent = claudeClient.chat(promptService.get("product.doc"), List.of(
             Map.of("role", "user", "content", prompt)
         ));
         logger.info("[产品文档] AI 生成完成，内容长度: {}", aiContent.length());
@@ -1910,8 +1899,8 @@ public class DocGenerator {
         return finalDoc;
     }
 
-    // Product doc system prompt (不要求 AI 生成图表)
-    private static final String PRODUCT_DOC_SYSTEM_PROMPT_WITHOUT_DIAGRAM = """
+    // Product doc system prompt (不要求 AI 生成图表)。默认值经 PromptService 登记为 "product.doc"，可在系统配置覆盖。
+    public static final String PRODUCT_DOC_SYSTEM_PROMPT_WITHOUT_DIAGRAM = """
         你是一位产品经理，正在为团队编写产品需求文档。你的读者是产品经理、测试工程师、客服人员、业务方。
         
         ## 输出要求

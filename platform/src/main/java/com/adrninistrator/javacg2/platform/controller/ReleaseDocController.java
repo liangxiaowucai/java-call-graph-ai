@@ -78,4 +78,24 @@ public class ReleaseDocController {
             return ApiResponse.error("GENERATE_ERROR", "生成失败: " + e.getMessage(), "");
         }
     }
+
+    /**
+     * 按需获取单个变更文件的 git diff（供前端「详情」左右源码对比）
+     * 请求体: { repoId, filePath, baseBranch, branch }
+     */
+    @PostMapping("/file-diff")
+    public ApiResponse<ReleaseDocService.FileDiffResult> fileDiff(@RequestBody Map<String, Object> body) {
+        if (body.get("repoId") == null || body.get("filePath") == null || body.get("branch") == null) {
+            return ApiResponse.error("BAD_REQUEST", "缺少 repoId/filePath/branch", "");
+        }
+        Long repoId = ((Number) body.get("repoId")).longValue();
+        String filePath = (String) body.get("filePath");
+        String branch = (String) body.get("branch");
+        String baseBranch = body.containsKey("baseBranch") ? (String) body.get("baseBranch") : "master";
+        try {
+            return ApiResponse.ok(releaseDocService.fileDiff(repoId, filePath, baseBranch, branch));
+        } catch (Exception e) {
+            return ApiResponse.error("DIFF_ERROR", "获取 diff 失败: " + e.getMessage(), "");
+        }
+    }
 }

@@ -8,6 +8,9 @@ import com.adrninistrator.javacg2.platform.repository.BoundaryRepo;
 import com.adrninistrator.javacg2.platform.repository.CallGraphRepo;
 import com.adrninistrator.javacg2.platform.repository.ChunkRepo;
 import com.adrninistrator.javacg2.platform.repository.ApiEndpointRepo;
+import com.adrninistrator.javacg2.platform.repository.ClassReferenceRepo;
+import com.adrninistrator.javacg2.platform.repository.RepoConfigRepo;
+import com.adrninistrator.javacg2.platform.entity.ClassReferenceEntity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -16,17 +19,24 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 全局仓库数据内存缓存。
+ * 全局仓库数据内存缓存（分级/分片懒加载）。
  *
- * <p>分析完成后把每个仓库的调用图、边界、Chunk 和入口点全量加载到内存，
- * 供 CallGraphEngine / BoundaryDetector / TopologyEngine 等直接读取，
- * 避免每次接口请求都重新全表扫描数据库。
+ * <p>不再一次性把整仓库全部数据载入内存，而是把数据切成 5 个独立分片，
+ * 各自按需懒加载、各自缓存：
+ * <ul>
+ *   <li>callGraph（含正向 callGraphMap + 反向 calleeIndex，同一次查询构建）</li>
+ *   <li>boundary（边界点）</li>
+ *   <li>chunk（方法元数据）</li>
+ *   <li>endpoint（入口点）</li>
+ *   <li>classRef（类引用/import 关系）</li>
+ * </ul>
+ * 例如「仓库拓扑」只用到 callGraph + chunk + classRef，就不会加载 boundary / endpoint。
  *
  * <p>生命周期：
  * <ul>
- *   <li>分析开始：{@link #invalidate(Long)} — 清除旧缓存</li>
- *   <li>分析成功：{@link #warmup(Long)} — 重新加载</li>
- *   <li>读取：{@link #get(Long)} — 立刻返回内存数据；未命中则按需加载一次</li>
+ *   <li>分析开始：{@link #invalidate(Long)} 清除该仓库所有分片缓存</li>
+ *   <li>分析成功 / 启动预热：{@link #warmup(Long)} 预载常用分片（拓扑相关）</li>
+ *   <li>读取：{@link #get(Long)} 返回轻量视图，分片在首次访问时才加载</li>
  * </ul>
  */
 @Component
@@ -38,134 +48,242 @@ public class RepoDataStore {
     private final BoundaryRepo boundaryRepo;
     private final ChunkRepo chunkRepo;
     private final ApiEndpointRepo apiEndpointRepo;
+    private final RepoConfigRepo repoConfigRepo;
+    private final ClassReferenceRepo classReferenceRepo;
 
-    /** repoId → 已加载的仓库数据（线程安全写，并发读） */
-    private final ConcurrentHashMap<Long, RepoData> store = new ConcurrentHashMap<>();
+    // ── 分片缓存（各自独立懒加载）─────────────────────────────────────────────
+    private final ConcurrentHashMap<Long, CallGraphSlice> callGraphCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Map<String, List<BoundaryEntity>>> boundaryCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Map<String, ChunkEntity>> chunkCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Map<String, ApiEndpointEntity>> endpointCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Map<String, List<String>>> classRefCache = new ConcurrentHashMap<>();
+
+    /** 包前缀缓存：repoId → 解析好的前缀列表，避免每次请求都打 DB。 */
+    private final ConcurrentHashMap<Long, List<String>> packagePrefixCache = new ConcurrentHashMap<>();
 
     public RepoDataStore(CallGraphRepo callGraphRepo, BoundaryRepo boundaryRepo,
-                         ChunkRepo chunkRepo, ApiEndpointRepo apiEndpointRepo) {
+                         ChunkRepo chunkRepo, ApiEndpointRepo apiEndpointRepo,
+                         RepoConfigRepo repoConfigRepo, ClassReferenceRepo classReferenceRepo) {
         this.callGraphRepo = callGraphRepo;
         this.boundaryRepo = boundaryRepo;
         this.chunkRepo = chunkRepo;
         this.apiEndpointRepo = apiEndpointRepo;
+        this.repoConfigRepo = repoConfigRepo;
+        this.classReferenceRepo = classReferenceRepo;
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /**
-     * 分析开始时清除旧缓存，确保下次 warmup 或按需加载得到最新数据。
-     */
+    /** 分析开始时清除该仓库所有分片缓存，确保下次加载得到最新数据。 */
     public void invalidate(Long repoId) {
-        store.remove(repoId);
-        log.info("[RepoDataStore] 已清除仓库 {} 的内存缓存", repoId);
+        callGraphCache.remove(repoId);
+        boundaryCache.remove(repoId);
+        chunkCache.remove(repoId);
+        endpointCache.remove(repoId);
+        classRefCache.remove(repoId);
+        packagePrefixCache.remove(repoId);
     }
 
     /**
-     * 分析成功后主动 warmup，把数据加载进内存。
-     * 同步加载（调用方在后台线程中调用即可，不阻塞 HTTP 响应）。
+     * 预热常用分片（拓扑/目录用到的 callGraph + chunk + classRef）到内存。
+     * 在后台线程调用，避免首次请求在请求线程内同步加载造成卡顿。
+     * boundary / endpoint 仍保持懒加载（调用链/搜索首次使用时再载）。
      */
     public void warmup(Long repoId) {
-        log.info("[RepoDataStore] 开始 warmup 仓库 {} ...", repoId);
-        long t = System.currentTimeMillis();
-        RepoData data = load(repoId);
-        store.put(repoId, data);
-        log.info("[RepoDataStore] warmup 仓库 {} 完成: {}条调用边 / {}个边界 / {}个Chunk / {}个入口点, 耗时 {}ms",
-                repoId,
-                data.callGraphMap.values().stream().mapToInt(List::size).sum(),
-                data.boundaryMap.values().stream().mapToInt(List::size).sum(),
-                data.chunkMap.size(),
-                data.endpointMap.size(),
-                System.currentTimeMillis() - t);
+        getCallGraphMap(repoId);
+        getChunkMap(repoId);
+        getClassRefMap(repoId);
     }
 
-    /**
-     * 获取仓库数据；若缓存不存在则按需加载（首次或未 warmup 时的安全兜底）。
-     */
+    /** 返回轻量视图；各分片在首次访问对应方法时才加载。 */
     public RepoData get(Long repoId) {
-        return store.computeIfAbsent(repoId, this::load);
+        return new RepoData(this, repoId);
     }
 
-    /**
-     * 清除所有仓库缓存（如系统重置时使用）。
-     */
+    // ── 分片访问器（懒加载 + 独立缓存）──────────────────────────────────────────
+
+    public Map<String, List<CallGraphEntity>> getCallGraphMap(Long repoId) {
+        return callGraphSlice(repoId).callGraphMap;
+    }
+
+    public Map<String, List<CallGraphEntity>> getCalleeIndex(Long repoId) {
+        return callGraphSlice(repoId).calleeIndex;
+    }
+
+    private CallGraphSlice callGraphSlice(Long repoId) {
+        return callGraphCache.computeIfAbsent(repoId, this::loadCallGraph);
+    }
+
+    public Map<String, List<BoundaryEntity>> getBoundaryMap(Long repoId) {
+        return boundaryCache.computeIfAbsent(repoId, this::loadBoundary);
+    }
+
+    public Map<String, ChunkEntity> getChunkMap(Long repoId) {
+        return chunkCache.computeIfAbsent(repoId, this::loadChunk);
+    }
+
+    public Map<String, ApiEndpointEntity> getEndpointMap(Long repoId) {
+        return endpointCache.computeIfAbsent(repoId, this::loadEndpoint);
+    }
+
+    public Map<String, List<String>> getClassRefMap(Long repoId) {
+        return classRefCache.computeIfAbsent(repoId, this::loadClassRef);
+    }
+
+    /** 仓库的包前缀配置（带缓存）。 */
+    public List<String> getPackagePrefixes(Long repoId) {
+        return packagePrefixCache.computeIfAbsent(repoId, this::loadPackagePrefixes);
+    }
+
+    public void invalidatePackagePrefix(Long repoId) {
+        packagePrefixCache.remove(repoId);
+    }
+
+    /** 清除所有仓库缓存。 */
     public void invalidateAll() {
-        store.clear();
+        callGraphCache.clear();
+        boundaryCache.clear();
+        chunkCache.clear();
+        endpointCache.clear();
+        classRefCache.clear();
+        packagePrefixCache.clear();
         log.info("[RepoDataStore] 已清除所有仓库内存缓存");
     }
 
-    // ── Internal load ─────────────────────────────────────────────────────────
+    // ── 分片加载（各自计时日志）─────────────────────────────────────────────────
 
-    private RepoData load(Long repoId) {
-        // 1. 调用边：按 callerMethod 分组
+    private CallGraphSlice loadCallGraph(Long repoId) {
+        long t = System.currentTimeMillis();
         List<CallGraphEntity> allEdges = callGraphRepo.findByRepoId(repoId);
         Map<String, List<CallGraphEntity>> callGraphMap = new HashMap<>(allEdges.size() * 2);
+        Map<String, List<CallGraphEntity>> calleeIndex  = new HashMap<>(allEdges.size() * 2);
         for (CallGraphEntity edge : allEdges) {
             callGraphMap.computeIfAbsent(edge.getCallerMethod(), k -> new ArrayList<>()).add(edge);
+            calleeIndex .computeIfAbsent(edge.getCalleeMethod(), k -> new ArrayList<>()).add(edge);
         }
-
-        // 2. 边界信息：按 fullMethod 分组
-        List<BoundaryEntity> allBoundaries = boundaryRepo.findByRepoId(repoId);
-        Map<String, List<BoundaryEntity>> boundaryMap = new HashMap<>(allBoundaries.size() * 2);
-        for (BoundaryEntity b : allBoundaries) {
-            boundaryMap.computeIfAbsent(b.getFullMethod(), k -> new ArrayList<>()).add(b);
-        }
-
-        // 3. Chunk 元数据：按 fullMethod 索引（同方法取第一个）
-        List<ChunkEntity> allChunks = chunkRepo.findByRepoId(repoId);
-        Map<String, ChunkEntity> chunkMap = new HashMap<>(allChunks.size() * 2);
-        for (ChunkEntity c : allChunks) {
-            chunkMap.putIfAbsent(c.getFullMethod(), c);
-        }
-
-        // 4. 入口点：按 fullMethod 索引
-        List<ApiEndpointEntity> allEndpoints = apiEndpointRepo.findByRepoId(repoId);
-        Map<String, ApiEndpointEntity> endpointMap = new HashMap<>(allEndpoints.size() * 2);
-        for (ApiEndpointEntity ep : allEndpoints) {
-            endpointMap.put(ep.getFullMethod(), ep);
-        }
-
-        return new RepoData(callGraphMap, boundaryMap, chunkMap, endpointMap);
+        log.info("[RepoDataStore] 加载仓库 {} 调用图分片: {} 条边, 耗时 {}ms",
+                repoId, allEdges.size(), System.currentTimeMillis() - t);
+        return new CallGraphSlice(
+                Collections.unmodifiableMap(callGraphMap),
+                Collections.unmodifiableMap(calleeIndex));
     }
 
-    // ── Data holder ───────────────────────────────────────────────────────────
+    private Map<String, List<BoundaryEntity>> loadBoundary(Long repoId) {
+        long t = System.currentTimeMillis();
+        List<BoundaryEntity> all = boundaryRepo.findByRepoId(repoId);
+        Map<String, List<BoundaryEntity>> map = new HashMap<>(all.size() * 2);
+        for (BoundaryEntity b : all) {
+            map.computeIfAbsent(b.getFullMethod(), k -> new ArrayList<>()).add(b);
+        }
+        log.info("[RepoDataStore] 加载仓库 {} 边界分片: {} 个, 耗时 {}ms",
+                repoId, all.size(), System.currentTimeMillis() - t);
+        return Collections.unmodifiableMap(map);
+    }
+
+    private Map<String, ChunkEntity> loadChunk(Long repoId) {
+        long t = System.currentTimeMillis();
+        List<ChunkEntity> all = chunkRepo.findByRepoId(repoId);
+        Map<String, ChunkEntity> map = new HashMap<>(all.size() * 2);
+        for (ChunkEntity c : all) {
+            map.putIfAbsent(c.getFullMethod(), c);
+        }
+        log.info("[RepoDataStore] 加载仓库 {} Chunk分片: {} 个, 耗时 {}ms",
+                repoId, all.size(), System.currentTimeMillis() - t);
+        return Collections.unmodifiableMap(map);
+    }
+
+    private Map<String, ApiEndpointEntity> loadEndpoint(Long repoId) {
+        long t = System.currentTimeMillis();
+        List<ApiEndpointEntity> all = apiEndpointRepo.findByRepoId(repoId);
+        Map<String, ApiEndpointEntity> map = new HashMap<>(all.size() * 2);
+        for (ApiEndpointEntity ep : all) {
+            map.put(ep.getFullMethod(), ep);
+        }
+        log.info("[RepoDataStore] 加载仓库 {} 入口分片: {} 个, 耗时 {}ms",
+                repoId, all.size(), System.currentTimeMillis() - t);
+        return Collections.unmodifiableMap(map);
+    }
+
+    private Map<String, List<String>> loadClassRef(Long repoId) {
+        long t = System.currentTimeMillis();
+        List<ClassReferenceEntity> all = classReferenceRepo.findByRepoId(repoId);
+        Map<String, List<String>> map = new HashMap<>(all.size() * 2);
+        for (ClassReferenceEntity ref : all) {
+            map.computeIfAbsent(ref.getSourceClass(), k -> new ArrayList<>()).add(ref.getTargetClass());
+        }
+        log.info("[RepoDataStore] 加载仓库 {} 类引用分片: {} 条, 耗时 {}ms",
+                repoId, all.size(), System.currentTimeMillis() - t);
+        return Collections.unmodifiableMap(map);
+    }
+
+    private List<String> loadPackagePrefixes(Long repoId) {
+        String raw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
+                .map(c -> c.getConfigValue())
+                .filter(s -> s != null && !s.isBlank())
+                .orElse(null);
+        List<String> prefixes = new ArrayList<>();
+        if (raw != null) {
+            for (String p : raw.split("[,;\\s]+")) {
+                String trimmed = p.trim();
+                if (!trimmed.isEmpty()) prefixes.add(trimmed);
+            }
+        }
+        return Collections.unmodifiableList(prefixes);
+    }
+
+    // ── 内部分片数据 ────────────────────────────────────────────────────────────
+
+    /** 调用图分片：正向 + 反向索引一次查询构建。 */
+    private record CallGraphSlice(Map<String, List<CallGraphEntity>> callGraphMap,
+                                  Map<String, List<CallGraphEntity>> calleeIndex) {}
+
+    // ── 轻量视图 ───────────────────────────────────────────────────────────────
 
     /**
-     * 一个仓库的全量内存数据。所有字段只读，线程安全。
+     * 仓库数据的轻量视图。各分片在首次访问对应方法时才从 {@link RepoDataStore} 懒加载并缓存。
+     * 线程安全、只读。
      */
     public static final class RepoData {
-        /** callerMethod → 直接调用边列表 */
-        public final Map<String, List<CallGraphEntity>> callGraphMap;
-        /** fullMethod → 外部 I/O 边界列表 */
-        public final Map<String, List<BoundaryEntity>> boundaryMap;
-        /** fullMethod → 方法元数据（constants/exceptions/resolvedUrls 等） */
-        public final Map<String, ChunkEntity> chunkMap;
-        /** fullMethod → 入口点元数据 */
-        public final Map<String, ApiEndpointEntity> endpointMap;
+        private final RepoDataStore store;
+        private final Long repoId;
 
-        RepoData(Map<String, List<CallGraphEntity>> callGraphMap,
-                 Map<String, List<BoundaryEntity>> boundaryMap,
-                 Map<String, ChunkEntity> chunkMap,
-                 Map<String, ApiEndpointEntity> endpointMap) {
-            this.callGraphMap = Collections.unmodifiableMap(callGraphMap);
-            this.boundaryMap  = Collections.unmodifiableMap(boundaryMap);
-            this.chunkMap     = Collections.unmodifiableMap(chunkMap);
-            this.endpointMap  = Collections.unmodifiableMap(endpointMap);
+        RepoData(RepoDataStore store, Long repoId) {
+            this.store = store;
+            this.repoId = repoId;
         }
 
+        /** callerMethod → 直接调用边列表（正向索引） */
+        public Map<String, List<CallGraphEntity>> callGraphMap() { return store.getCallGraphMap(repoId); }
+        /** calleeMethod → 被调用边列表（反向索引） */
+        public Map<String, List<CallGraphEntity>> calleeIndex() { return store.getCalleeIndex(repoId); }
+        /** fullMethod → 外部 I/O 边界列表 */
+        public Map<String, List<BoundaryEntity>> boundaryMap() { return store.getBoundaryMap(repoId); }
+        /** fullMethod → 方法元数据 */
+        public Map<String, ChunkEntity> chunkMap() { return store.getChunkMap(repoId); }
+        /** fullMethod → 入口点元数据 */
+        public Map<String, ApiEndpointEntity> endpointMap() { return store.getEndpointMap(repoId); }
+        /** sourceClass → 引用的目标类列表 */
+        public Map<String, List<String>> classRefMap() { return store.getClassRefMap(repoId); }
+
         public List<CallGraphEntity> getCallees(String callerMethod) {
-            return callGraphMap.getOrDefault(callerMethod, List.of());
+            return callGraphMap().getOrDefault(callerMethod, List.of());
+        }
+
+        /** 反向查询：谁调用了 calleeMethod */
+        public List<CallGraphEntity> getCallers(String calleeMethod) {
+            return calleeIndex().getOrDefault(calleeMethod, List.of());
         }
 
         public List<BoundaryEntity> getBoundaries(String fullMethod) {
-            return boundaryMap.getOrDefault(fullMethod, List.of());
+            return boundaryMap().getOrDefault(fullMethod, List.of());
         }
 
         public ChunkEntity getChunk(String fullMethod) {
-            return chunkMap.get(fullMethod);
+            return chunkMap().get(fullMethod);
         }
 
         public ApiEndpointEntity getEndpoint(String fullMethod) {
-            return endpointMap.get(fullMethod);
+            return endpointMap().get(fullMethod);
         }
     }
 }

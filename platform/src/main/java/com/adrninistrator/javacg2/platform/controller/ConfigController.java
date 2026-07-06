@@ -14,9 +14,33 @@ import java.util.Map;
 public class ConfigController {
 
     private final SystemConfigRepo configRepo;
+    private final com.adrninistrator.javacg2.platform.service.PromptService promptService;
 
-    public ConfigController(SystemConfigRepo configRepo) {
+    public ConfigController(SystemConfigRepo configRepo,
+                            com.adrninistrator.javacg2.platform.service.PromptService promptService) {
         this.configRepo = configRepo;
+        this.promptService = promptService;
+    }
+
+    /** 列出所有 AI Prompt 定义与当前值（含默认值与用户覆盖），供配置界面渲染 */
+    @GetMapping("/prompts")
+    public ApiResponse<java.util.List<Map<String, Object>>> getPrompts() {
+        return ApiResponse.ok(promptService.listWithValues());
+    }
+
+    /**
+     * 保存单个 Prompt 覆盖值。body: {key, value}。
+     * value 为空 → 恢复默认（删除覆盖）。
+     */
+    @PutMapping("/prompts")
+    public ApiResponse<String> savePrompt(@RequestBody Map<String, String> body) {
+        String key = body.get("key");
+        if (key == null || key.isBlank()) {
+            return ApiResponse.error("BAD_REQUEST", "缺少 key", "请传入 prompt 的 key");
+        }
+        boolean ok = promptService.saveOverride(key, body.get("value"));
+        return ok ? ApiResponse.ok("保存成功")
+                  : ApiResponse.error("UNKNOWN_KEY", "未知 prompt key: " + key, "请刷新页面重试");
     }
 
     @GetMapping("/maven")

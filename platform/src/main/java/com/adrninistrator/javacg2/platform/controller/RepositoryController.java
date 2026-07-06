@@ -13,12 +13,23 @@ import com.adrninistrator.javacg2.platform.service.BuildLogService;
 import com.adrninistrator.javacg2.platform.service.impl.ClaudeApiClient;
 import com.adrninistrator.javacg2.platform.service.impl.DocGenerator;
 import com.adrninistrator.javacg2.platform.service.RepositoryManager;
+import com.adrninistrator.javacg2.platform.service.RepositoryQueryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -47,6 +58,8 @@ public class RepositoryController {
     private final ChunkRepo chunkRepo;
     private final com.adrninistrator.javacg2.platform.repository.CallGraphRepo callGraphRepo;
     private final com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore;
+    private final RepositoryQueryService repositoryQueryService;
+    private final com.adrninistrator.javacg2.platform.repository.GraphLayoutRepo graphLayoutRepo;
 
     public RepositoryController(RepositoryRepo repositoryRepo, RepositoryManager repositoryManager,
                                  BytecodeAnalyzer bytecodeAnalyzer,
@@ -55,7 +68,9 @@ public class RepositoryController {
                                  DocGenerator docGenerator, ClaudeApiClient claudeClient,
                                  BuildLogService buildLogService, ChunkRepo chunkRepo,
                                  com.adrninistrator.javacg2.platform.repository.CallGraphRepo callGraphRepo,
-                                 com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore) {
+                                 com.adrninistrator.javacg2.platform.service.RepoDataStore repoDataStore,
+                                 RepositoryQueryService repositoryQueryService,
+                                 com.adrninistrator.javacg2.platform.repository.GraphLayoutRepo graphLayoutRepo) {
         this.repositoryRepo = repositoryRepo;
         this.repositoryManager = repositoryManager;
         this.bytecodeAnalyzer = bytecodeAnalyzer;
@@ -67,6 +82,8 @@ public class RepositoryController {
         this.chunkRepo = chunkRepo;
         this.callGraphRepo = callGraphRepo;
         this.repoDataStore = repoDataStore;
+        this.repositoryQueryService = repositoryQueryService;
+        this.graphLayoutRepo = graphLayoutRepo;
     }
 
     @GetMapping
@@ -118,7 +135,7 @@ public class RepositoryController {
                 entity.setUpdatedAt(java.time.LocalDateTime.now());
                 repoConfigRepo.save(entity);
             }
-            
+
             // 保存 URL 路径标识符到 repository 表
             if (request.urlPathIdentifier() != null && !request.urlPathIdentifier().isBlank()) {
                 var repo = repositoryRepo.findById(result.repoId()).orElse(null);
@@ -127,6 +144,9 @@ public class RepositoryController {
                     repositoryRepo.save(repo);
                 }
             }
+
+            // clone 成功后自动触发分析，状态流：CLONING → QUEUED → ANALYZING → READY
+            submitAnalysis(result.repoId(), false);
         }
 
         return ApiResponse.ok(result);
@@ -158,31 +178,8 @@ public class RepositoryController {
             return ApiResponse.error("DOC_GENERATING", "该仓库正在生成文档", "请等待文档生成完成后再分析");
         }
 
-        // 先设为排队状态
-        repo.setStatus("QUEUED");
-        repositoryRepo.save(repo);
-
-        final boolean rebuild = forceRebuild;
-        try {
-            analysisExecutor.submit(() -> {
-                try {
-                    // 开始执行时改为 ANALYZING
-                    var r = repositoryRepo.findById(id).orElse(null);
-                    if (r != null) {
-                        r.setStatus("ANALYZING");
-                        repositoryRepo.save(r);
-                    }
-                    bytecodeAnalyzer.analyzeFullProject(id, rebuild);
-                } catch (Exception e) {
-                    logger.error("分析异常: repoId={}", id, e);
-                }
-            });
-            return ApiResponse.ok("任务已提交，当前状态：排队中");
-        } catch (RejectedExecutionException e) {
-            repo.setStatus("READY");
-            repositoryRepo.save(repo);
-            return ApiResponse.error("QUEUE_FULL", "分析队列已满，请稍后再试", "当前最多排队 10 个任务");
-        }
+        submitAnalysis(id, forceRebuild);
+        return ApiResponse.ok("任务已提交，当前状态：排队中");
     }
 
     @PostMapping("/{id}/reset")
@@ -203,18 +200,22 @@ public class RepositoryController {
     @PostMapping("/rebuild-index-all")
     public ApiResponse<String> rebuildIndexAll() {
         List<RepositoryEntity> repos = repositoryRepo.findAll();
-        int count = 0;
-        for (RepositoryEntity repo : repos) {
-            if ("READY".equals(repo.getStatus())) {
+        List<Long> readyIds = repos.stream()
+                .filter(r -> "READY".equals(r.getStatus()))
+                .map(RepositoryEntity::getId)
+                .collect(Collectors.toList());
+
+        for (Long repoId : readyIds) {
+            final Long id = repoId;
+            analysisExecutor.submit(() -> {
                 try {
-                    bytecodeAnalyzer.rebuildIndex(repo.getId());
-                    count++;
+                    bytecodeAnalyzer.rebuildIndex(id);
                 } catch (Exception e) {
-                    logger.warn("补建索引失败: repoId={}, {}", repo.getId(), e.getMessage());
+                    logger.warn("补建索引失败: repoId={}, {}", id, e.getMessage());
                 }
-            }
+            });
         }
-        return ApiResponse.ok("已完成 " + count + " 个仓库的索引重建");
+        return ApiResponse.ok("已提交 " + readyIds.size() + " 个仓库的索引重建任务，后台异步执行");
     }
 
     @PostMapping("/{id}/sync")
@@ -249,7 +250,7 @@ public class RepositoryController {
         repositoryRepo.save(repo);
 
         final Long repoId = id;
-        new Thread(() -> {
+        analysisExecutor.submit(() -> {
             try {
                 logger.info("开始生成 AI 概览文档: repoId={}", repoId);
                 buildLogService.clear(repoId);
@@ -274,7 +275,7 @@ public class RepositoryController {
                     repositoryRepo.save(r);
                 }
             }
-        }).start();
+        });
 
         return ApiResponse.ok("概览文档正在后台生成，请稍后刷新查看");
     }
@@ -348,6 +349,40 @@ public class RepositoryController {
         return ApiResponse.ok("已删除");
     }
 
+    // ── 内部工具方法 ──────────────────────────────────────────────────────────
+
+    /**
+     * 提交分析任务：设为 QUEUED → 异步改 ANALYZING → 分析完成后 READY。
+     * clone 后自动调用，也被 /analyze 接口复用。
+     */
+    private void submitAnalysis(Long id, boolean forceRebuild) {
+        var repo = repositoryRepo.findById(id).orElse(null);
+        if (repo == null) return;
+        repo.setStatus("QUEUED");
+        repositoryRepo.save(repo);
+        try {
+            analysisExecutor.submit(() -> {
+                try {
+                    var r = repositoryRepo.findById(id).orElse(null);
+                    if (r != null) {
+                        r.setStatus("ANALYZING");
+                        repositoryRepo.save(r);
+                    }
+                    bytecodeAnalyzer.analyzeFullProject(id, forceRebuild);
+                } catch (Exception e) {
+                    logger.error("分析异常: repoId={}", id, e);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            repo = repositoryRepo.findById(id).orElse(null);
+            if (repo != null) {
+                repo.setStatus("READY");
+                repositoryRepo.save(repo);
+            }
+            logger.warn("分析队列已满，repoId={} 无法自动分析，请稍后手动触发", id);
+        }
+    }
+
     @GetMapping("/{id}/jars")
     public ApiResponse<List<Map<String, String>>> listJars(@PathVariable Long id) {
         var repo = repositoryRepo.findById(id).orElse(null);
@@ -407,154 +442,49 @@ public class RepositoryController {
         return ApiResponse.ok(jars);
     }
 
-    /**
-     * 获取仓库的类间调用关系（用于文件关系图的边）。
-     * 从 call_graph 表聚合：caller 类名 → callee 类名（去重），只返回两端都在本仓库业务包内的边。
-     */
     @GetMapping("/{id}/class-edges")
     public ApiResponse<List<Map<String, String>>> getClassEdges(@PathVariable Long id) {
         var repo = repositoryRepo.findById(id).orElse(null);
         if (repo == null) return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
-
-        // 读取包前缀
-        String prefixRaw = repoConfigRepo.findByRepoIdAndConfigKey(id, "analyze.package.prefix")
-                .map(c -> c.getConfigValue())
-                .orElse(null);
-        List<String> prefixes = new java.util.ArrayList<>();
-        if (prefixRaw != null) {
-            for (String p : prefixRaw.split("[,;\\s]+")) {
-                String t = p.trim(); if (!t.isEmpty()) prefixes.add(t);
-            }
-        }
-
-        // 聚合类间调用（去重）
-        Set<String> seen = new java.util.HashSet<>();
-        List<Map<String, String>> edges = new java.util.ArrayList<>();
-
-        // Use memory cache instead of DB query
-        var repoData = repoDataStore.get(id);
-        for (var cg : repoData.callGraphMap.values().stream().flatMap(java.util.Collection::stream).collect(java.util.stream.Collectors.toList())) {
-            if (cg.getEnabled() == null || !cg.getEnabled()) continue;
-            if ("EXTENDS".equals(cg.getCallType()) || "IMPLEMENTS".equals(cg.getCallType())) continue;
-
-            String callerFull = cg.getCallerMethod();
-            String calleeFull = cg.getCalleeMethod();
-            int c1 = callerFull.lastIndexOf(':');
-            int c2 = calleeFull.lastIndexOf(':');
-            if (c1 <= 0 || c2 <= 0) continue;
-
-            String callerClass = callerFull.substring(0, c1);
-            String calleeClass = calleeFull.substring(0, c2);
-
-            // 同类调用跳过
-            if (callerClass.equals(calleeClass)) continue;
-            // 跳过匿名内部类
-            if (callerClass.matches(".*\\$\\d+$") || calleeClass.matches(".*\\$\\d+$")) continue;
-            // 只保留业务包内的边
-            if (!prefixes.isEmpty()) {
-                if (prefixes.stream().noneMatch(callerClass::startsWith)) continue;
-                if (prefixes.stream().noneMatch(calleeClass::startsWith)) continue;
-            }
-            // 跳过 gRPC/proto 生成类
-            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoiseClass(callerClass)) continue;
-            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoiseClass(calleeClass)) continue;
-
-            String key = callerClass + ">" + calleeClass;
-            if (seen.add(key)) {
-                edges.add(Map.of("source", callerClass, "target", calleeClass));
-            }
-        }
-
-        return ApiResponse.ok(edges);
+        return ApiResponse.ok(repositoryQueryService.getClassEdges(id));
     }
 
     /**
-     * 获取仓库的类/文件树结构（从 chunks 表聚合，只返回业务代码）。
-     * 过滤规则：
-     *  1. 包前缀匹配（业务代码）
-     *  2. 过滤 gRPC/protobuf 生成类（GrpcNoiseFilter）
-     *  3. 过滤 $Builder / OrBuilder / 匿名内部类
-     *  4. 过滤 .api.client.model / .api.client.service 包（proto 生成）
+     * 获取仓库拓扑图预计算布局。
+     * 分析完成后由后端自动计算并缓存，所有用户共享同一份布局数据。
+     * 返回 { layoutVersion: ISO时间, nodes: [{className, x, y}] }。
+     * 若尚未计算完成则返回 nodes:[]，前端应回退到客户端 force simulation。
+     * 前端通过对比 layoutVersion 与本地缓存版本决定是否刷新。
      */
+    @GetMapping("/{id}/graph-layout")
+    public ApiResponse<Map<String, Object>> getGraphLayout(@PathVariable Long id) {
+        var repo = repositoryRepo.findById(id).orElse(null);
+        if (repo == null) return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
+
+        List<com.adrninistrator.javacg2.platform.entity.GraphLayoutEntity> layouts =
+                graphLayoutRepo.findByRepoId(id);
+
+        List<Map<String, Object>> nodes = layouts.stream().map(l -> {
+            Map<String, Object> m = new java.util.HashMap<>(3);
+            m.put("className", l.getClassName());
+            m.put("x", l.getX());
+            m.put("y", l.getY());
+            return m;
+        }).collect(java.util.stream.Collectors.toList());
+
+        String version = layouts.isEmpty() ? null
+                : layouts.get(0).getComputedAt().toString();
+
+        Map<String, Object> result = new java.util.HashMap<>(2);
+        result.put("layoutVersion", version);
+        result.put("nodes", nodes);
+        return ApiResponse.ok(result);
+    }
+
     @GetMapping("/{id}/file-tree")
     public ApiResponse<List<Map<String, Object>>> getFileTree(@PathVariable Long id) {
         var repo = repositoryRepo.findById(id).orElse(null);
         if (repo == null) return ApiResponse.error("NOT_FOUND", "仓库不存在", "");
-
-        // 读取用户配置的包前缀，只展示属于本项目的业务类
-        String prefixRaw = repoConfigRepo.findByRepoIdAndConfigKey(id, "analyze.package.prefix")
-                .map(c -> c.getConfigValue())
-                .orElse(null);
-        List<String> packagePrefixes = new java.util.ArrayList<>();
-        if (prefixRaw != null && !prefixRaw.isBlank()) {
-            for (String p : prefixRaw.split("[,;\\s]+")) {
-                String t = p.trim();
-                if (!t.isEmpty()) packagePrefixes.add(t);
-            }
-        }
-
-        // 从 chunks 数据推断每个 jarNum 的模块名
-        // 策略：按 jarNum 分组，取该组类名中最常见的顶层包段作为模块名
-        Map<Integer, String> jarNameMap = new java.util.HashMap<>();
-        Map<Integer, Map<String, Integer>> jarPkgCount = new java.util.HashMap<>();
-        for (ChunkEntity chunk : repoDataStore.get(id).chunkMap.values()) {
-            Integer jn = chunk.getJarNum();
-            if (jn == null) continue;
-            String cn = chunk.getClassName();
-            if (cn == null) continue;
-            // 取类名的倒数第2段（通常是 module 特征段，如 tla.base / tla.consumer）
-            String[] segs = cn.split("\\.");
-            String key = segs.length >= 4 ? segs[segs.length - 3] + "." + segs[segs.length - 2] : (segs.length >= 3 ? segs[segs.length - 2] : cn);
-            jarPkgCount.computeIfAbsent(jn, k -> new java.util.HashMap<>()).merge(key, 1, Integer::sum);
-        }
-        jarPkgCount.forEach((jn, pkgMap) -> {
-            // 取出现最多的包段作为模块名
-            String bestPkg = pkgMap.entrySet().stream()
-                .max(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey)
-                .orElse("module-" + jn);
-            jarNameMap.put(jn, bestPkg);
-        });
-
-        Map<String, Map<String, Object>> classMap = new java.util.LinkedHashMap<>();
-        for (ChunkEntity chunk : repoDataStore.get(id).chunkMap.values()) {
-            String cn = chunk.getClassName();
-            if (cn == null || cn.isBlank()) continue;
-
-            // 如果配置了包前缀，只显示前缀匹配的类（本项目业务代码）
-            if (!packagePrefixes.isEmpty() && packagePrefixes.stream().noneMatch(cn::startsWith)) continue;
-
-            // 跳过匿名内部类 $1, $2（目录结构不展示，但调用链保留）
-            if (cn.matches(".*\\$\\d+$")) continue;
-            // 跳过所有命名内部类（$ChapterStat 等，属于外部类的一部分）
-            if (cn.contains("$")) continue;
-            // 跳过 gRPC 生成类（工厂类、Stub、MethodHandlers 等）
-            if (com.adrninistrator.javacg2.platform.util.GrpcNoiseFilter.isGrpcNoiseClass(cn)) continue;
-            // 跳过 proto 生成包
-            String pkg = chunk.getPackageName() != null ? chunk.getPackageName() : "";
-            if (pkg.contains(".api.client.model") || pkg.contains(".api.client.service")
-                    || pkg.contains(".api.grpc.model") || pkg.contains(".proto.")) continue;
-
-            // 用 className + jarNum 作为唯一键，区分多 module 同名类
-            String uniqueKey = cn + "#" + (chunk.getJarNum() != null ? chunk.getJarNum() : 0);
-            final String finalPkg = pkg;
-            final Integer jarNum = chunk.getJarNum();
-            final String jarName = jarNameMap.getOrDefault(jarNum != null ? jarNum : 0, "module-" + (jarNum != null ? jarNum : 0));
-            classMap.compute(uniqueKey, (k, v) -> {
-                if (v == null) {
-                    v = new java.util.LinkedHashMap<>();
-                    v.put("className", cn);
-                    v.put("packageName", finalPkg);
-                    v.put("filePath", chunk.getFilePath());
-                    v.put("jarNum", jarNum != null ? jarNum : 0);
-                    v.put("jarName", jarName);
-                    v.put("methodCount", 0);
-                }
-                v.put("methodCount", (int) v.get("methodCount") + 1);
-                return v;
-            });
-        }
-
-        return ApiResponse.ok(new ArrayList<>(classMap.values()));
+        return ApiResponse.ok(repositoryQueryService.getFileTree(id));
     }
 }

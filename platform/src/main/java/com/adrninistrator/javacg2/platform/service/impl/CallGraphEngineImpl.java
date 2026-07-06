@@ -94,9 +94,9 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         com.adrninistrator.javacg2.platform.service.RepoDataStore.RepoData cache = repoDataStore.get(repoId);
         logger.info("[调用树] 使用内存缓存 repoId={}, 调用边={}, 边界={}, chunk={}",
                 repoId,
-                cache.callGraphMap.values().stream().mapToInt(List::size).sum(),
-                cache.boundaryMap.values().stream().mapToInt(List::size).sum(),
-                cache.chunkMap.size());
+                cache.callGraphMap().values().stream().mapToInt(List::size).sum(),
+                cache.boundaryMap().values().stream().mapToInt(List::size).sum(),
+                cache.chunkMap().size());
 
         // 先构建调用树（ambiguous 字段初始为 false）
         CallTreeNodeDTO root = buildNodeLazy(repoId, entryMethod, packagePrefixes,
@@ -212,16 +212,10 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                 .filter(c -> !isBoilerplate(c.getCalleeMethod()))
                 .filter(c -> packagePrefixes.isEmpty() || packagePrefixes.stream().anyMatch(p -> c.getCalleeMethod().startsWith(p)))
                 .collect(Collectors.toList());
-        
-        // 调试日志
-        if (fullMethod.contains("queryClassProgressInfo")) {
-            logger.info("[调用树构建] {} 的子调用数: {}", fullMethod, callees.size());
-            callees.forEach(c -> logger.info("  - {} ({})", c.getCalleeMethod(), c.getCallType()));
-        }
 
         // 接口/抽象方法桥接：自身无下游调用边时，接到实现类的同签名方法继续展开
         List<String> implTargets = callees.isEmpty()
-                ? resolveImplementations(repoId, fullMethod).stream()
+                ? resolveImplementations(repoId, fullMethod, cache).stream()
                     .filter(m -> packagePrefixes.isEmpty() || packagePrefixes.stream().anyMatch(m::startsWith))
                     .collect(Collectors.toList())
                 : List.of();
@@ -381,7 +375,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             }
             // 接口/抽象方法桥接：自身无下游调用边时，接到实现类的同签名方法继续遍历
             if (callees.isEmpty()) {
-                for (String impl : resolveImplementations(repoId, fullMethod)) {
+                for (String impl : resolveImplementations(repoId, fullMethod, cache)) {
                     if ((packagePrefixes.isEmpty() || packagePrefixes.stream().anyMatch(impl::startsWith))
                             && !seen.contains(impl)) {
                         stack.push(impl);
@@ -411,34 +405,36 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         // --- 全量计算 ---
 
         // 2. 统计每个 repo 的方法总数（chunk 表），精确 fullMethod -> repoId 索引
+        //    直接用 RepoDataStore 缓存，避免全表 findAll()
         Map<Long, Integer> repoMethodCount = new HashMap<>();
         Map<String, Long> chunkMethodToRepo = new HashMap<>();
-        chunkRepo.findAll().forEach(c -> {
-            repoMethodCount.merge(c.getRepoId(), 1, Integer::sum);
-            chunkMethodToRepo.merge(c.getFullMethod(), c.getRepoId(), (a, b) -> a.equals(b) ? a : -1L);
-        });
+        for (RepositoryEntity r : repos) {
+            repoDataStore.get(r.getId()).chunkMap().values().forEach(c -> {
+                repoMethodCount.merge(c.getRepoId(), 1, Integer::sum);
+                chunkMethodToRepo.merge(c.getFullMethod(), c.getRepoId(), (a, b) -> a.equals(b) ? a : -1L);
+            });
+        }
 
         // 3. 入口点索引（用于 P1 精确匹配 + 包前缀提取）
         Map<String, Map<Long, ApiEndpointEntity>> epByMethodAndRepo = new HashMap<>();
         Map<Long, Integer> repoEntryCount = new HashMap<>();
-        // 从 entry points 提取每个 repo 的专属包前缀（entry points 一定是该 repo 自己写的类，不含共享 proto jar）
-        // repoId -> Set<包前缀3段>
         Map<Long, Map<String, Integer>> repoPkgCountFromEp = new HashMap<>();
-        apiEndpointRepo.findAll().forEach(ep -> {
-            epByMethodAndRepo.computeIfAbsent(ep.getFullMethod(), k -> new HashMap<>())
-                    .put(ep.getRepoId(), ep);
-            repoEntryCount.merge(ep.getRepoId(), 1, Integer::sum);
-            // 取 entry point 类名前3段作为候选包前缀
-            String cls = ep.getClassName();
-            if (cls != null) {
-                String[] parts = cls.split("\\.");
-                if (parts.length >= 3) {
-                    String prefix = parts[0] + "." + parts[1] + "." + parts[2];
-                    repoPkgCountFromEp.computeIfAbsent(ep.getRepoId(), k -> new HashMap<>())
-                            .merge(prefix, 1, Integer::sum);
+        for (RepositoryEntity r : repos) {
+            repoDataStore.get(r.getId()).endpointMap().values().forEach(ep -> {
+                epByMethodAndRepo.computeIfAbsent(ep.getFullMethod(), k -> new HashMap<>())
+                        .put(ep.getRepoId(), ep);
+                repoEntryCount.merge(ep.getRepoId(), 1, Integer::sum);
+                String cls = ep.getClassName();
+                if (cls != null) {
+                    String[] parts = cls.split("\\.");
+                    if (parts.length >= 3) {
+                        String prefix = parts[0] + "." + parts[1] + "." + parts[2];
+                        repoPkgCountFromEp.computeIfAbsent(ep.getRepoId(), k -> new HashMap<>())
+                                .merge(prefix, 1, Integer::sum);
+                    }
                 }
-            }
-        });
+            });
+        }
         // 每个 repo 选 entry points 中出现最多的包前缀作为该 repo 的专属包前缀
         Map<Long, String> repoDominantPrefix = new HashMap<>();
         repoPkgCountFromEp.forEach((repoId, pkgMap) ->
@@ -451,17 +447,17 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         repoDominantPrefix.forEach((repoId, prefix) -> prefixToRepo.put(prefix, repoId));
         logger.info("[拓扑图] repo专属包前缀(来自entry points): {}", repoDominantPrefix);
 
-        // 4. 扫描调用图，识别跨库调用（三级优先级）：
-        //    P1: callee 是另一个库注册的 apiEndpoint 入口点（精确）
-        //    P2: callee 在 chunk 表中唯一归属另一个库（精确，处理非入口点方法）
-        //    P3: callee 类名包前缀匹配另一个库的专属包前缀（处理 gRPC stub/proto 生成类等）
+        // 4. 扫描调用图，识别跨库调用（三级优先级）。
+        //    直接用各仓库的 RepoDataStore 缓存，避免全表 findAll()
         Map<String, long[]> repoPairCount = new LinkedHashMap<>();
         Map<String, Map<String, long[]>> repoPairMethodMap = new LinkedHashMap<>();
 
-        callGraphRepo.findAll().stream()
+        for (RepositoryEntity r : repos) {
+            repoDataStore.get(r.getId()).callGraphMap().values().stream()
+                .flatMap(List::stream)
                 .filter(c -> c.getEnabled() != null && c.getEnabled())
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
-                .filter(c -> !isBoilerplate(c.getCalleeMethod()))   // 全局过滤样板/噪点方法
+                .filter(c -> !isBoilerplate(c.getCalleeMethod()))
                 .forEach(c -> {
                     Long fromRepo = c.getRepoId();
                     String callee = c.getCalleeMethod();
@@ -509,6 +505,7 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                         }
                     }
                 });
+        }
 
         // 5. 统计每个 repo 被其他仓库调用的方法数（exposed）
         Map<Long, Set<String>> exposedMethodSets = new HashMap<>();
@@ -595,66 +592,36 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         return types.isEmpty() ? "RPC" : types.iterator().next();
     }
 
-    /** 读取仓库级包前缀配置（analyze.package.prefix，支持逗号/分号/空白分隔的多个前缀）。 */
+    /** 读取仓库级包前缀配置（走 RepoDataStore 缓存，避免每次打 DB）。 */
     private List<String> loadPackagePrefixes(Long repoId) {
-        String raw = repoConfigRepo.findByRepoIdAndConfigKey(repoId, "analyze.package.prefix")
-                .map(c -> c.getConfigValue())
-                .filter(s -> s != null && !s.isBlank())
-                .orElse(null);
-        List<String> prefixes = new ArrayList<>();
-        if (raw != null) {
-            for (String p : raw.split("[,;\\s]+")) {
-                String trimmed = p.trim();
-                if (!trimmed.isEmpty()) prefixes.add(trimmed);
-            }
-        }
-        return prefixes;
+        return repoDataStore.getPackagePrefixes(repoId);
     }
 
-    /** 过滤构造方法、setter/getter、gRPC 生成类噪点方法等非业务方法 */
+    /** 过滤构造方法、setter/getter、gRPC 生成类噪点方法等非业务方法（委托 CallFilter） */
     private boolean isBoilerplate(String calleeMethod) {
-        if (calleeMethod.contains(":<init>(") || calleeMethod.contains(":<clinit>(")) return true;
-        String methodName = extractMethodName(calleeMethod);
-        if ("equals".equals(methodName) || "hashCode".equals(methodName) || "toString".equals(methodName)) return true;
-
-        // gRPC 噪点（工具类统一判断）
-        if (GrpcNoiseFilter.isGrpcNoise(calleeMethod)) return true;
-
-        // 仅按签名特征识别真正的访问器，避免误杀 getDetail(Long)/getById(Long) 这类业务方法：
-        // 真正的 getter/is 访问器是无参的 getXxx()/isXxx()；真正的 setter 是单参的 setXxx(one)。
-        String params = extractParams(calleeMethod);
-        if (params == null) return false;
-        boolean noArg = params.isEmpty();
-        boolean singleArg = !noArg && !params.contains(",");
-        if (noArg && (methodName.startsWith("get") || methodName.startsWith("is"))) return true;
-        if (singleArg && methodName.startsWith("set")) return true;
-        return false;
-    }
-
-    /** 提取方法签名括号内的入参字符串；无括号返回 null，无参返回 "" */
-    private String extractParams(String fullMethod) {
-        int open = fullMethod.indexOf('(');
-        int close = fullMethod.lastIndexOf(')');
-        if (open < 0 || close < open) return null;
-        return fullMethod.substring(open + 1, close).trim();
+        return com.adrninistrator.javacg2.platform.util.CallFilter.isBoilerplateMethod(calleeMethod);
     }
 
     /**
-     * 接口/抽象方法 → 实现方法桥接。
-     * Java 中接口方法必有实现类实现（除非空体），但调用边只记录到接口（callType=INT/ITF），
-     * 实现关系单独以 IMPLEMENTS/EXTENDS 边（类级）存储，实现体的下游 caller 是「实现类:方法」。
-     * 本方法用实现关系把接口节点接到实现类的同签名方法，使调用链能继续往下展开。
-     *
-     * @return 真实存在的实现方法 fullMethod 列表（无实现/空体则为空）
+     * 接口/抽象方法 → 实现方法桥接（无 cache 参数时按需从 RepoDataStore 获取）。
      */
     private List<String> resolveImplementations(Long repoId, String interfaceFullMethod) {
+        return resolveImplementations(repoId, interfaceFullMethod, repoDataStore.get(repoId));
+    }
+
+    /**
+     * 接口/抽象方法 → 实现方法桥接（使用已有缓存，避免重复 DB 查询）。
+     * 用 calleeIndex 找 IMPLEMENTS/EXTENDS 边，用缓存判断方法体是否存在。
+     */
+    private List<String> resolveImplementations(Long repoId, String interfaceFullMethod,
+            com.adrninistrator.javacg2.platform.service.RepoDataStore.RepoData cache) {
         int colonIdx = interfaceFullMethod.lastIndexOf(':');
         if (colonIdx <= 0) return List.of();
         String interfaceClass = interfaceFullMethod.substring(0, colonIdx);
         String methodSig = interfaceFullMethod.substring(colonIdx + 1);
 
-        // 查谁 IMPLEMENTS/EXTENDS 了该接口/抽象类（这些边里 callee=接口类名、caller=子类名）
-        List<CallGraphEntity> relations = callGraphRepo.findByRepoIdAndCalleeMethod(repoId, interfaceClass).stream()
+        // 用反向索引找谁 IMPLEMENTS/EXTENDS 了该接口/抽象类（calleeIndex：callee=接口类名）
+        List<CallGraphEntity> relations = cache.getCallers(interfaceClass).stream()
                 .filter(c -> "IMPLEMENTS".equals(c.getCallType()) || "EXTENDS".equals(c.getCallType()))
                 .collect(Collectors.toList());
         if (relations.isEmpty()) return List.of();
@@ -665,9 +632,9 @@ public class CallGraphEngineImpl implements CallGraphEngine {
             String implClass = rel.getCallerMethod();
             String candidate = implClass + ":" + methodSig;
             if (!seen.add(candidate)) continue;
-            // 仅保留真实存在且有方法体的实现：实现体作为 caller 出现过，或 chunk 表有定义
-            boolean hasBody = !callGraphRepo.findByRepoIdAndCallerMethod(repoId, candidate).isEmpty()
-                    || chunkRepo.findByRepoIdAndFullMethod(repoId, candidate).isPresent();
+            // 用缓存判断实现体是否存在（替代两次 DB 查询）
+            boolean hasBody = !cache.getCallees(candidate).isEmpty()
+                    || cache.getChunk(candidate) != null;
             if (hasBody) impls.add(candidate);
         }
         return impls;
@@ -688,7 +655,8 @@ public class CallGraphEngineImpl implements CallGraphEngine {
                                 Set<String> visited, List<CallerDTO> result) {
         if (depth > maxDepth || result.size() >= MAX_TOTAL_NODES) return;
 
-        List<CallGraphEntity> edges = callGraphRepo.findByRepoIdAndCalleeMethod(repoId, fullMethod).stream()
+        // 使用 RepoDataStore calleeIndex，替代每层递归打一次 DB
+        List<CallGraphEntity> edges = repoDataStore.get(repoId).getCallers(fullMethod).stream()
                 .filter(c -> !"EXTENDS".equals(c.getCallType()) && !"IMPLEMENTS".equals(c.getCallType()))
                 .collect(Collectors.toList());
 
@@ -1345,6 +1313,14 @@ public class CallGraphEngineImpl implements CallGraphEngine {
         String methodPart = fullMethod.substring(colonIdx + 1);
         int parenIdx = methodPart.indexOf('(');
         return parenIdx > 0 ? methodPart.substring(0, parenIdx) : methodPart;
+    }
+
+    /** 提取方法签名括号内的入参字符串；无括号返回 null，无参返回 "" */
+    private String extractParams(String fullMethod) {
+        int open = fullMethod.indexOf('(');
+        int close = fullMethod.lastIndexOf(')');
+        if (open < 0 || close < open) return null;
+        return fullMethod.substring(open + 1, close).trim();
     }
 
     /** 简短引用：ClassSimpleName.methodName */
