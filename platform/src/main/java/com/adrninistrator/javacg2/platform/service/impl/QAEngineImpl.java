@@ -1522,7 +1522,7 @@ public class QAEngineImpl {
 
         // 缓存（仅无历史对话时缓存，带时间戳供 TTL 检查）
         if (history.isEmpty()) {
-            answerCache.put(cacheKey, new CachedAnswer(answer, references));
+            answerCache.put(cacheKey, new CachedAnswer(answer, references, System.currentTimeMillis()));
         }
 
         // 回填摘要：从 AI 回答中提取一句话描述，保存到 chunks 表的 call_summary
@@ -1749,9 +1749,8 @@ public class QAEngineImpl {
     public record MatchedEndpoint(String fullMethod, String className, String methodName,
                                    String endpointType, String httpMethod, String urlPath,
                                    String repoName, int score) {}
-    private record CachedAnswer(String answer, List<String> references) {
+    private record CachedAnswer(String answer, List<String> references, long createdAt) {
         private static final long TTL_MS = 30 * 60 * 1000L;
-        private final long createdAt = System.currentTimeMillis();
         boolean isExpired() { return System.currentTimeMillis() - createdAt > TTL_MS; }
     }
 
