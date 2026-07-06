@@ -10,7 +10,7 @@
 
 ### 1. 调用链分析
 
-从入口点（Controller / MQ 消费者 / 定时任务）出发，图形化展开完整调用树：
+从入口点（Controller / MQ 消费者 / 定时任务 / gRPC 服务）出发，图形化展开完整调用树：
 
 - 支持继承、多态、接口→实现自动桥接、Lambda、Stream 方法引用、线程调用
 - 边界点标注：DB / HTTP / MQ / CACHE / GRPC / TRANSACTION
@@ -32,8 +32,9 @@
 
 基于源码和调用链的智能问答（Claude function calling）：
 
-- 直接输入问题，自动搜索相关接口
-- AI 逐层工具调用（getMethodSource / getCallees / getConstants / getExceptions / getParamClassDef / getImplementations）
+- 直接输入问题，自动语义匹配相关接口
+- 目标驱动工具调用：先用 `getChainOutline` 拿调用链地图，再按需并行深挖
+- 支持工具：`getChainOutline` / `getMethodSource` / `getCallees` / `getCallers` / `getConstants` / `getExceptions` / `getParamClassDef` / `getImplementations` / `getBoundaries`
 - 多态分派解析：自动找到接口的实现类
 - 降噪过滤：自动跳过 getter/setter/日志/工具类
 - 所有结论严格引用源码，不编造
@@ -42,25 +43,47 @@
 
 ## 快速开始
 
-**环境要求**：JDK 17+、Node.js 18+
+**环境要求**：JDK 17+、Node.js 18+、Docker（推荐）
 
-### 启动
+### 方式一：一键启动（推荐）
 
 ```bash
 git clone https://github.com/liangxiaowucai/java-call-graph.git
-cd java-call-graph
+cd java-call-graph/platform
 
-# 1. 构建核心引擎
-./gradlew jar -x test
-
-# 2. 启动后端（另开终端）
-cd platform && ./gradlew bootRun
-
-# 3. 启动前端（另开终端）
-cd platform/frontend && npm install && npm run dev
+./start.sh
 ```
 
-访问 http://localhost:5173
+`start.sh` 会自动完成环境检查、启动 PostgreSQL + Qdrant 容器、编译后端、启动前端。
+
+访问 http://localhost:5173（前端）| http://localhost:8080（后端 API）
+
+### 方式二：Docker Compose 部署
+
+```bash
+cd platform
+docker compose up -d
+```
+
+包含服务：`app`（后端 + 前端静态资源）、`postgres`、`qdrant`、`ollama`（可选）。
+
+### 方式三：手动启动
+
+```bash
+# 1. 启动 PostgreSQL（本地或 Docker）
+docker run -d --name javacg2-postgres \
+  -e POSTGRES_DB=javacg2 -e POSTGRES_USER=javacg2 -e POSTGRES_PASSWORD=javacg2 \
+  -p 5432:5432 postgres:16-alpine
+
+# 2. 构建核心引擎
+./gradlew jar -x test
+
+# 3. 启动后端
+cd platform && ./gradlew bootRun
+
+# 4. 启动前端（另开终端）
+cd platform/frontend && npm install && npm run dev
+```
 
 ### 配置 AI 模型
 
@@ -68,12 +91,27 @@ cd platform/frontend && npm install && npm run dev
 
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
-| Claude API 地址 | 对话模型 API | `https://api.anthropic.com` |
+| Claude API 地址 | 对话模型 API | `https://api.anthropic.com` 或 AWS Bedrock 代理 |
 | Claude API Key | 密钥 | `sk-ant-xxxx` |
-| Embedding API 地址 | 向量模型（可选） | `https://api.openai.com` |
-| Embedding API Key | 密钥（可选） | `sk-xxxx` |
+| Claude 模型 | 模型名称 | `claude-sonnet-4-20250514` |
+| Embedding API 地址 | 向量模型（可选，默认 Ollama） | `http://localhost:11434` |
+| Embedding 模型 | 向量模型名（可选） | `nomic-embed-text` |
 
-> 不配置 AI 模型不影响调用链分析，只影响 AI 问答和调用链追踪的 AI 报告。
+> 不配置 AI 模型不影响调用链分析，只影响 AI 问答和调用链追踪的 AI 分析报告。
+
+#### 环境变量覆盖（Docker / 生产环境）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DB_HOST` | `localhost` | PostgreSQL 地址 |
+| `DB_PORT` | `5432` | PostgreSQL 端口 |
+| `DB_NAME` | `javacg2` | 数据库名 |
+| `DB_USER` | `javacg2` | 数据库用户 |
+| `DB_PASS` | `javacg2` | 数据库密码 |
+| `EMBEDDING_URL` | `http://localhost:11434` | Embedding API 地址 |
+| `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding 模型名 |
+| `EMBEDDING_DIMENSIONS` | `768` | 向量维度 |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant 地址 |
 
 ---
 
@@ -155,10 +193,11 @@ cd platform/frontend && npm install && npm run dev
 | 层 | 技术 |
 |----|------|
 | 静态分析 | Apache BCEL（java-callgraph2 核心） |
-| 后端 | Spring Boot 3.3、Spring AI MCP、JPA、H2 |
+| 后端 | Spring Boot 3.3、Spring AI MCP、JPA、PostgreSQL |
 | 前端 | React 18、TypeScript、Vite、AntV G6 |
-| AI | Claude function calling、OpenAI Embedding |
+| AI | Claude function calling、Embedding（Ollama / OpenAI） |
 | 向量数据库 | Qdrant（可选，不装则降级为关键词匹配） |
+| 容器化 | Docker、Docker Compose、多阶段构建 |
 
 ---
 
