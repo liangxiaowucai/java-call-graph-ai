@@ -1,4 +1,4 @@
-import { createContext, useContext, useState } from 'react';
+import { createContext, useContext } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
 import { Layout, Menu } from 'antd';
 import {
@@ -14,11 +14,9 @@ import CallGraph from './pages/CallGraph';
 import QAChat from './pages/QAChat';
 import Settings from './pages/Settings';
 import RequestChainAnalyzer from './pages/RequestChainAnalyzer';
-import RepoTopology from './pages/RepoTopology';
 import ImpactAnalysis from './pages/ImpactAnalysis';
 import ReleaseDoc from './pages/ReleaseDoc';
 // import OperationLogPanel from './components/OperationLogPanel';
-// import { useOperationLog, type LogEntry } from './hooks/useOperationLog';
 
 const { Sider, Content } = Layout;
 
@@ -66,7 +64,6 @@ function AppLayout() {
               <Route path="/repos" element={<RepoManager />} />
               <Route path="/callgraph" element={<CallGraph />} />
               <Route path="/release-doc" element={<ReleaseDoc />} />
-              <Route path="/topology" element={<RepoTopology />} />
               <Route path="/request-analyzer" element={<RequestChainAnalyzer />} />
               <Route path="/qa" element={<QAChat />} />
               <Route path="/settings" element={<Settings />} />
@@ -82,7 +79,7 @@ function AppLayout() {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <Routes>
         {/* 独立全屏页（无侧边栏） */}
         <Route path="/impact" element={<ImpactAnalysis />} />

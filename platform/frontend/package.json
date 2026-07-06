@@ -15,6 +15,7 @@
     "@types/cytoscape": "3.21.9",
     "@types/cytoscape-dagre": "2.3.4",
     "@types/prismjs": "^1.26.6",
+    "@types/react-syntax-highlighter": "^15.5.13",
     "antd": "^5.29.3",
     "axios": "^1.15.0",
     "cytoscape": "3.34.0",
@@ -25,6 +26,8 @@
     "react-dom": "^18.2.0",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^6.30.3",
+    "react-syntax-highlighter": "^16.1.1",
+    "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {

@@ -283,6 +283,44 @@ export async function saveClaudeConfig(config: ClaudeConfig): Promise<void> {
   if (!res.data.success) throw new Error(res.data.error?.message ?? '保存失败');
 }
 
+export interface PromptDef {
+  key: string;
+  label: string;
+  description: string;
+  defaultText: string;
+  value?: string | null;   // null 表示使用默认
+  customized: boolean;
+}
+
+export async function fetchPrompts(): Promise<PromptDef[]> {
+  const res = await api.get<ApiResponse<PromptDef[]>>('/config/prompts');
+  return res.data.data;
+}
+
+export async function savePrompt(key: string, value: string): Promise<void> {
+  const res = await api.put<ApiResponse<string>>('/config/prompts', { key, value });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '保存失败');
+}
+
+// ── 发布文档：文件 diff ────────────────────────────────────────────────────
+export interface FileDiffResult {
+  repo: string;
+  path: string;
+  diff: string;
+  additions: number;
+  deletions: number;
+}
+
+export async function fetchReleaseFileDiff(
+  repoId: number, filePath: string, baseBranch: string, branch: string,
+): Promise<FileDiffResult> {
+  const res = await api.post<ApiResponse<FileDiffResult>>('/release-doc/file-diff', {
+    repoId, filePath, baseBranch, branch,
+  });
+  if (!res.data.success) throw new Error(res.data.error?.message ?? '获取 diff 失败');
+  return res.data.data;
+}
+
 export interface EmbeddingConfig {
   apiUrl?: string;
   apiKey?: string;
@@ -1039,6 +1077,7 @@ export interface FileTreeItem {
   filePath: string;
   methodCount: number;
   jarNum: number;
+  jarName: string;
 }
 
 export async function fetchFileTree(repoId: number): Promise<FileTreeItem[]> {
@@ -1050,6 +1089,18 @@ export async function fetchFileTree(repoId: number): Promise<FileTreeItem[]> {
 export interface ClassEdge {
   source: string;
   target: string;
+  type?: 'call' | 'import';
+}
+
+export interface GraphLayout {
+  layoutVersion: string | null;
+  nodes: { className: string; x: number; y: number }[];
+}
+
+export async function fetchGraphLayout(repoId: number): Promise<GraphLayout> {
+  const res = await api.get<ApiResponse<GraphLayout>>(`/repos/${repoId}/graph-layout`);
+  if (!res.data.success) return { layoutVersion: null, nodes: [] };
+  return res.data.data ?? { layoutVersion: null, nodes: [] };
 }
 
 export async function fetchClassEdges(repoId: number): Promise<ClassEdge[]> {

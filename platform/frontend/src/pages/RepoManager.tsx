@@ -520,62 +520,68 @@ export default function RepoManager() {
     {
       title: '操作',
       key: 'actions',
-      width: 360,
+      width: 200,
       fixed: 'right',
       render: (_, record) => {
         const busy = record.status === 'ANALYZING' || record.status === 'BUILDING' || record.status === 'QUEUED';
+        const moreItems = [
+          { key: 'pull',   label: '拉取代码',  icon: <SyncOutlined /> },
+          { key: 'logs',   label: '查看日志',  icon: <FileTextOutlined /> },
+          { key: 'jars',   label: 'jar 列表',  icon: <ContainerOutlined /> },
+          { key: 'upload', label: '上传 jar',  icon: <UploadOutlined /> },
+          { key: 'config', label: '配置',      icon: <SettingOutlined /> },
+          ...(record.status === 'ERROR' || busy
+            ? [{ key: 'reset', label: '重置状态', icon: <UndoOutlined />, danger: true }]
+            : []),
+        ];
+
+        const onMore = async ({ key }: { key: string }) => {
+          if (key === 'pull')   { await handlePull(record.id); }
+          if (key === 'logs')   { showLogs(record.id); }
+          if (key === 'jars')   { showJars(record.id, record.name); }
+          if (key === 'upload') { setUploadRepoId(record.id); uploadFilesRef.current = []; setUploadModalOpen(true); }
+          if (key === 'config') { openConfigModal(record.id, record.name); }
+          if (key === 'reset')  { await resetRepo(record.id); message.success('已重置'); load(); }
+        };
+
         return (
-        <Space size={4} wrap>
-          <Button size="small" icon={<SyncOutlined />} loading={!!actionLoading[`pull-${record.id}`]} onClick={() => handlePull(record.id)} disabled={busy}>拉取</Button>
-          <Dropdown.Button
-            size="small"
-            type="primary"
-            loading={!!actionLoading[`analyze-${record.id}`]}
-            disabled={busy}
-            onClick={() => handleAnalyze(record.id)}
-            menu={{
-              items: [
-                { key: 'rebuild', label: '重新编译+分析', icon: <SyncOutlined /> },
-              ],
-              onClick: ({ key }) => {
-                if (key === 'rebuild') handleAnalyze(record.id, true);
-              },
-            }}
-            icon={<DownOutlined />}
-          >
-            <ThunderboltOutlined /> 分析
-          </Dropdown.Button>
-          <Button size="small" icon={<FileTextOutlined />} onClick={() => showLogs(record.id)}>日志</Button>
-          <Button size="small" icon={<ContainerOutlined />} onClick={() => showJars(record.id, record.name)}>jar列表</Button>
-          <Button size="small" icon={<UploadOutlined />} onClick={() => { setUploadRepoId(record.id); uploadFilesRef.current = []; setUploadModalOpen(true); }}>上传jar</Button>
-          <Button size="small" icon={<SettingOutlined />} onClick={() => openConfigModal(record.id, record.name)}>配置</Button>
-          <Button size="small" icon={<EditOutlined />} onClick={async () => { 
-            setEditingRepo(record); 
-            
-            // 加载包前缀配置
-            let packagePrefixValue = '';
-            try {
-              const configs = await fetchRepoConfigs(record.id);
-              const packagePrefixConfig = configs.find(c => c.configKey === 'analyze.package.prefix');
-              packagePrefixValue = packagePrefixConfig?.configValue || '';
-            } catch (err) {
-              console.error('加载包前缀配置失败:', err);
-            }
-            
-            editForm.setFieldsValue({ 
-              name: record.name || '',
-              gitUrl: record.gitUrl || '',
-              branch: record.branch || '',
-              packagePrefix: packagePrefixValue,
-              urlPathIdentifier: record.urlPathIdentifier || '' 
-            }); 
-            setEditModalOpen(true); 
-          }}>编辑</Button>
-          {(record.status === 'ERROR' || busy) && (
-            <Button size="small" icon={<UndoOutlined />} onClick={async () => { await resetRepo(record.id); message.success('已重置'); load(); }}>重置</Button>
-          )}
-          <Button size="small" danger icon={<DeleteOutlined />} onClick={() => handleDelete(record.id, record.name)} disabled={busy}>删除</Button>
-        </Space>
+          <Space size={4}>
+            <Dropdown.Button
+              size="small"
+              type="primary"
+              loading={!!actionLoading[`analyze-${record.id}`]}
+              disabled={busy}
+              onClick={() => handleAnalyze(record.id)}
+              menu={{
+                items: [{ key: 'rebuild', label: '重新编译+分析', icon: <SyncOutlined /> }],
+                onClick: ({ key }) => { if (key === 'rebuild') handleAnalyze(record.id, true); },
+              }}
+              icon={<DownOutlined />}
+            >
+              <ThunderboltOutlined /> 分析
+            </Dropdown.Button>
+            <Button size="small" icon={<EditOutlined />} onClick={async () => {
+              setEditingRepo(record);
+              let packagePrefixValue = '';
+              try {
+                const configs = await fetchRepoConfigs(record.id);
+                const pc = configs.find(c => c.configKey === 'analyze.package.prefix');
+                packagePrefixValue = pc?.configValue || '';
+              } catch { /* ignore */ }
+              editForm.setFieldsValue({
+                name: record.name || '',
+                gitUrl: record.gitUrl || '',
+                branch: record.branch || '',
+                packagePrefix: packagePrefixValue,
+                urlPathIdentifier: record.urlPathIdentifier || '',
+              });
+              setEditModalOpen(true);
+            }}>编辑</Button>
+            <Button size="small" danger icon={<DeleteOutlined />} onClick={() => handleDelete(record.id, record.name)} disabled={busy}>删除</Button>
+            <Dropdown menu={{ items: moreItems, onClick: onMore }} trigger={['click']}>
+              <Button size="small" icon={<DownOutlined />} />
+            </Dropdown>
+          </Space>
         );
       },
     },

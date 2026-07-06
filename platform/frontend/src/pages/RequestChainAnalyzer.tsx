@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Card, Button, Input, message, Spin, Tag, Typography, Space, Upload, Collapse, Tabs, Modal, Descriptions } from 'antd';
-import { ThunderboltOutlined, CopyOutlined, UploadOutlined, WarningOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
+import { Card, Button, Input, message, Spin, Tag, Typography, Space, Upload, Collapse, Modal, Descriptions } from 'antd';
+import { ThunderboltOutlined, CopyOutlined, UploadOutlined, WarningOutlined } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
 import JavaCodeViewer from '../components/JavaCodeViewer';
 import axios from 'axios';
@@ -12,7 +12,7 @@ import 'prismjs/components/prism-java';
 import '../markdown.css';
 
 const { TextArea } = Input;
-const { Title, Text, Paragraph } = Typography;
+const { Text, Paragraph } = Typography;
 
 // 初始化 Mermaid
 mermaid.initialize({
@@ -219,52 +219,6 @@ function CallChainTreeView({ node, depth = 0, repoId, onJump }: { node: any; dep
   );
 }
 
-// 调用链方法源码查看器：展开某方法时按需从后端拉取完整源码
-function MethodSourceViewer({ repoId, methods }: { repoId: number; methods: { fullMethod: string; label: string; callType: string }[] }) {
-  const [sources, setSources] = useState<Record<string, string>>({});
-  const [loadingKey, setLoadingKey] = useState<string | null>(null);
-
-  const loadSource = async (fm: string) => {
-    if (sources[fm] !== undefined) return;
-    setLoadingKey(fm);
-    try {
-      const resp = await axios.get(`/api/repos/${repoId}/source`, { params: { method: fm } });
-      const src = resp.data?.data ?? resp.data;
-      setSources((prev) => ({ ...prev, [fm]: typeof src === 'string' ? src : JSON.stringify(src) }));
-    } catch {
-      setSources((prev) => ({ ...prev, [fm]: '// 未找到源码（接口/抽象方法或第三方库方法）' }));
-    } finally {
-      setLoadingKey(null);
-    }
-  };
-
-  return (
-    <Collapse
-      accordion
-      onChange={(key) => {
-        const k = Array.isArray(key) ? key[0] : key;
-        if (k) loadSource(String(k));
-      }}
-      items={methods.map((m) => ({
-        key: m.fullMethod,
-        label: (
-          <span style={{ fontFamily: 'monospace', fontSize: 12 }}>
-            {m.label}
-            {m.callType && <Tag style={{ marginLeft: 8 }}>{m.callType}</Tag>}
-          </span>
-        ),
-        children: loadingKey === m.fullMethod
-          ? <Spin size="small" />
-          : (
-            sources[m.fullMethod]
-              ? <JavaCodeViewer code={sources[m.fullMethod]} maxHeight="420px" />
-              : <div style={{ color: '#999', fontSize: 12, padding: 8 }}>展开以加载源码…</div>
-          ),
-      }))}
-    />
-  );
-}
-
 export default function RequestChainAnalyzer() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -322,7 +276,7 @@ export default function RequestChainAnalyzer() {
   }, [result]);
 
   // 自定义代码块渲染器：mermaid 渲染图，其它语言用 Prism 高亮
-  const renderCodeBlock = ({ inline, className, children, ...props }: any) => {
+  const renderCodeBlock = ({ inline, className, children }: any) => {
     const match = /language-(\w+)/.exec(className || '');
     const language = match ? match[1] : '';
     const value = String(children).replace(/\n$/, '');
@@ -572,135 +526,6 @@ export default function RequestChainAnalyzer() {
     }
   };
 
-  // 生成交互式时序图
-  const generateInteractiveMermaid = (call: ApiCall): string => {
-    const lines = ['sequenceDiagram'];
-    lines.push('    participant Client as 客户端');
-    
-    if (!call.callTree || !call.callTree.root) {
-      const controllerName = call.method?.split(':')[0]?.split('.').pop() || 'API';
-      lines.push(`    participant API as ${controllerName}`);
-      lines.push(`    Client->>+API: ${call.requestMethod || 'GET'} ${call.url?.split('?')[0] || ''}`);
-      lines.push(`    API-->>-Client: ${call.status}`);
-      return lines.join('\n');
-    }
-
-    const participants = new Map<string, string>();
-    const sequence: string[] = [];
-    let participantId = 0;
-    const boundaryMap = new Map<string, any[]>();
-
-    // 折叠接口→实现桥接：当节点只有 1 个同名子节点且子边是接口分发(_ITF/IMPL/INT)时，
-    // 合并为实现节点，消除时序图里重复的同名 participant（如 Service 接口 + ServiceImpl）
-    const collapseBridges = (node: any): any => {
-      if (!node) return node;
-      let n = node;
-      while (n.children && n.children.length === 1) {
-        const child = n.children[0];
-        const sameMethod = (child.methodName || '') === (n.methodName || '');
-        const bridge = ['_ITF', 'IMPL', 'INT'].includes(child.callType);
-        // 合并时把当前节点的边界(如解析出的URL)带到实现节点上，避免丢失
-        if (sameMethod && bridge) {
-          const mergedBoundaries = [...(n.boundaries || []), ...(child.boundaries || [])];
-          n = { ...child, boundaries: mergedBoundaries };
-        } else break;
-      }
-      return { ...n, children: (n.children || []).map(collapseBridges) };
-    };
-
-    const processNode = (node: any, depth: number, parentId: string | null, maxDepth: number = 20) => {
-      if (depth > maxDepth) return;
-
-      const className = node.className || node.fullMethod?.split(':')[0] || 'Unknown';
-      const methodName = node.methodName || node.fullMethod?.split(':')[1]?.split('(')[0] || 'unknown';
-      const shortClassName = className.split('.').pop() || className;
-      const currentId = `P${participantId++}`;
-      
-      participants.set(node.fullMethod, currentId);
-      
-      // 确保 participant 只添加一次
-      const participantLabel = `participant ${currentId} as ${shortClassName}`;
-      if (!lines.includes(participantLabel)) {
-        lines.push(`    ${participantLabel}`);
-      }
-
-      // 收集边界信息
-      if (node.boundaries && node.boundaries.length > 0) {
-        boundaryMap.set(node.fullMethod, node.boundaries);
-      }
-
-      if (parentId) {
-        const boundaries = node.boundaries?.filter((b: any) => 
-          ['HTTP', 'RPC', 'GRPC', 'DB', 'CACHE', 'REDIS', 'MQ'].includes(b.boundaryType)
-        ) || [];
-        
-        // 在方法名后面标注有外部调用
-        let methodLabel = methodName;
-        if (boundaries.length > 0) {
-          const types = boundaries.map((b: any) => getBoundaryIcon(b.boundaryType)).join('');
-          methodLabel = `${methodName}() ${types}`;
-        } else {
-          methodLabel = `${methodName}()`;
-        }
-        
-        sequence.push(`    ${parentId}->>+${currentId}: ${methodLabel}`);
-        
-        if (boundaries.length > 0) {
-          boundaries.forEach((b: any) => {
-            const icon = getBoundaryIcon(b.boundaryType);
-            if (b.boundaryType === 'HTTP' && b.context) {
-              const urlMatch = b.context.match(/📌 URL:\s*(.+)/);
-              if (urlMatch) {
-                const fullUrl = urlMatch[1].trim();
-                // 不截断，完整显示
-                sequence.push(`    Note over ${currentId}: ${icon} ${b.boundaryType}<br/>${fullUrl}`);
-              } else {
-                // 如果没有 URL，显示原始 context
-                const displayText = b.context.split('\n')[0].substring(0, 60);
-                sequence.push(`    Note over ${currentId}: ${icon} ${displayText}`);
-              }
-            } else if (b.boundaryType === 'DB' && b.context) {
-              // DB 调用：显示 SQL 的前40个字符
-              const sql = b.context.split('\n')[0].trim().substring(0, 40);
-              sequence.push(`    Note over ${currentId}: ${icon} ${sql}...`);
-            } else if (b.boundaryType === 'GRPC' && b.context) {
-              // gRPC 调用：显示 proto 服务方法名 + 请求模型类型
-              const grpcMatch = b.context.match(/📡 gRPC:\s*(.+)/);
-              const modelMatch = b.context.match(/📦 请求:\s*(.+)/);
-              if (grpcMatch) {
-                const callLabel = grpcMatch[1].trim();
-                const modelLabel = modelMatch ? `<br/>📦 ${modelMatch[1].trim()}` : '';
-                sequence.push(`    Note over ${currentId}: ${icon} ${callLabel}${modelLabel}`);
-              } else {
-                sequence.push(`    Note over ${currentId}: ${icon} ${b.context.split('\n')[0].substring(0, 60)}`);
-              }
-            } else {
-              sequence.push(`    Note over ${currentId}: ${icon} ${b.boundaryType}`);
-            }
-          });
-        }
-        
-        sequence.push(`    ${currentId}-->>-${parentId}: 返回`);
-      }
-
-      if (node.children && node.children.length > 0) {
-        node.children.slice(0, 5).forEach((child: any) => {
-          processNode(child, depth + 1, currentId, maxDepth);
-        });
-      }
-    };
-
-    const rootNode = collapseBridges(call.callTree.root);
-    processNode(rootNode, 0, null);
-
-    const rootId = participants.get(rootNode.fullMethod) || 'P0';
-    lines.push(`    Client->>+${rootId}: ${call.requestMethod || 'GET'} ${call.url?.split('?')[0] || ''}`);
-    lines.push(...sequence);
-    lines.push(`    ${rootId}-->>-Client: ${call.status}`);
-
-    return lines.join('\n');
-  };
-
   // 提取调用链中所有节点的常量与异常（后端 JSON 结构化数据，带源码引用）
   // node.constants: [{value,line,code,file}]   node.exceptions: [{kind,type,line,code,file}]
   const extractConstantsAndExceptions = (callTree: any) => {
@@ -747,33 +572,6 @@ export default function RequestChainAnalyzer() {
 
     if (callTree && callTree.root) traverse(callTree.root);
     return { constants, exceptions };
-  };
-
-  // 收集调用链上的方法（折叠接口→实现桥接），用于源码查看
-  const collectChainMethods = (callTree: any): { fullMethod: string; label: string; callType: string }[] => {
-    const out: { fullMethod: string; label: string; callType: string }[] = [];
-    const seen = new Set<string>();
-    const collapse = (node: any): any => {
-      let n = node;
-      while (n && n.children && n.children.length === 1) {
-        const child = n.children[0];
-        const sameMethod = (child.methodName || '') === (n.methodName || '');
-        const bridge = ['_ITF', 'IMPL', 'INT'].includes(child.callType);
-        if (sameMethod && bridge) n = child; else break;
-      }
-      return n;
-    };
-    const walk = (node: any, depth: number) => {
-      const n = collapse(node);
-      if (!n || !n.fullMethod || seen.has(n.fullMethod)) return;
-      seen.add(n.fullMethod);
-      const cls = (n.className || n.fullMethod.split(':')[0] || '').split('.').pop();
-      const m = n.methodName || n.fullMethod.split(':')[1]?.split('(')[0] || '';
-      out.push({ fullMethod: n.fullMethod, label: `${'　'.repeat(depth)}${cls}.${m}()`, callType: n.callType || '' });
-      (n.children || []).forEach((c: any) => walk(c, depth + 1));
-    };
-    if (callTree && callTree.root) walk(callTree.root, 0);
-    return out;
   };
 
   // 提取外部依赖信息

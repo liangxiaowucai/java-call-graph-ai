@@ -6,7 +6,8 @@ import {
   fetchMavenConfig, saveMavenConfig, fetchClaudeConfig, saveClaudeConfig,
   fetchEmbeddingConfig, saveEmbeddingConfig,
   fetchGitConfig, saveGitConfig, fetchMcpStatus, fetchMcpServers, createMcpServer, updateMcpServer, deleteMcpServer, testMcpServer,
-  type MavenConfig, type ClaudeConfig, type EmbeddingConfig, type GitConfig, type McpStatus, type McpServerItem,
+  fetchPrompts, savePrompt,
+  type MavenConfig, type ClaudeConfig, type EmbeddingConfig, type GitConfig, type McpStatus, type McpServerItem, type PromptDef,
 } from '../api';
 
 const { Title, Text } = Typography;
@@ -121,6 +122,95 @@ function FileBrowser({ open, onClose, onSelect, filter }: {
   );
 }
 
+// ─── AI Prompt 配置面板 ───────────────────────────────────────────────────────
+
+function PromptConfigPanel() {
+  const [prompts, setPrompts] = useState<PromptDef[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetchPrompts()
+      .then((list) => {
+        setPrompts(list);
+        const d: Record<string, string> = {};
+        list.forEach((p) => { d[p.key] = p.value ?? ''; });
+        setDrafts(d);
+      })
+      .catch(() => message.error('加载 Prompt 失败'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const doSave = async (key: string, value: string, resetHint: boolean) => {
+    setSaving(key);
+    try {
+      await savePrompt(key, value);
+      message.success(resetHint ? '已恢复默认' : '已保存');
+      load();
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : '操作失败');
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  return (
+    <Card>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <Title level={4} style={{ margin: 0 }}>AI Prompt 配置</Title>
+        <Button icon={<ReloadOutlined />} size="small" onClick={load} loading={loading}>刷新</Button>
+      </div>
+      <Text type="secondary" style={{ display: 'block', marginBottom: 16 }}>
+        所有 AI 使用的系统 prompt 集中在此管理。留空则使用内置默认值，填写后覆盖默认；保存后即时生效。
+      </Text>
+      <Collapse items={prompts.map((p) => ({
+        key: p.key,
+        label: (
+          <span>
+            {p.label}
+            {p.customized && <Tag color="blue" style={{ marginLeft: 8 }}>已自定义</Tag>}
+          </span>
+        ),
+        children: (
+          <div>
+            <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>{p.description}</Text>
+            <Input.TextArea
+              value={drafts[p.key] ?? ''}
+              onChange={(e) => setDrafts({ ...drafts, [p.key]: e.target.value })}
+              rows={10}
+              placeholder="留空使用内置默认值"
+              style={{ fontFamily: 'monospace', fontSize: 12 }}
+            />
+            <Space style={{ marginTop: 8 }}>
+              <Button type="primary" icon={<SaveOutlined />} size="small"
+                loading={saving === p.key} onClick={() => doSave(p.key, drafts[p.key] ?? '', false)}>
+                保存
+              </Button>
+              <Button size="small" loading={saving === p.key}
+                onClick={() => { setDrafts({ ...drafts, [p.key]: '' }); doSave(p.key, '', true); }}>
+                恢复默认
+              </Button>
+            </Space>
+            <Collapse size="small" style={{ marginTop: 12 }} items={[{
+              key: 'def',
+              label: '📋 查看内置默认值',
+              children: (
+                <pre style={{ fontSize: 12, fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, maxHeight: 360, overflow: 'auto', background: '#fafafa', padding: 12, borderRadius: 4 }}>
+                  {p.defaultText}
+                </pre>
+              ),
+            }]} />
+          </div>
+        ),
+      }))} />
+    </Card>
+  );
+}
+
 // ─── Settings Page ───────────────────────────────────────────────────────────
 
 export default function Settings() {
@@ -132,7 +222,6 @@ export default function Settings() {
   const [savingMaven, setSavingMaven] = useState(false);
   const [savingClaude, setSavingClaude] = useState(false);
   const [savingEmbedding, setSavingEmbedding] = useState(false);
-  const [defaultPrompt, setDefaultPrompt] = useState('');
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserFilter, setBrowserFilter] = useState<'all' | 'dir' | 'xml'>('all');
   const [browserTarget, setBrowserTarget] = useState<string>('');
@@ -151,7 +240,7 @@ export default function Settings() {
   useEffect(() => {
     fetchGitConfig().then(c => gitForm.setFieldsValue(c)).catch(() => {});
     fetchMavenConfig().then(c => mavenForm.setFieldsValue(c)).catch(() => {});
-    fetchClaudeConfig().then(c => { claudeForm.setFieldsValue(c); if (c.defaultPrompt) setDefaultPrompt(c.defaultPrompt); }).catch(() => {});
+    fetchClaudeConfig().then(c => { claudeForm.setFieldsValue(c); }).catch(() => {});
     fetchEmbeddingConfig().then(c => embeddingForm.setFieldsValue(c)).catch(() => {});
     loadMcpStatus();
     loadMcpServers();
@@ -390,28 +479,20 @@ export default function Settings() {
                 <Form.Item name="apiKey" label="API Key">
                   <Input.Password placeholder="输入新的 API Key（留空则保持原有配置）" />
                 </Form.Item>
-                <Form.Item name="systemPrompt" label="System Prompt（可选）"
-                  tooltip="填写后会替换默认 prompt。留空则使用下方内置默认 prompt">
-                  <Input.TextArea rows={6} placeholder="留空使用默认配置。填写后会完全替换默认 prompt"
-                    style={{ fontFamily: 'monospace', fontSize: 12 }} />
-                </Form.Item>
-                {defaultPrompt && (
-                  <Collapse size="small" style={{ marginBottom: 16 }} items={[{
-                    key: 'default-prompt',
-                    label: '📋 内置默认 System Prompt（点击展开查看）',
-                    children: (
-                      <pre style={{ fontSize: 12, fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, maxHeight: 400, overflow: 'auto', background: '#fafafa', padding: 12, borderRadius: 4 }}>
-                        {defaultPrompt}
-                      </pre>
-                    )
-                  }]} />
-                )}
+                <Alert type="info" showIcon style={{ marginBottom: 16 }}
+                  message="System Prompt 已迁移" 
+                  description="智能问答及各类 AI 分析的 prompt 现统一在「AI Prompt」标签页管理。" />
                 <Button type="primary" icon={<SaveOutlined />} onClick={handleSaveClaude} loading={savingClaude}>
                   保存 Claude 配置
                 </Button>
               </Form>
             </Card>
           ),
+        },
+        {
+          key: 'prompts',
+          label: 'AI Prompt',
+          children: <PromptConfigPanel />,
         },
         {
           key: 'embedding',

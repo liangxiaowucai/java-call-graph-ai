@@ -3,19 +3,25 @@ import type React from 'react';
 import { Select, Spin, Tag, Drawer, Button, Empty, Tooltip, message, Input, Modal, Space, Tabs } from 'antd';
 import {
   ZoomInOutlined, ZoomOutOutlined, ExpandOutlined,
-  CodeOutlined, BugOutlined, ApiOutlined, FileTextOutlined,
+  CodeOutlined, ApiOutlined, FileTextOutlined,
   DownOutlined, RightOutlined, FolderOutlined,
 } from '@ant-design/icons';
-import { Graph } from '@antv/g6';
+import { Graph, register, getExtension, ExtensionCategory, ForceAtlas2Layout } from '@antv/g6';
 import {
   fetchRepos, fetchEntryPoints, fetchCallTree, fetchMethodSource, fetchMethodSourceDetail,
-  analyzeLog, getMock, saveMock, generateCallChainCode,
+  analyzeLog, saveMock,
   generateProductDoc, generateDevDoc,
-  fetchFileTree, fetchClassEdges, fetchRepoJars,
+  fetchFileTree, fetchClassEdges,
   type RepoEntity, type EntryPoint, type CallTree, type CallTreeNode,
   type LogAnalysisResult, type MethodSourceDetail, type BoundaryInfo, type FileTreeItem, type ClassEdge,
 } from '../api';
+import { getPositions, preloadLayout, layoutCacheKey } from '../services/graphPreloader';
 import JavaCodeViewer from '../components/JavaCodeViewer';
+
+// 官方 ForceAtlas2 布局：内置扩展通常导入即自动注册；此处兜底注册，避免个别版本未注册。
+if (!getExtension(ExtensionCategory.LAYOUT, 'force-atlas2')) {
+  register(ExtensionCategory.LAYOUT, 'force-atlas2', ForceAtlas2Layout);
+}
 
 // ─── Types & Helpers ─────────────────────────────────────────────────────────
 
@@ -23,17 +29,6 @@ interface NodeCustomData {
   label: string; fullMethod: string; className: string; methodName: string;
   callType: string; lineNumber: number | null; boundaries: BoundaryInfo[];
   isRecursive: boolean; isLazyLoad: boolean; ambiguous: boolean; depth: number;
-}
-
-function collapseBridges(node: CallTreeNode): CallTreeNode {
-  let n = node;
-  while (n.children && n.children.length === 1) {
-    const child = n.children[0];
-    if ((child.methodName || '') === (n.methodName || '') && ['_ITF', 'IMPL', 'INT'].includes(child.callType ?? '')) {
-      n = { ...child, boundaries: [...(n.boundaries ?? []), ...(child.boundaries ?? [])] };
-    } else break;
-  }
-  return { ...n, children: (n.children ?? []).map(collapseBridges) };
 }
 
 function flattenTree(root: CallTreeNode) {
@@ -63,10 +58,6 @@ function flattenTree(root: CallTreeNode) {
   walk(root, 0);
   return { nodes, edges, rootId: root.fullMethod };
 }
-
-const _BOUNDARY_COLORS: Record<string, string> = {
-  DB: '#1890ff', HTTP: '#52c41a', GRPC: '#722ed1', MQ: '#fa8c16', CACHE: '#eb2f96', REDIS: '#eb2f96',
-};
 
 function getNodeColor(d: NodeCustomData): string {
   if (d.isRecursive) return '#ff4d4f';
@@ -106,7 +97,6 @@ export default function CallGraph() {
   // File tree tab
   const [fileTreeData, setFileTreeData] = useState<Map<number, FileTreeItem[]>>(new Map());
   const [classEdges, setClassEdges] = useState<ClassEdge[]>([]);
-  const [jarNames, setJarNames] = useState<Map<number, string[]>>(new Map()); // repoId → jar name list (index = jarNum)
   const [loadingFileTree, setLoadingFileTree] = useState(false);
 
   // Entry points tab
@@ -130,12 +120,9 @@ export default function CallGraph() {
   const [logAnalyzing, setLogAnalyzing] = useState(false);
   const [logResult, setLogResult] = useState<LogAnalysisResult | null>(null);
   const [mockModalOpen, setMockModalOpen] = useState(false);
-  const [mockMethod, setMockMethod] = useState('');
+  const [mockMethod] = useState('');
   const [mockRequest, setMockRequest] = useState('');
   const [mockResponse, setMockResponse] = useState('');
-  const [codeDrawerOpen, setCodeDrawerOpen] = useState(false);
-  const [generatedCode, setGeneratedCode] = useState('');
-  const [generatingCode, setGeneratingCode] = useState(false);
   const [docDrawerOpen, setDocDrawerOpen] = useState(false);
   const [docContent, setDocContent] = useState('');
   const [docLoading, setDocLoading] = useState(false);
@@ -148,15 +135,28 @@ export default function CallGraph() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const graphRef = useRef<any>(null);
   const fitIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Graph render ready state (covers the blank period before G6 first paints)
+  const [graphReady, setGraphReady] = useState(false);
+  const allGraphNodeIdsRef = useRef<Set<string>>(new Set());
+  // 当前聚焦选中的类名（图点击 / 目录点击共用，用于「屏蔽蒙层下节点」的判断）
+  const selectedNodeRef = useRef<string | null>(null);
+  const showTempEdgesRef = useRef<((nodeId: string) => void) | null>(null);
+  const clearTempEdgesRef = useRef<(() => void) | null>(null);
+  // 记录布局配置，供鼠标离开时重启动画
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const layoutConfigRef = useRef<any>(null);
 
   // ── Load repos ──
   useEffect(() => {
     fetchRepos().then(r => {
       setRepos(r);
-      // Auto-select first analyzed repo
       if (selectedRepoIds.length === 0) {
         const first = r.find(repo => repo.status === 'ANALYZED' || repo.status === 'READY');
-        if (first) setSelectedRepoIds([first.id]);
+        if (first) {
+          setSelectedRepoIds([first.id]);
+          // 后台预加载布局（用户还没打开拓扑 Tab，趁现在 Worker 先算好）
+          preloadLayout(first.id, first.lastSyncTime ?? undefined).catch(() => {});
+        }
       }
     }).catch(() => message.error('加载仓库列表失败'));
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -180,6 +180,7 @@ export default function CallGraph() {
     setSourcePanelOpen(false);
     setSourceDetail(null);
     setSelectedEntry(null);
+    setGraphReady(false);
     if (graphRef.current) { try { graphRef.current.destroy(); } catch { /* */ } graphRef.current = null; }
 
     if (selectedRepoIds.length === 0) { setEntryPoints([]); return; }
@@ -190,23 +191,19 @@ export default function CallGraph() {
       .finally(() => setLoadingEntries(false));
   }, [selectedRepoIds]);
 
-  // ── Load file tree + class edges + jar names when repos change & tab is files ──
+  // ── Load file tree + class edges when repos change & tab is files ──
   useEffect(() => {
     if (activeTab !== 'files' || selectedRepoIds.length === 0) return;
     setLoadingFileTree(true);
     Promise.all([
       Promise.all(selectedRepoIds.map(id => fetchFileTree(id).then(items => [id, items] as [number, FileTreeItem[]]))),
       Promise.all(selectedRepoIds.map(id => fetchClassEdges(id).catch(() => [] as ClassEdge[]))),
-      Promise.all(selectedRepoIds.map(id => fetchRepoJars(id).then(jars => [id, jars.map(j => j.name.replace(/\.jar$|\.war$/, ''))] as [number, string[]]))),
     ])
-      .then(([treeResults, edgeResults, jarResults]) => {
+      .then(([treeResults, edgeResults]) => {
         const m = new Map<number, FileTreeItem[]>();
         treeResults.forEach(([id, items]) => m.set(id, items));
         setFileTreeData(m);
         setClassEdges(edgeResults.flat());
-        const jm = new Map<number, string[]>();
-        jarResults.forEach(([id, names]) => jm.set(id, names));
-        setJarNames(jm);
       })
       .catch(() => message.error('加载文件树失败'))
       .finally(() => setLoadingFileTree(false));
@@ -249,27 +246,11 @@ export default function CallGraph() {
   }, [selectedRepoIds, selectedEntry, logText]);
 
   // ── Mock ──
-  const _openMockEditor = useCallback(async (fullMethod: string) => {
-    const repoId = selectedRepoIds[0]; if (!repoId) return;
-    setMockMethod(fullMethod);
-    try { const mock = await getMock(repoId, fullMethod); setMockRequest(mock?.mockRequest ?? '{}'); setMockResponse(mock?.mockResponse ?? '{"code":200}'); }
-    catch { setMockRequest('{}'); setMockResponse('{"code":200}'); }
-    setMockModalOpen(true);
-  }, [selectedRepoIds]);
   const handleSaveMock = useCallback(async () => {
     const repoId = selectedRepoIds[0]; if (!repoId) return;
     try { await saveMock(repoId, mockMethod, mockRequest, mockResponse); message.success('Mock 已保存'); setMockModalOpen(false); }
     catch (e: unknown) { if (e instanceof Error) message.error(e.message); }
   }, [selectedRepoIds, mockMethod, mockRequest, mockResponse]);
-
-  // ── Code gen ──
-  const handleGenerateCode = useCallback(async () => {
-    const repoId = selectedRepoIds[0]; if (!repoId || !selectedEntry) return;
-    setGeneratingCode(true);
-    try { const code = await generateCallChainCode(repoId, selectedEntry); setGeneratedCode(code); setCodeDrawerOpen(true); }
-    catch (e: unknown) { if (e instanceof Error) message.error(e.message); }
-    finally { setGeneratingCode(false); }
-  }, [selectedRepoIds, selectedEntry]);
 
   // ── Doc gen ──
   const handleGenerateDoc = useCallback(async (type: 'product' | 'dev') => {
@@ -289,131 +270,355 @@ export default function CallGraph() {
     if (graphRef.current) { try { graphRef.current.destroy(); } catch { /* */ } graphRef.current = null; }
     const container = graphContainerRef.current;
 
-    // Color palette per package (rotate through 8 colors)
+    // ── 仓库拓扑图 ──────────────────────────────────────────────────────────────
     const PALETTE = ['#1890ff', '#52c41a', '#722ed1', '#fa8c16', '#eb2f96', '#13c2c2', '#2f54eb', '#fa541c'];
     const allItems = [...fileTreeData.values()].flat();
     const pkgList = [...new Set(allItems.map(i => i.packageName || ''))].sort();
     const pkgColorMap = new Map(pkgList.map((pkg, i) => [pkg, PALETTE[i % PALETTE.length]]));
+    const nodeIdSet = new Set(allItems.map(i => i.className));
 
-    // Include ALL classes (single repo, no limit needed)
-    const nodes = allItems.map(item => {
-      const short = (item.className.split('.').pop() ?? item.className).replace(/\$.+/, '');
-      const color = pkgColorMap.get(item.packageName || '') ?? '#1890ff';
-      return { id: item.className, data: { label: short, pkg: item.packageName, methodCount: item.methodCount, color } };
+    const nodes = allItems.map(item => ({
+      id: item.className,
+      data: {
+        label: (item.className.split('.').pop() ?? item.className).replace(/\$.+/, ''),
+        pkg: item.packageName || 'default',
+        methodCount: item.methodCount,
+        color: pkgColorMap.get(item.packageName || '') ?? '#1890ff',
+      },
+    }));
+
+    const externalNodes: typeof nodes = [];
+    const allNodes = [...nodes, ...externalNodes];
+
+    // ── 包节点（每个 package 一个节点）——层级边的 source ─────────────────────────
+    const pkgNodeMap = new Map<string, { id: string; label: string; color: string }>();
+    pkgList.forEach(pkg => {
+      if (!pkg) return;
+      const label = pkg.split('.').pop() ?? pkg;
+      const color = pkgColorMap.get(pkg) ?? '#8c8c8c';
+      pkgNodeMap.set(pkg, { id: `pkg::${pkg}`, label, color });
+    });
+    const pkgNodes = [...pkgNodeMap.values()].map(p => ({
+      id: p.id,
+      data: { label: p.label, pkg: p.id, methodCount: 0, color: p.color, isPkg: true },
+    }));
+
+    // ── 模块节点（jar 级别）─────────────────────────────────────────────────────
+    // 按 jarName 分组，每个 jar 一个模块节点
+    const jarGroupMap = new Map<string, { items: typeof allItems; color: string }>();
+    allItems.forEach(item => {
+      const jarKey = item.jarName ?? `module-${item.jarNum ?? 0}`;
+      if (!jarGroupMap.has(jarKey)) {
+        const pkgOfFirst = item.packageName || '';
+        jarGroupMap.set(jarKey, { items: [], color: pkgColorMap.get(pkgOfFirst) ?? '#8c8c8c' });
+      }
+      jarGroupMap.get(jarKey)!.items.push(item);
+    });
+    const moduleNodes = [...jarGroupMap.entries()].map(([jarKey]) => ({
+      id: `mod::${jarKey}`,
+      data: { label: jarKey, pkg: `mod::${jarKey}`, methodCount: 0, color: '#555', isPkg: true, isMod: true },
+    }));
+
+    // 层级边：模块 → 包（每个包连到它所属的模块）
+    const modPkgEdgeSet = new Set<string>();
+    const modulePkgEdges: { id: string; source: string; target: string; style: Record<string, unknown>; data: { edgeType: string } }[] = [];
+    allItems.forEach(item => {
+      const jarKey = item.jarName ?? `module-${item.jarNum ?? 0}`;
+      const pkgKey = item.packageName;
+      if (!pkgKey || !pkgNodeMap.has(pkgKey)) return;
+      const edgeId = `mod::${jarKey}>>pkg::${pkgKey}`;
+      if (!modPkgEdgeSet.has(edgeId)) {
+        modPkgEdgeSet.add(edgeId);
+        modulePkgEdges.push({ id: edgeId, source: `mod::${jarKey}`, target: `pkg::${pkgKey}`,
+          style: { stroke: '#bfbfbf', lineWidth: 1, opacity: 0.5, endArrow: false },
+          data: { edgeType: 'hierarchy' } });
+      }
     });
 
-    // Edges: use real call_graph class-level edges (filtered to only nodes present in graph)
-    const nodeIdSet = new Set(nodes.map(n => n.id));
-    const edges = classEdges
-      .filter(e => nodeIdSet.has(e.source) && nodeIdSet.has(e.target))
-      .map((e, i) => ({ id: `fe${i}`, source: e.source, target: e.target }));
+    const hierarchyEdges = allItems
+      .filter(item => item.packageName && pkgNodeMap.has(item.packageName))
+      .map((item, i) => {
+        const color = pkgColorMap.get(item.packageName ?? '') ?? '#b0b0b0';
+        return {
+          id: `hie${i}`,
+          source: pkgNodeMap.get(item.packageName!)!.id,
+          target: item.className,
+          // 样式直接放进数据，不用函数 → updateEdgeData 修改才能生效
+          style: { stroke: color, lineWidth: 1.2, opacity: 0.65, endArrow: false },
+          data: { edgeType: 'hierarchy', color },
+        };
+      });
 
-    // Initialize node positions near center to avoid left-top-corner start
-    const cx = (container.clientWidth || 800) / 2;
+    const allNodesFull = [...moduleNodes, ...pkgNodes, ...allNodes];
+    const allHierarchyEdges = [...modulePkgEdges, ...hierarchyEdges];
+    // edges 里只保留仓库内部的 import/call 边（外部类已过滤，tempEdgeIds 计算时也用这份）
+
+    // ── 布局坐标：优先内存缓存（Worker 预算）→ localStorage → d3-force ────
+    const repoId = selectedRepoIds[0];
+    const repo = repos.find(r => r.id === repoId);
+    const cacheKey = layoutCacheKey(repoId, repo?.lastSyncTime ?? undefined);
+
+    // 优先读内存（Worker 预算结果），内存没有则读 localStorage
+    let cachedPositions: Record<string, { x: number; y: number }> | null = getPositions(cacheKey);
+    if (!cachedPositions) {
+      try {
+        const raw = localStorage.getItem(cacheKey);
+        if (raw) cachedPositions = JSON.parse(raw);
+      } catch { /* */ }
+    }
+    const hasCache = cachedPositions !== null && Object.keys(cachedPositions).length > 10;
+
+    const cx = (container.clientWidth  || 800) / 2;
     const cy = (container.clientHeight || 500) / 2;
-    const nodesWithPos = nodes.map(n => ({
+    const allNodesWithPos = allNodesFull.map(n => ({
       ...n,
-      style: { x: cx + (Math.random() - 0.5) * 200, y: cy + (Math.random() - 0.5) * 200 },
+      style: hasCache && cachedPositions![n.id]
+        ? { x: cachedPositions![n.id].x, y: cachedPositions![n.id].y }
+        : { x: cx + (Math.random() - 0.5) * 400, y: cy + (Math.random() - 0.5) * 300 },
     }));
+
+    const layoutConfig = {
+      type: 'd3-force',
+      link:   { distance: 30 },
+      charge: { strength: -60 },
+      center: { x: cx, y: cy, strength: 0.15 },
+      collide: { radius: 12 },
+      x: { strength: 0.08 },
+      y: { strength: 0.08 },
+      alphaDecay: hasCache ? 0.12 : 0.05,
+      alphaMin: 0.001,
+    };
+    layoutConfigRef.current = layoutConfig;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const graph = new (Graph as any)({
       container,
-      width: container.clientWidth || 800,
+      width:  container.clientWidth  || 800,
       height: container.clientHeight || 500,
       autoFit: 'view',
-      data: { nodes: nodesWithPos, edges },
+      data: { nodes: allNodesWithPos, edges: allHierarchyEdges },
+      animation: true,
       node: {
-        style: (datum: { id: string; data?: { label: string; pkg: string; methodCount: number; color: string } }) => {
-          const d = datum.data ?? { label: '', pkg: '', methodCount: 1, color: '#1890ff' };
-          const size = Math.min(Math.max(d.methodCount * 3 + 12, 18), 50);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        style: (d: any) => {
+          const color = d.data?.color ?? '#1890ff';
+          const isExt  = d.data?.pkg === '__ext__';
+          const isPkg  = d.data?.isPkg === true;
+          const isMod  = d.data?.isMod === true;
+          const size   = isMod ? 28                                           // 模块节点最大
+                       : isPkg ? 22                                           // 包节点中等
+                       : isExt ? 10 : Math.min(Math.max((d.data?.methodCount ?? 1) * 2.2 + 14, 16), 42);
           return {
-            size, fill: d.color, stroke: '#fff', lineWidth: 1.5,
-            opacity: 0.9, labelText: d.label, labelFill: '#262626', labelFontSize: 10,
-            labelPlacement: 'bottom', labelOffsetY: 5, cursor: 'pointer',
-            shadowColor: d.color, shadowBlur: 4, shadowOffsetY: 0,
+            size,
+            type: isMod ? 'star' : isPkg ? 'diamond' : 'circle',            // 模块=星形 包=菱形 类=圆形
+            fill:      isExt ? '#f0f0f0' : color,
+            stroke:    isExt ? '#bfbfbf' : '#fff',
+            lineWidth: 1.5,
+            lineDash:  isExt ? [3, 3] : undefined,
+            opacity:   isExt ? 0.7 : 0.9,
+            // 标签默认隐藏，悬停 / 选中时 state 会开启
+            labelText:        d.data?.label ?? '',
+            labelFillOpacity: 0,
+            labelPlacement:   'bottom',
+            labelOffsetY:     4,
+            cursor: 'pointer',
+            // 不设 shadowBlur，阴影是 Canvas 每帧最贵的操作
           };
         },
         state: {
-          selected: { stroke: '#fa8c16', lineWidth: 3, halo: true, haloStroke: '#fa8c16', haloLineWidth: 18, haloStrokeOpacity: 0.35, labelFontWeight: 700, labelFontSize: 12 },
-          active: { halo: true, haloStroke: '#1890ff', haloLineWidth: 12, haloStrokeOpacity: 0.25 },
-          inactive: { opacity: 0.5 },
+          selected: {
+            stroke: '#ff4d00', lineWidth: 3,
+            halo: true, haloStroke: '#ff4d00', haloLineWidth: 12, haloStrokeOpacity: 0.8,
+            labelFontWeight: 700, labelFontSize: 12, labelFill: '#c41d00', labelFillOpacity: 1,
+            labelBackground: true, labelBackgroundFill: 'rgba(255,255,255,0.95)',
+            labelBackgroundRadius: 4, labelBackgroundPadding: [2, 6, 2, 6],
+            zIndex: 1000,
+          },
+          active: {
+            stroke: '#1677ff', lineWidth: 2,
+            halo: true, haloStroke: '#1677ff', haloLineWidth: 8, haloStrokeOpacity: 0.45,
+            labelFill: '#0958d9', labelFillOpacity: 1,
+            labelBackground: true, labelBackgroundFill: 'rgba(255,255,255,0.9)',
+            labelBackgroundRadius: 4, labelBackgroundPadding: [1, 5, 1, 5],
+            zIndex: 999,
+          },
+          inactive: { opacity: 0.25, labelFillOpacity: 0 },
         },
-        animation: { enter: 'fade' },
+        // 节点进场不做动画（初始 468 个同时动画会卡），状态切换保留过渡
+        animation: { enter: false, exit: false },
       },
       edge: {
-        style: { stroke: '#999', lineWidth: 1.5, opacity: 0.4, endArrow: true, endArrowSize: 5 },
-        state: { active: { stroke: '#fa8c16', lineWidth: 2.5, opacity: 1 }, inactive: { opacity: 0.08 } },
+        // 无 style 函数：样式全部在每条边的 data.style 里（见 hierarchyEdges/modulePkgEdges/showTempEdges）
+        // 这样 updateEdgeData({ style: { opacity } }) 才能真正生效
+        state: {
+          active:   { lineWidth: 2.5, opacity: 1 },
+          inactive: { opacity: 0.06 },
+        },
+        animation: { enter: 'fade', duration: 400, easing: 'ease-in' },
       },
-      layout: {
-        type: 'd3-force',
-        link: { distance: 50 },
-        charge: { strength: -100 },
-        center: { x: 0, y: 0, strength: 0.1 },
-        collide: { radius: 18 },
-        x: { strength: 0.05 },
-        y: { strength: 0.05 },
-      },
-      behaviors: ['drag-canvas', 'drag-element-force', { type: 'click-select', multiple: false }],
+      layout: layoutConfig,
+      behaviors: [
+        'drag-canvas', 'zoom-canvas',
+        'optimize-viewport-transform',
+        { type: 'hover-activate', degree: 0, state: 'active' },
+        {
+          type: 'click-select', degree: 1,
+          state: 'selected', neighborState: 'active', unselectedState: 'inactive',
+        },
+      ],
     });
 
-    // Click node: highlight neighbors + show source
+    // ── 临时边逻辑：点击节点时加该节点的所有相关边，点击其他地方或再次点击时清除 ──
+    // 边只在需要时出现，默认视图是干净的节点云
+    let tempEdgeIds: string[] = [];
+
+    const showTempEdges = (nodeId: string) => {
+      if (tempEdgeIds.length > 0) {
+        try { (graph as any).removeEdgeData?.(tempEdgeIds); } catch { /* */ }
+        tempEdgeIds = [];
+      }
+
+      // 无 style 函数，updateEdgeData 直接修改 style.opacity 才能生效
+      try {
+        (graph as any).updateEdgeData?.(allHierarchyEdges.map(e => ({ id: e.id, style: { opacity: 0.04 } })));
+      } catch { /* */ }
+
+      const nodeEdges = classEdges.filter(e =>
+        (e.source === nodeId || e.target === nodeId) &&
+        nodeIdSet.has(e.source) && nodeIdSet.has(e.target)
+      );
+      if (nodeEdges.length > 0) {
+        const tempEdges = nodeEdges.map((e, i) => {
+          const isCall = e.type === 'call';
+          return {
+            id: `temp_${nodeId}_${i}`,
+            source: e.source, target: e.target,
+            style: {
+              stroke: isCall ? '#6366f1' : '#10b981',
+              lineWidth: 1.8, opacity: 0.9, endArrow: true, endArrowSize: 3,
+              ...(isCall ? {} : { lineDash: [4, 3] }),
+            },
+            data: { edgeType: e.type ?? 'import' },
+          };
+        });
+        tempEdgeIds = tempEdges.map(e => e.id);
+        try { (graph as any).addEdgeData?.(tempEdges); } catch { /* */ }
+
+        const neighborIds = nodeEdges.map(e => e.source === nodeId ? e.target : e.source);
+        if (neighborIds.length > 0) {
+          try {
+            const ns: Record<string, string[]> = {};
+            neighborIds.forEach(id => { ns[id] = ['active']; });
+            (graph as any).setElementState?.(ns);
+          } catch { /* */ }
+        }
+      }
+      try { (graph as any).draw?.(); } catch { /* */ }
+    };
+
+    const clearTempEdges = () => {
+      if (tempEdgeIds.length > 0) {
+        try { (graph as any).removeEdgeData?.(tempEdgeIds); } catch { /* */ }
+        tempEdgeIds = [];
+      }
+      // 恢复层级边原始 opacity
+      try {
+        (graph as any).updateEdgeData?.(
+          allHierarchyEdges.map(e => ({ id: e.id, style: { opacity: (e.style as Record<string, unknown>).opacity ?? 0.65 } }))
+        );
+        const clearStates: Record<string, string[]> = {};
+        allNodesFull.forEach(n => { clearStates[n.id] = []; });
+        (graph as any).setElementState?.(clearStates);
+        (graph as any).draw?.();
+      } catch { /* */ }
+    };
+
+    showTempEdgesRef.current = showTempEdges;
+    clearTempEdgesRef.current = clearTempEdges;
+
+    // 鼠标进入：停止 d3-force，节点定住方便查看
+    // 鼠标离开：重启布局动画，按当前位置继续收敛
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    graph.on('canvas:pointerenter', () => { try { (graph as any).stopLayout?.(); } catch { /* */ } });
+    graph.on('canvas:pointerleave', () => {
+      try {
+        // 重启 d3-force（从当前节点位置出发继续动画）
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (graph as any).layout?.(layoutConfigRef.current);
+      } catch { /* */ }
+    });
+    // 点击节点：视觉高亮由官方 click-select 负责，这里只做「临时边 + 目录/源码联动」
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     graph.on('node:click', (event: any) => {
       const nodeId = event?.itemId ?? event?.target?.id;
       if (!nodeId) return;
-      const item = allItems.find(i => i.className === nodeId);
-      if (!item) return;
 
-      // Highlight: clicked=selected, neighbors=active, rest=inactive
-      const neighbors = new Set<string>();
-      neighbors.add(nodeId);
-      classEdges.forEach(e => {
-        if (e.source === nodeId) neighbors.add(e.target);
-        if (e.target === nodeId) neighbors.add(e.source);
-      });
-      const states: Record<string, string[]> = {};
-      for (const n of allItems) {
-        if (n.className === nodeId) states[n.className] = ['selected'];
-        else if (neighbors.has(n.className)) states[n.className] = ['active'];
-        else states[n.className] = ['inactive'];
-      }
-      try { graph.setElementState?.(states); } catch { /* */ }
-
-      // Load source with structured detail
-      const repoId = selectedRepoIds[0];
-      if (repoId) {
-        showSource(item.className + ':__CLASS__()');
+      // 再点选中项 → 取消选中 + 清除临时边
+      if (selectedNodeRef.current === nodeId) {
+        selectedNodeRef.current = null;
+        setSelectedClassName(null);
+        setSourcePanelOpen(false);
+        clearTempEdges();
+        return;
       }
 
-      // Scroll left panel to the file
-      setTimeout(() => {
-        const el = document.querySelector(`[data-classname="${item.className}"]`);
-        if (el) {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          el.classList.add('active');
-        }
-      }, 100);
+      selectedNodeRef.current = nodeId;
+
+      // 加载该节点的临时边
+      showTempEdges(nodeId);
+
+      // 只有类节点才同步目录树和源码（包/模块节点没有对应目录条目）
+      const isClassNode = !nodeId.startsWith('pkg::') && !nodeId.startsWith('mod::') && !nodeId.startsWith('__ext__');
+      if (isClassNode) {
+        setSelectedClassName(nodeId);
+        const foundItem = allItems.find(i => i.className === nodeId);
+        setTimeout(() => {
+          const el = document.querySelector(`[data-classname="${CSS.escape(nodeId)}"]`);
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 150);
+        showSource((foundItem?.className ?? nodeId) + ':__CLASS__()');
+      }
     });
 
-    // Click empty canvas → clear highlights + close source
+    // Click empty canvas → 清除临时边 + 关闭源码
     graph.on('canvas:click', () => {
-      try {
-        const clearStates: Record<string, string[]> = {};
-        allItems.forEach(item => { clearStates[item.className] = []; });
-        classEdges.forEach((_, i) => { clearStates[`fe${i}`] = []; });
-        graph.setElementState?.(clearStates);
-      } catch { /* */ }
+      selectedNodeRef.current = null;
+      setSelectedClassName(null);
       setSourcePanelOpen(false);
+      clearTempEdges();
     });
+
+    // 600ms 后移除进度条（节点开始出现），fitView 在 afterlayout 收敛后调用
+    const readyTimer = setTimeout(() => setGraphReady(true), 600);
 
     graph.render().catch(console.warn);
 
-    // Keep graph fitted during force simulation (nodes spread out over time)
-    const fitInterval = setInterval(() => { try { graph.fitView?.(); } catch { /* */ } }, 1500);
-    fitIntervalRef.current = fitInterval;
-    setTimeout(() => { clearInterval(fitInterval); fitIntervalRef.current = null; }, 8000);
+    // afterlayout：fitView + 加边 + 保存 localStorage（d3-force 收敛后）
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    graph.on('afterlayout', () => {
+      setGraphReady(true);
+      try { (graph as any).fitView?.({ padding: 30 }, { duration: 600, easing: 'ease-in-out' }); } catch { /* */ }
 
+      // 收敛后保存 localStorage（边不再预加载，只在点击时按需加载）
+      if (!hasCache) {
+        try {
+          const positions: Record<string, { x: number; y: number }> = {};
+          allNodesFull.forEach(n => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const d = (graph as any).getNodeData?.(n.id);
+            if (d?.style?.x !== undefined) positions[n.id] = { x: d.style.x, y: d.style.y };
+          });
+          if (Object.keys(positions).length > 10) {
+            localStorage.setItem(cacheKey, JSON.stringify(positions));
+          }
+        } catch { /* */ }
+      }
+    });
+
+    // 保存完整节点 ID 集合（含外部依赖虚节点）供 handleFileTreeClick 使用
+    allGraphNodeIdsRef.current = new Set(allNodesFull.map(n => n.id));
+
+    // 布局为逐帧 tick 的 force 布局，配合 autoFit:'view' 官方自适应即可。
     graphRef.current = graph;
 
     const ro = new ResizeObserver(() => {
@@ -421,14 +626,14 @@ export default function CallGraph() {
       try { graphRef.current.changeSize?.(container.clientWidth, container.clientHeight); } catch { /* */ }
     });
     ro.observe(container);
-    return () => ro.disconnect();
+    return () => { clearTimeout(readyTimer); ro.disconnect(); };
   }, [activeTab, fileTreeData, classEdges, showSource, selectedRepoIds]);
 
   // ── G6 Dagre graph rendering ──
   useEffect(() => {
     if (activeTab !== 'entries' || !callTree?.root || !graphContainerRef.current) return;
 
-    const { nodes, edges, rootId } = flattenTree(callTree.root);
+    const { nodes, edges } = flattenTree(callTree.root);
     const nodeMap = new Map(nodes.map(n => [n.id, n.data]));
 
     if (graphRef.current) { try { graphRef.current.destroy(); } catch { /* */ } graphRef.current = null; }
@@ -507,7 +712,7 @@ export default function CallGraph() {
       const data = nodeMap.get(nodeId);
       if (!data) return;
 
-      // If clicking same node again → deselect, restore all, hide source
+      // 点同一节点再次点击 → 取消选中
       if (lastSelectedNode === nodeId) {
         lastSelectedNode = null;
         try {
@@ -518,9 +723,10 @@ export default function CallGraph() {
         setSourcePanelOpen(false);
         return;
       }
+
+      // 任意节点点击都更新选中
       lastSelectedNode = nodeId;
 
-      // Highlight clicked node + adjacent
       try {
         const neighbors = new Set<string>();
         neighbors.add(nodeId);
@@ -572,14 +778,23 @@ export default function CallGraph() {
     const repoId = selectedRepoIds[0];
     if (!repoId) return;
 
-    // Stop fitView loop to prevent interference
     if (fitIntervalRef.current) { clearInterval(fitIntervalRef.current); fitIntervalRef.current = null; }
 
-    // Highlight in graph: set clicked node + neighbors to active/selected, rest to inactive
+    // 再次点击同一节点 → 取消高亮，恢复初始状态
+    if (selectedNodeRef.current === className) {
+      selectedNodeRef.current = null;
+      setSelectedClassName(null);
+      setSourcePanelOpen(false);
+      clearTempEdgesRef.current?.();
+      return;
+    }
+
+    setSelectedClassName(className);
+    selectedNodeRef.current = className;
+
     const graph = graphRef.current;
     if (graph) {
       try {
-        // Find neighbors of clicked node from classEdges
         const neighbors = new Set<string>();
         neighbors.add(className);
         classEdges.forEach(e => {
@@ -587,40 +802,55 @@ export default function CallGraph() {
           if (e.target === className) neighbors.add(e.source);
         });
 
-        // Build state map: all nodes are in graph (single repo, full render)
+        // 用完整节点集合（含外部依赖虚节点）设置状态：选中/相邻高亮，其余轻度淡化作背景
+        const allNodeIds = allGraphNodeIdsRef.current;
         const states: Record<string, string[]> = {};
-        const allItems = [...fileTreeData.values()].flat();
-        for (const item of allItems) {
-          if (item.className === className) {
-            states[item.className] = ['selected'];
-          } else if (neighbors.has(item.className)) {
-            states[item.className] = ['active'];
-          } else {
-            states[item.className] = ['inactive'];
-          }
-        }
+        allNodeIds.forEach(id => {
+          if (id === className) states[id] = ['selected'];
+          else if (neighbors.has(id)) states[id] = ['active'];
+          else states[id] = ['inactive'];
+        });
         try { graph.setElementState?.(states); } catch { /* */ }
 
-        // Highlight edges
-        const edgeStates: Record<string, string[]> = {};
-        classEdges.forEach((e, i) => {
-          const edgeId = `fe${i}`;
-          if (e.source === className || e.target === className) {
-            edgeStates[edgeId] = ['active'];
-          } else {
-            edgeStates[edgeId] = ['inactive'];
-          }
-        });
-        try { graph.setElementState?.(edgeStates); } catch { /* */ }
+        // 边现在是临时动态加载的（点击节点时 addEdgeData），没有固定 ID，不再在这里设置边状态
 
-      } catch { /* graph API variation */ }
+      } catch { /* */ }
+
+      // 目录树点击：通过 ref 调用 effect 内的 showTempEdges（同图节点点击，会压暗层级边）
+      if (showTempEdgesRef.current) {
+        showTempEdgesRef.current(className);
+      }
     }
 
-    // Load full class source with structured detail (params, dependencies, etc)
     showSource(className + ':__CLASS__()');
   }, [selectedRepoIds, classEdges, fileTreeData, showSource]);
 
-  // ── Entry point grouping helpers ──
+  // ── 源码面板高度拖拽 ──
+  const [sourcePanelHeight, setSourcePanelHeight] = useState(280); // px，默认 280px
+  const isDraggingRef = useRef(false);
+  const dragStartYRef = useRef(0);
+  const dragStartHeightRef = useRef(0);
+
+  const handleDividerMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isDraggingRef.current = true;
+    dragStartYRef.current = e.clientY;
+    dragStartHeightRef.current = sourcePanelHeight;
+
+    const onMove = (ev: MouseEvent) => {
+      if (!isDraggingRef.current) return;
+      const delta = dragStartYRef.current - ev.clientY; // 向上拖 → 面板变高
+      const next = Math.max(80, Math.min(600, dragStartHeightRef.current + delta));
+      setSourcePanelHeight(next);
+    };
+    const onUp = () => {
+      isDraggingRef.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [sourcePanelHeight]);
   const grouped = entryPoints.reduce<Record<string, EntryPoint[]>>((acc, ep) => {
     const t = ep.endpointType || 'OTHER'; if (!acc[t]) acc[t] = []; acc[t].push(ep); return acc;
   }, {});
@@ -647,6 +877,7 @@ export default function CallGraph() {
 
   // ── File tree rendering helper — IDEA style ──
   const [expandedPkgs, setExpandedPkgs] = useState<Set<string>>(new Set());
+  const [selectedClassName, setSelectedClassName] = useState<string | null>(null);
   const togglePkg = (key: string) => setExpandedPkgs(prev => {
     const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n;
   });
@@ -707,9 +938,17 @@ export default function CallGraph() {
     // 4) Render with collapse/expand
     function count(n: N): number { return n.classes.length + [...n.children.values()].reduce((s, c) => s + count(c), 0); }
 
+    // 该节点子树是否包含当前选中类（用于从图节点反查目录时自动展开路径）
+    function hasSelected(n: N): boolean {
+      if (selectedClassName == null) return false;
+      if (n.classes.some(c => c.className === selectedClassName)) return true;
+      for (const c of n.children.values()) if (hasSelected(c)) return true;
+      return false;
+    }
+
     function render(node: N, depth: number, isRoot: boolean): React.ReactNode {
       const key = `${repoName}::${node.path}`;
-      const expanded = isRoot || expandedPkgs.has(key);
+      const expanded = isRoot || expandedPkgs.has(key) || hasSelected(node);
       const total = count(node);
       const hasKids = node.children.size > 0 || node.classes.length > 0;
 
@@ -727,11 +966,15 @@ export default function CallGraph() {
           {expanded && [...node.children.values()].sort((a, b) => a.seg.localeCompare(b.seg)).map(c => render(c, depth + 1, false))}
           {expanded && node.classes.sort((a, b) => a.className.localeCompare(b.className)).map(cls => {
             const short = (cls.className.split('.').pop() ?? '').replace(/\$.+/, '');
+            const isSelected = selectedClassName === cls.className;
             return (
-              <div key={cls.className} className="entry-item" data-classname={cls.className} onClick={() => handleFileTreeClick(cls.className)}
-                style={{ padding: `2px 4px 2px ${(depth + 1) * 16}px`, fontSize: 12, display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+              <div key={cls.className} className={`entry-item${isSelected ? ' active' : ''}`}
+                data-classname={cls.className} onClick={() => handleFileTreeClick(cls.className)}
+                style={{ padding: `2px 4px 2px ${(depth + 1) * 16}px`, fontSize: 12, display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer',
+                  background: isSelected ? '#e6f4ff' : undefined,
+                  borderLeft: isSelected ? '2px solid #1890ff' : '2px solid transparent' }}>
                 <span style={{ color: '#6897bb', fontWeight: 700, fontSize: 10, width: 12 }}>C</span>
-                <span style={{ color: classColor(short), flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{short}</span>
+                <span style={{ color: isSelected ? '#1890ff' : classColor(short), flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: isSelected ? 600 : 400 }}>{short}</span>
                 <span style={{ color: '#bfbfbf', fontSize: 10 }}>{cls.methodCount}</span>
               </div>
             );
@@ -751,7 +994,14 @@ export default function CallGraph() {
         {/* Repo multi-select */}
         <div className="left-header">
           <Select style={{ width: '100%', marginBottom: 8 }} placeholder="选择仓库"
-            value={selectedRepoIds[0] ?? null} onChange={v => setSelectedRepoIds(v ? [v] : [])}
+            value={selectedRepoIds[0] ?? null} onChange={v => {
+            setSelectedRepoIds(v ? [v] : []);
+            // 切换仓库时触发后台预加载
+            if (v) {
+              const repo = repos.find(r => r.id === v);
+              preloadLayout(v, repo?.lastSyncTime ?? undefined).catch(() => {});
+            }
+          }}
             options={repos.filter(r => r.status === 'ANALYZED' || r.status === 'READY').map(r => ({ label: r.name, value: r.id }))}
             allowClear />
         </div>
@@ -771,7 +1021,6 @@ export default function CallGraph() {
             selectedRepoIds.length === 0 ? <Empty description="请先选择仓库" image={Empty.PRESENTED_IMAGE_SIMPLE} /> :
             Array.from(fileTreeData.entries()).map(([repoId, items]) => {
               const repo = repos.find(r => r.id === repoId);
-              const jars = jarNames.get(repoId) ?? [];
               // Group items by jarNum (module)
               const byJar = new Map<number, FileTreeItem[]>();
               for (const item of items) {
@@ -785,7 +1034,8 @@ export default function CallGraph() {
                     <span style={{ color: '#bfbfbf', fontWeight: 400, marginLeft: 6 }}>{items.length} 类 · {byJar.size} 模块</span>
                   </div>
                   {[...byJar.entries()].sort((a, b) => a[0] - b[0]).map(([jarNum, jarItems]) => {
-                    const moduleName = jars[jarNum] ?? `module-${jarNum}`;
+                    // 直接用后端返回的 jarName，不再用错误的数组下标索引
+                    const moduleName = jarItems[0]?.jarName ?? `module-${jarNum}`;
                     return (
                       <div key={`${repoId}:${jarNum}`}>
                         {byJar.size > 1 && (
@@ -866,10 +1116,27 @@ export default function CallGraph() {
             {/* Graph (fills available space) */}
             <div style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden', borderBottom: sourcePanelOpen ? '1px solid #f0f0f0' : 'none' }}>
               <div ref={graphContainerRef} style={{ width: '100%', height: '100%' }} />
+              {/* d3-force 计算时顶部显示细进度条，不遮挡节点运动动画 */}
+              {!graphReady && (
+                <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3,
+                  background: 'linear-gradient(90deg, #1677ff 0%, #69b1ff 50%, #1677ff 100%)',
+                  backgroundSize: '200% 100%',
+                  animation: 'shimmer 1.5s infinite',
+                  zIndex: 10 }} />
+              )}
             </div>
-            {/* Source panel (30%) — only visible when a node is clicked */}
+            <style>{`@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }`}</style>
+            {/* Source panel — height adjustable by dragging the divider */}
             {sourcePanelOpen && (
-            <div style={{ height: '30%', maxHeight: '30%', minHeight: 0, overflow: 'auto', background: '#fff', borderTop: '1px solid #e8e8e8', position: 'relative' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', background: '#fff', borderTop: '1px solid #e8e8e8' }}>
+              {/* 拖拽分割线 */}
+              <div
+                onMouseDown={handleDividerMouseDown}
+                style={{ height: 5, background: '#f0f0f0', cursor: 'row-resize', flexShrink: 0,
+                  borderTop: '1px solid #e0e0e0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ width: 32, height: 3, borderRadius: 2, background: '#bfbfbf' }} />
+              </div>
+              <div style={{ height: sourcePanelHeight, overflow: 'auto', position: 'relative' }}>
               <Button size="small" type="text" onClick={() => setSourcePanelOpen(false)}
                 style={{ position: 'sticky', top: 0, right: 0, zIndex: 10, float: 'right', color: '#8c8c8c' }}>✕</Button>
               {loadingSource ? (
@@ -887,6 +1154,7 @@ export default function CallGraph() {
               ) : (
                 <div style={{ textAlign: 'center', padding: 24, color: '#8c8c8c', fontSize: 12 }}>无源码</div>
               )}
+              </div>
             </div>
             )}
           </>
@@ -917,9 +1185,16 @@ export default function CallGraph() {
                   <div ref={graphContainerRef} style={{ width: '100%', height: '100%' }} />
                 </div>
 
-                {/* Source code panel (30%) — toggled */}
+                {/* Source code panel — height adjustable by dragging the divider */}
                 {sourcePanelOpen && (
-                <div style={{ height: '30%', maxHeight: '30%', minHeight: 0, overflow: 'auto', background: '#fff', borderTop: '1px solid #e8e8e8', position: 'relative' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', background: '#fff', borderTop: '1px solid #e8e8e8' }}>
+                  <div
+                    onMouseDown={handleDividerMouseDown}
+                    style={{ height: 5, background: '#f0f0f0', cursor: 'row-resize', flexShrink: 0,
+                      borderTop: '1px solid #e0e0e0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div style={{ width: 32, height: 3, borderRadius: 2, background: '#bfbfbf' }} />
+                  </div>
+                  <div style={{ height: sourcePanelHeight, overflow: 'auto', position: 'relative' }}>
                   <Button size="small" type="text" onClick={() => setSourcePanelOpen(false)}
                     style={{ position: 'sticky', top: 0, right: 0, zIndex: 10, float: 'right', color: '#8c8c8c' }}>✕</Button>
                   {loadingSource ? (
@@ -980,6 +1255,7 @@ export default function CallGraph() {
                   ) : (
                     <div style={{ textAlign: 'center', padding: 24, color: '#bfbfbf', fontSize: 12 }}>无源码</div>
                   )}
+                  </div>
                 </div>
                 )}
               </>
@@ -1004,11 +1280,6 @@ export default function CallGraph() {
             ))}
           </div>
         )}
-      </Drawer>
-
-      <Drawer title={<span><CodeOutlined style={{ marginRight: 8 }} />调用链展平代码</span>} placement="bottom" height="60%" open={codeDrawerOpen} onClose={() => setCodeDrawerOpen(false)}
-        extra={<Button size="small" onClick={() => { navigator.clipboard.writeText(generatedCode); message.success('已复制'); }}>复制</Button>}>
-        <div style={{ height: '100%' }}><JavaCodeViewer code={generatedCode} maxHeight="100%" /></div>
       </Drawer>
 
       <Drawer title={<span><FileTextOutlined style={{ marginRight: 8 }} />{docType === 'product' ? '产品文档' : '研发文档'}</span>}
