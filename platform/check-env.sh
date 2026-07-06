@@ -52,38 +52,48 @@ _pkg_name() {
     case "$CHECK_ENV_PM" in
         brew)
             case "$dep" in
-                jdk17) echo "openjdk@17" ;;
-                node)  echo "node" ;;
-                maven) echo "maven" ;;
-                docker) echo "--cask docker" ;;
+                jdk17)   echo "openjdk@17" ;;
+                node)    echo "node" ;;
+                maven)   echo "maven" ;;
+                docker)  echo "--cask docker" ;;
+                postgres) echo "postgresql@16" ;;
+                ollama)  echo "ollama" ;;
             esac ;;
         apt)
             case "$dep" in
-                jdk17) echo "openjdk-17-jdk" ;;
-                node)  echo "nodejs npm" ;;
-                maven) echo "maven" ;;
-                docker) echo "docker.io" ;;
+                jdk17)   echo "openjdk-17-jdk" ;;
+                node)    echo "nodejs npm" ;;
+                maven)   echo "maven" ;;
+                docker)  echo "docker.io" ;;
+                postgres) echo "postgresql postgresql-contrib" ;;
+                ollama)  echo "" ;;  # ollama 无 apt 包，用官方脚本
             esac ;;
         dnf|yum)
             case "$dep" in
-                jdk17) echo "java-17-openjdk-devel" ;;
-                node)  echo "nodejs npm" ;;
-                maven) echo "maven" ;;
-                docker) echo "docker" ;;
+                jdk17)   echo "java-17-openjdk-devel" ;;
+                node)    echo "nodejs npm" ;;
+                maven)   echo "maven" ;;
+                docker)  echo "docker" ;;
+                postgres) echo "postgresql-server postgresql-contrib" ;;
+                ollama)  echo "" ;;
             esac ;;
         pacman)
             case "$dep" in
-                jdk17) echo "jdk17-openjdk" ;;
-                node)  echo "nodejs npm" ;;
-                maven) echo "maven" ;;
-                docker) echo "docker" ;;
+                jdk17)   echo "jdk17-openjdk" ;;
+                node)    echo "nodejs npm" ;;
+                maven)   echo "maven" ;;
+                docker)  echo "docker" ;;
+                postgres) echo "postgresql" ;;
+                ollama)  echo "" ;;
             esac ;;
         zypper)
             case "$dep" in
-                jdk17) echo "java-17-openjdk-devel" ;;
-                node)  echo "nodejs npm" ;;
-                maven) echo "maven" ;;
-                docker) echo "docker" ;;
+                jdk17)   echo "java-17-openjdk-devel" ;;
+                node)    echo "nodejs npm" ;;
+                maven)   echo "maven" ;;
+                docker)  echo "docker" ;;
+                postgres) echo "postgresql postgresql-server" ;;
+                ollama)  echo "" ;;
             esac ;;
     esac
 }
@@ -91,10 +101,12 @@ _pkg_name() {
 # 官方下载链接（无包管理器或安装失败时提示）
 _download_url() {
     case "$1" in
-        jdk17) echo "https://adoptium.net/temurin/releases/?version=17" ;;
-        node)  echo "https://nodejs.org/en/download" ;;
-        maven) echo "https://maven.apache.org/download.cgi" ;;
-        docker) echo "https://www.docker.com/products/docker-desktop/" ;;
+        jdk17)    echo "https://adoptium.net/temurin/releases/?version=17" ;;
+        node)     echo "https://nodejs.org/en/download" ;;
+        maven)    echo "https://maven.apache.org/download.cgi" ;;
+        docker)   echo "https://www.docker.com/products/docker-desktop/" ;;
+        postgres) echo "https://www.postgresql.org/download/" ;;
+        ollama)   echo "https://ollama.com/download" ;;
     esac
 }
 
@@ -137,16 +149,26 @@ _prompt_install() {
     read -r answer
     case "$answer" in
         [yY]|[yY][eE][sS])
-            echo "   正在安装 $name ..."
-            # shellcheck disable=SC2086
-            if [ "$CHECK_ENV_PM" = "apt" ]; then sudo apt-get update -qq || true; fi
-            if $CHECK_ENV_PM_INSTALL $pkg; then
-                echo "   ✅ $name 安装完成"
-                return 0
-            else
-                echo "   ❌ $name 安装失败，请手动安装: $url"
-                return 1
-            fi
+                local pkg; pkg="$(_pkg_name "$dep")"
+                echo "   正在安装 $name ..."
+                # shellcheck disable=SC2086
+                if [ "$CHECK_ENV_PM" = "apt" ]; then sudo apt-get update -qq || true; fi
+                # Ollama 在 Linux 上没有标准包，使用官方一键安装脚本
+                if [ "$dep" = "ollama" ] && [ -z "$pkg" ]; then
+                    if curl -fsSL https://ollama.com/install.sh | sh; then
+                        echo "   ✅ $name 安装完成"
+                        return 0
+                    else
+                        echo "   ❌ $name 安装失败，请手动安装: $url"
+                        return 1
+                    fi
+                elif $CHECK_ENV_PM_INSTALL $pkg; then
+                    echo "   ✅ $name 安装完成"
+                    return 0
+                else
+                    echo "   ❌ $name 安装失败，请手动安装: $url"
+                    return 1
+                fi
             ;;
         *)
             # 可选依赖：记住拒绝，下次不再问
@@ -275,7 +297,262 @@ check_docker() {
     return 0
 }
 
-# ── 主流程 ────────────────────────────────────────────────────────
+# ── PostgreSQL 检测 ───────────────────────────────────────────────
+# 成功后导出 DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASS 供 start.sh 使用
+
+# 尝试启动 PostgreSQL 服务（macOS brew / Linux systemd 两路）
+_pg_start_service() {
+    if [ "$CHECK_ENV_OS" = "mac" ] && command -v brew &>/dev/null; then
+        # 找到已安装的 postgresql 服务名（可能是 postgresql@16 / postgresql@17 等）
+        local svc
+        svc="$(brew services list 2>/dev/null | awk '/^postgresql/{print $1}' | head -1)"
+        if [ -n "$svc" ]; then
+            echo "   正在执行: brew services start $svc ..."
+            brew services start "$svc" && return 0
+        fi
+    fi
+    if command -v systemctl &>/dev/null; then
+        echo "   正在执行: sudo systemctl start postgresql ..."
+        sudo systemctl start postgresql && return 0
+    fi
+    if command -v service &>/dev/null; then
+        echo "   正在执行: sudo service postgresql start ..."
+        sudo service postgresql start && return 0
+    fi
+    return 1
+}
+
+# 检查/创建数据库和用户（以 postgres 超级用户身份）
+_pg_ensure_database() {
+    local host="$1" port="$2" dbname="$3" user="$4" pass="$5"
+
+    # 测试能否以应用用户直连
+    if PGPASSWORD="$pass" psql -h "$host" -p "$port" -U "$user" -d "$dbname" -c '\q' &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "   数据库 '$dbname' 或用户 '$user' 不存在，尝试自动创建..."
+    echo "   （需要 postgres 超级用户权限，可能弹出密码提示）"
+
+    # 创建用户（忽略已存在错误）
+    psql -h "$host" -p "$port" -U postgres \
+        -c "CREATE USER $user WITH PASSWORD '$pass';" 2>/dev/null || true
+
+    # 创建数据库并授权
+    psql -h "$host" -p "$port" -U postgres \
+        -c "CREATE DATABASE $dbname OWNER $user;" 2>/dev/null || true
+    psql -h "$host" -p "$port" -U postgres \
+        -c "GRANT ALL PRIVILEGES ON DATABASE $dbname TO $user;" 2>/dev/null || true
+
+    # 再次验证
+    if PGPASSWORD="$pass" psql -h "$host" -p "$port" -U "$user" -d "$dbname" -c '\q' &>/dev/null 2>&1; then
+        echo "   ✅ 数据库 '$dbname' 就绪"
+        return 0
+    else
+        echo "   ⚠️  无法自动创建数据库，请手动执行："
+        echo "      psql -U postgres -c \"CREATE USER $user WITH PASSWORD '$pass';\""
+        echo "      psql -U postgres -c \"CREATE DATABASE $dbname OWNER $user;\""
+        return 1
+    fi
+}
+
+check_postgres() {
+    # 读取配置（优先使用外部环境变量，否则用默认值）
+    local host="${DB_HOST:-localhost}"
+    local port="${DB_PORT:-5432}"
+    local dbname="${DB_NAME:-javacg2}"
+    local user="${DB_USER:-javacg2}"
+    local pass="${DB_PASS:-javacg2}"
+
+    # ── 优先用 Docker 管理 ────────────────────────────────────
+    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+        local container_status
+        container_status="$(docker inspect --format='{{.State.Status}}' javacg2-postgres 2>/dev/null)"
+
+        if [ "$container_status" = "running" ]; then
+            echo "✅ PostgreSQL : 运行中 (Docker, $host:$port)"
+        else
+            if [ "$container_status" = "exited" ] || [ "$container_status" = "created" ]; then
+                echo "⚠️ PostgreSQL : 容器已存在但未运行"
+            else
+                echo "⚠️ PostgreSQL : 容器不存在，将通过 docker compose 启动"
+            fi
+            printf '   是否用 docker compose 启动 PostgreSQL？ (y/N) '
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS])
+                    cd "$SCRIPT_DIR" && docker compose up -d postgres
+                    echo "   等待 PostgreSQL 就绪..."
+                    local i
+                    for i in $(seq 1 20); do
+                        sleep 2
+                        if docker exec javacg2-postgres pg_isready -U "$user" -d "$dbname" &>/dev/null 2>&1; then
+                            echo "   ✅ PostgreSQL 就绪"
+                            break
+                        fi
+                        [ "$i" -eq 20 ] && { echo "   ❌ 等待超时，请检查: docker logs javacg2-postgres"; return 1; }
+                    done
+                    ;;
+                *)
+                    echo "   ❌ PostgreSQL 未运行，平台无法启动"
+                    return 1
+                    ;;
+            esac
+        fi
+
+        export DB_HOST="$host" DB_PORT="$port" DB_NAME="$dbname" DB_USER="$user" DB_PASS="$pass"
+        return 0
+    fi
+
+    # ── fallback：本地安装 ────────────────────────────────────
+    if command -v psql &>/dev/null; then
+        if pg_isready -h "$host" -p "$port" -q 2>/dev/null; then
+            echo "✅ PostgreSQL : 运行中 (本地, $host:$port)"
+        else
+            echo "⚠️ PostgreSQL : 已安装但未运行 ($host:$port)"
+            printf '   是否现在启动 PostgreSQL？ (y/N) '
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS])
+                    _pg_start_service || { echo "   ❌ 启动失败"; return 1; }
+                    sleep 2
+                    pg_isready -h "$host" -p "$port" -q 2>/dev/null || { echo "   ❌ 启动后仍无法连接"; return 1; }
+                    echo "   ✅ PostgreSQL 已启动"
+                    ;;
+                *) echo "   ❌ PostgreSQL 未运行，平台无法启动"; return 1 ;;
+            esac
+        fi
+    else
+        echo "❌ PostgreSQL : 未检测到（需要 Docker 或本地安装）"
+        _prompt_install postgres "PostgreSQL" || return 1
+        _pg_start_service || true
+        sleep 2
+    fi
+
+    _pg_ensure_database "$host" "$port" "$dbname" "$user" "$pass" || return 1
+    export DB_HOST="$host" DB_PORT="$port" DB_NAME="$dbname" DB_USER="$user" DB_PASS="$pass"
+    return 0
+}
+
+# ── Ollama 检测（可选）────────────────────────────────────────────
+# 成功后导出 EMBEDDING_URL / EMBEDDING_MODEL / EMBEDDING_DIMENSIONS
+
+_ollama_model_exists() {
+    local model="$1"
+    ollama list 2>/dev/null | grep -q "^${model}"
+}
+
+check_ollama() {
+    local model="${EMBEDDING_MODEL:-nomic-embed-text}"
+    local dims="${EMBEDDING_DIMENSIONS:-768}"
+
+    if _is_skipped "ollama"; then
+        echo "   （已按你的选择跳过 Ollama；如需启用：删除 data/.skip-install）"
+        return 0
+    fi
+
+    # ── 优先用 Docker 管理 ────────────────────────────────────
+    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+        local container_status
+        container_status="$(docker inspect --format='{{.State.Status}}' javacg2-ollama 2>/dev/null)"
+
+        if [ "$container_status" = "running" ] && curl -sf http://localhost:11434 &>/dev/null; then
+            echo "✅ Ollama     : 运行中 (Docker, http://localhost:11434)"
+        else
+            echo "⚠️ Ollama     : 未运行（可选；用于本地 Embedding，缺失则降级为关键词匹配）"
+            printf '   是否用 docker compose 启动 Ollama？ (y/N) '
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS])
+                    cd "$SCRIPT_DIR" && docker compose up -d ollama
+                    echo "   等待 Ollama 就绪（首次启动较慢）..."
+                    local i
+                    for i in $(seq 1 18); do
+                        sleep 3
+                        curl -sf http://localhost:11434 &>/dev/null && break
+                        [ "$i" -eq 18 ] && { echo "   ⚠️  Ollama 启动超时，降级为关键词匹配"; _remember_skip "ollama"; return 0; }
+                    done
+                    echo "   ✅ Ollama 就绪"
+                    ;;
+                *)
+                    _remember_skip "ollama"
+                    echo "   已跳过，Embedding 将降级为关键词匹配"
+                    return 0
+                    ;;
+            esac
+        fi
+
+        # 检查/拉取模型（在容器内执行）
+        if ! docker exec javacg2-ollama ollama list 2>/dev/null | grep -q "^${model}"; then
+            printf '   模型 %s 未下载，是否现在拉取？ (y/N) ' "$model"
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS])
+                    docker exec javacg2-ollama ollama pull "$model" \
+                        && echo "   ✅ 模型 $model 拉取完成" \
+                        || echo "   ⚠️  拉取失败，可稍后: docker exec javacg2-ollama ollama pull $model"
+                    ;;
+                *) echo "   可稍后手动拉取: docker exec javacg2-ollama ollama pull $model" ;;
+            esac
+        else
+            echo "   ✅ 模型 $model 就绪"
+        fi
+
+        export EMBEDDING_URL="http://localhost:11434"
+        export EMBEDDING_MODEL="$model"
+        export EMBEDDING_DIMENSIONS="$dims"
+        return 0
+    fi
+
+    # ── fallback：本地 ollama 进程 ────────────────────────────
+    if command -v ollama &>/dev/null; then
+        if curl -sf http://localhost:11434 &>/dev/null; then
+            echo "✅ Ollama     : 运行中 (本地)"
+        else
+            echo "⚠️ Ollama     : 已安装但未运行"
+            printf '   是否在后台启动 Ollama？ (y/N) '
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS])
+                    ollama serve > /tmp/ollama.log 2>&1 &
+                    local i
+                    for i in $(seq 1 15); do
+                        sleep 1
+                        curl -sf http://localhost:11434 &>/dev/null && break
+                    done
+                    curl -sf http://localhost:11434 &>/dev/null || { _remember_skip "ollama"; return 0; }
+                    echo "   ✅ Ollama 已启动"
+                    ;;
+                *) _remember_skip "ollama"; echo "   已跳过，降级为关键词匹配"; return 0 ;;
+            esac
+        fi
+    else
+        echo "⚠️ Ollama     : 未检测到（可选）"
+        _prompt_install ollama "Ollama" optional || return 0
+        ollama serve > /tmp/ollama.log 2>&1 &
+        sleep 5
+    fi
+
+    # 本地模式：检查/拉取模型
+    if curl -sf http://localhost:11434 &>/dev/null; then
+        if ! _ollama_model_exists "$model"; then
+            printf '   模型 %s 未下载，是否现在拉取？ (y/N) ' "$model"
+            read -r answer
+            case "$answer" in
+                [yY]|[yY][eE][sS]) ollama pull "$model" ;;
+                *) echo "   可稍后: ollama pull $model" ;;
+            esac
+        else
+            echo "   ✅ 模型 $model 就绪"
+        fi
+        export EMBEDDING_URL="http://localhost:11434"
+        export EMBEDDING_MODEL="$model"
+        export EMBEDDING_DIMENSIONS="$dims"
+    fi
+    return 0
+}
+
+
 check_env_main() {
     _detect_platform
 
@@ -292,13 +569,15 @@ check_env_main() {
 
     echo ""
     echo "[必需项]"
-    check_jdk17 || required_ok=1
-    check_node  || required_ok=1
+    check_jdk17    || required_ok=1
+    check_node     || required_ok=1
+    check_postgres || required_ok=1
 
     echo ""
     echo "[可选项]"
     check_maven
     check_docker
+    check_ollama
 
     echo ""
     if [ "$required_ok" -ne 0 ]; then

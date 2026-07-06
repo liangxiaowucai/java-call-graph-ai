@@ -1,6 +1,65 @@
 services:
+  # ── 平台应用（后端 + 前端静态资源）──────────────────────────
+  app:
+    build:
+      context: ..               # 构建上下文为项目根目录
+      dockerfile: Dockerfile
+    image: javacg2-app:latest
+    container_name: javacg2-app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data        # 分析产物、仓库克隆目录等持久化
+    environment:
+      # 数据库
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: javacg2
+      DB_USER: javacg2
+      DB_PASS: javacg2
+      # Embedding（Ollama，可选）
+      EMBEDDING_URL: http://ollama:11434
+      EMBEDDING_MODEL: nomic-embed-text
+      EMBEDDING_DIMENSIONS: "768"
+      # Qdrant
+      QDRANT_URL: http://qdrant:6333
+      # JVM 选项（容器内按实际内存自动计算堆大小）
+      JAVA_OPTS: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/repos || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ── PostgreSQL 数据库 ──────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: javacg2-postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: javacg2
+      POSTGRES_USER: javacg2
+      POSTGRES_PASSWORD: javacg2
+      PGDATA: /var/lib/postgresql/data/pgdata
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U javacg2 -d javacg2"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
   # ── Qdrant 向量数据库 ──────────────────────────────────────
-  # 仅向量数据库使用容器；应用本体（后端 + 前端）通过 ./start.sh 在本地启动
   qdrant:
     image: qdrant/qdrant:v1.9.4
     container_name: javacg2-qdrant
@@ -18,3 +77,27 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  # ── Ollama 本地 Embedding 服务（可选）──────────────────────
+  # CPU 模式（默认）；如有 GPU 取消注释 deploy 段
+  ollama:
+    image: ollama/ollama:latest
+    container_name: javacg2-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
+    restart: unless-stopped
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s

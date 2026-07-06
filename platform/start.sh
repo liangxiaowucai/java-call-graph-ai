@@ -39,44 +39,49 @@ echo "=========================================="
 echo "  javacg2-platform 启动"
 echo "  JAVA_HOME: $JAVA_HOME"
 echo "  Java版本: $($JAVA_HOME/bin/java -version 2>&1 | head -1)"
+echo "  数据库:   ${DB_HOST:-localhost}:${DB_PORT:-5432}/${DB_NAME:-javacg2}"
+echo "  Embedding: ${EMBEDDING_URL:-未配置（降级为关键词匹配）}"
 echo "=========================================="
 
-# ── Step 0: 启动 Qdrant（向量数据库）──────────────────────
+# ── Step 0: 启动基础服务（PostgreSQL / Qdrant / Ollama）──────
 echo ""
-echo "[0/4] 启动 Qdrant (向量数据库)..."
+echo "[0/4] 启动基础服务 (docker compose)..."
 cd "$SCRIPT_DIR"
 
 if ! command -v docker &> /dev/null; then
-    echo "⚠️  未检测到 docker，跳过 Qdrant（问答将使用关键词降级模式）"
+    echo "⚠️  未检测到 docker，跳过容器服务启动"
 else
-    # 检查 docker compose 命令（v2 用 'docker compose'，v1 用 'docker-compose'）
     if docker compose version &> /dev/null 2>&1; then
         COMPOSE_CMD="docker compose"
     elif command -v docker-compose &> /dev/null; then
         COMPOSE_CMD="docker-compose"
     else
-        echo "⚠️  未检测到 docker compose，跳过 Qdrant"
+        echo "⚠️  未检测到 docker compose，跳过容器服务"
         COMPOSE_CMD=""
     fi
 
     if [ -n "$COMPOSE_CMD" ]; then
-        $COMPOSE_CMD up -d qdrant
+        # 启动 postgres + qdrant（必需）；ollama 已在 check-env.sh 里按需询问启动
+        $COMPOSE_CMD up -d postgres qdrant
 
-        echo "等待 Qdrant 就绪..."
-        QDRANT_OK=false
-        for i in $(seq 1 30); do
-            if curl -sf http://localhost:6333/healthz > /dev/null 2>&1; then
-                QDRANT_OK=true
-                break
-            fi
+        # 等待 PostgreSQL 健康
+        echo "等待 PostgreSQL 就绪..."
+        PG_OK=false
+        for i in $(seq 1 20); do
+            docker exec javacg2-postgres pg_isready -U "${DB_USER:-javacg2}" -d "${DB_NAME:-javacg2}" &>/dev/null 2>&1 \
+                && { PG_OK=true; break; }
             sleep 2
         done
+        $PG_OK && echo "✅ PostgreSQL 就绪" || echo "⚠️  PostgreSQL 启动超时，请检查: docker logs javacg2-postgres"
 
-        if $QDRANT_OK; then
-            echo "✅ Qdrant 就绪 (http://localhost:6333)"
-        else
-            echo "⚠️  Qdrant 启动超时，问答将使用关键词降级模式"
-        fi
+        # 等待 Qdrant 健康
+        echo "等待 Qdrant 就绪..."
+        QDRANT_OK=false
+        for i in $(seq 1 15); do
+            curl -sf http://localhost:6333/healthz > /dev/null 2>&1 && { QDRANT_OK=true; break; }
+            sleep 2
+        done
+        $QDRANT_OK && echo "✅ Qdrant 就绪 (http://localhost:6333)" || echo "⚠️  Qdrant 启动超时，问答将使用关键词降级模式"
     fi
 fi
 
@@ -91,6 +96,7 @@ echo "✅ 核心 jar 构建完成"
 echo ""
 echo "[2/4] 启动后端 (http://localhost:8080)..."
 cd "$SCRIPT_DIR"
+mkdir -p "$SCRIPT_DIR/data/logs"
 ./gradlew bootRun 2>&1 | tee "$SCRIPT_DIR/data/logs/backend.log" &
 BACKEND_PID=$!
 
@@ -127,9 +133,15 @@ echo "FRONTEND_PID=$FRONTEND_PID" >> "$PID_FILE"
 echo ""
 echo "=========================================="
 echo "  启动完成！"
-echo "  前端:   http://localhost:5173"
-echo "  后端:   http://localhost:8080"
-echo "  Qdrant: http://localhost:6333"
+echo "  前端:    http://localhost:5173"
+echo "  后端:    http://localhost:8080"
+echo "  Qdrant:  http://localhost:6333"
+echo "  数据库:  ${DB_HOST:-localhost}:${DB_PORT:-5432}/${DB_NAME:-javacg2}"
+if [ -n "$EMBEDDING_URL" ]; then
+  echo "  Embedding: $EMBEDDING_URL ($EMBEDDING_MODEL)"
+else
+  echo "  Embedding: 未配置（降级为关键词匹配）"
+fi
 echo ""
 echo "  按 Ctrl+C 停止所有服务（等同 ./stop.sh）"
 echo "  后端日志: tail -f data/logs/backend.log"

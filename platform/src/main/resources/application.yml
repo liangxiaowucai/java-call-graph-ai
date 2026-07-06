@@ -5,14 +5,23 @@ spring:
   application:
     name: javacg2-platform
   datasource:
-    url: jdbc:h2:file:./data/javacg2-platform;AUTO_SERVER=TRUE;CACHE_SIZE=65536
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
-  h2:
-    console:
-      enabled: false
-      path: /h2-console
+    # PostgreSQL（默认）
+    # 可通过环境变量覆盖：DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASS
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:javacg2}
+    username: ${DB_USER:javacg2}
+    password: ${DB_PASS:javacg2}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      connection-timeout: 10000
+      maximum-pool-size: 10
+  # ── H2 fallback（本地调试用，去掉上方 datasource 改用下方）─────────
+  # datasource:
+  #   url: jdbc:h2:file:./data/javacg2-platform;AUTO_SERVER=TRUE;CACHE_SIZE=65536
+  #   driver-class-name: org.h2.Driver
+  #   username: sa
+  #   password:
+  # h2.console.enabled: true
+  # ──────────────────────────────────────────────────────────────────
   jpa:
     hibernate:
       ddl-auto: update
@@ -21,11 +30,9 @@ spring:
     properties:
       hibernate:
         format_sql: true
-        dialect: org.hibernate.dialect.H2Dialect
   sql:
     init:
-      mode: always
-      schema-locations: classpath:schema.sql
+      mode: never  # Hibernate ddl-auto 管理建表，schema.sql 不自动执行
   servlet:
     multipart:
       max-file-size: 500MB
@@ -48,11 +55,13 @@ platform:
     enabled: false
     cron: "0 0 * * * *"  # 每小时同步
   embedding:
-    api-url: ${EMBEDDING_URL:}
+    # Ollama（默认，本地免费）：api-url=http://localhost:11434, model=nomic-embed-text, dimensions=768
+    # OpenAI（付费）：api-url=https://api.openai.com, model=text-embedding-3-large, dimensions=3072
+    api-url: ${EMBEDDING_URL:http://localhost:11434}
     api-key: ${EMBEDDING_API_KEY:}
-    model: text-embedding-3-large
+    model: ${EMBEDDING_MODEL:nomic-embed-text}
     batch-size: ${EMBEDDING_BATCH_SIZE:100}
-    dimensions: 3072
+    dimensions: ${EMBEDDING_DIMENSIONS:768}
   qdrant:
     url: ${QDRANT_URL:http://localhost:6333}
     collection: ${QDRANT_COLLECTION:javacg2_chunks}

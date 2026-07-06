@@ -41,7 +41,9 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
 
-    // H2 嵌入式数据库
+    // PostgreSQL 数据库驱动
+    runtimeOnly 'org.postgresql:postgresql:42.7.3'
+    // H2 嵌入式数据库（本地调试备用，生产用 PostgreSQL）
     runtimeOnly 'com.h2database:h2'
 
     // SQLite JDBC（用于 sqlite-vss 向量存储）
